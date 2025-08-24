@@ -137,7 +137,7 @@ resource "oci_core_instance" "bnbong_server" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
-    user_data = base64encode(templatefile("${path.module}/user_data.sh", {
+    user_data = base64encode(templatefile("${path.module}/scripts/user_data.sh", {
       domain_name = var.domain_name
     }))
   }
