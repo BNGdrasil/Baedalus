@@ -1,0 +1,16 @@
+# OCI Configuration
+tenancy_ocid     = "ocid1.tenancy.oc1..example"
+user_ocid        = "ocid1.user.oc1..example"
+fingerprint      = "xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"
+private_key_path = "/path/to/your/private_key.pem"
+region           = "ap-northeast-2a"
+
+# Compartment
+compartment_id = "ocid1.compartment.oc1..example"
+
+# Instance Configuration
+instance_shape = "VM.Standard.A1.Flex"
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+
+# Domain Configuration
+domain_name = "bnbong.xyz"
