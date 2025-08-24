@@ -1,4 +1,4 @@
-# Baedalus
+# Baedalus (Bnbong + Daedalus)
 
 Infrastructure of bnbong cloud-nation
 
