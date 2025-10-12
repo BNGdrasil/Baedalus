@@ -6,337 +6,476 @@
 
 # 🏗️ Baedalus (Bnbong + daedalus)
 
-**Infrastructure as Code for Cloud Nation**
+**Multi-Region Cloud Infrastructure as Code**
 
 [![Terraform](https://img.shields.io/badge/Terraform-1.0+-623CE4?style=flat-square&logo=terraform&logoColor=white)](https://terraform.io)
 [![Oracle Cloud](https://img.shields.io/badge/Oracle%20Cloud-F80000?style=flat-square&logo=oracle&logoColor=white)](https://cloud.oracle.com)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com)
 
-*Part of the [BNGdrasil](https://github.com/BNGdrasil/BNGdrasil) ecosystem - A comprehensive cloud infrastructure project*
+*Infrastructure as Code for [BNGdrasil](https://github.com/BNGdrasil/BNGdrasil) - A comprehensive cloud infrastructure project*
 
 </div>
 
 ---
 
-## Overview
+## 📋 Overview
 
-**Baedalus** is the Infrastructure as Code (IaC) foundation of the [BNGdrasil](https://github.com/BNGdrasil/BNGdrasil) cloud infrastructure project. Named after the master craftsman from Greek mythology, Baedalus provisions and manages cloud infrastructure across multiple cloud service providers (CSP) and prepares for eventual transition to OpenStack-based home lab environments.
+**Baedalus** is a Terraform-based IaC project that manages the core infrastructure of the BNGdrasil project.
 
-### Key Features
+### 🌏 Multi-Region Architecture
 
-- **Multi-Cloud Ready**: Designed for Oracle Cloud with AWS/Azure expansion planned
-- **Declarative Infrastructure**: Terraform-based infrastructure management
-- **Automated Deployment**: Complete CI/CD pipeline integration
-- **Security Focused**: Network isolation with public/private subnet architecture
-- **Scalable Design**: From single VM to multi-tier application architecture
-- **Container Ready**: Docker and Docker Compose pre-configured
-- **Cost Optimized**: ARM-based instances with efficient resource allocation
+- **Chuncheon Region (ap-chuncheon-1)**: Main Services (OCPU 4, RAM 24GB)
+  - VM1 (1 OCPU, 6GB, 50GB): Client - Nginx reverse proxy & static files
+  - VM2 (2 OCPU, 12GB, 50GB): Core APIs - Gateway + Auth Server
+  - VM3 (1 OCPU, 6GB, 80GB): Database - PostgreSQL + Redis + MongoDB
 
-## Architecture
+- **Osaka Region (ap-osaka-1)**: Monitoring & Backup (OCPU 4, RAM 24GB)
+  - VM4 (1 OCPU, 6GB, 80GB): Monitoring - Prometheus + Grafana + Loki
+  - VM5 (2 OCPU, 12GB, 70GB): Backup - Long-term storage & remote backups
+  - VM6 (1 OCPU, 6GB, 50GB): Playground - Development & testing environment
 
-### Current Implementation (Phase 1)
+### 💰 Cost: $0 (OCI Free Tier)
 
-```mermaid
-graph TB
-    subgraph "Oracle Cloud Infrastructure"
-        subgraph "VCN (10.0.0.0/16)"
-            subgraph "Public Subnet (10.0.1.0/24)"
-                VM1[bnbong-server<br/>Ubuntu 22.04<br/>Docker + Docker Compose]
-            end
-            IGW[Internet Gateway]
-            RT[Route Table]
-            SL[Security List<br/>SSH:22, HTTP:80, HTTPS:443]
-        end
-        PIP[Reserved Public IP]
-    end
-    
-    Internet --> IGW
-    IGW --> RT
-    RT --> VM1
-    VM1 --> PIP
-    VM1 -.-> SL
-```
-
-### Target Architecture (Future Phases)
-
-```mermaid
-graph TB
-    subgraph "Cloud Infrastructure (OCI/OpenStack)"
-        subgraph "Custom VPC (Bsgard) - 10.0.0.0/16"
-            subgraph "Public Subnet (10.0.1.0/24)"
-                VM1[VM1: Nginx Proxy Manager<br/>Cloudflare Integration]
-                VM2[VM2: Bifrost API Gateway<br/>Bidar Auth Server]
-                VM3[VM3: Bantheon Portfolio<br/>Blysium Game Platform]
-            end
-            
-            subgraph "Private Subnet (10.0.2.0/24)"
-                VM4[VM4: PostgreSQL<br/>Redis Cache]
-                VM5[VM5: Monitoring Stack<br/>Prometheus, Grafana, Loki]
-                VM6[VM6: Backend APIs<br/>Independent Services]
-            end
-            
-            IGW[Internet Gateway]
-            NAT[NAT Gateway]
-            ALB[Application Load Balancer]
-        end
-        
-        CF[Cloudflare DNS & WAF]
-    end
-    
-    Internet --> CF
-    CF --> ALB
-    ALB --> VM1
-    ALB --> VM2
-    ALB --> VM3
-    
-    VM1 --> NAT
-    VM2 --> NAT
-    VM3 --> NAT
-    NAT --> VM4
-    NAT --> VM5
-    NAT --> VM6
-```
+All resources operate within Oracle Cloud Free Tier limits. Main services in Chuncheon region minimize cross-region data transfer costs.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ### Prerequisites
 
 - Terraform >= 1.0
-- Oracle Cloud Infrastructure account
-- OCI CLI configured or API key setup
-- SSH key pair for instance access
+- 2 Oracle Cloud Infrastructure accounts (Chuncheon, Osaka)
+- SSH key pair
+- OCI CLI setup (optional)
 
 ### Installation
 
-#### Using Makefile (Recommended)
-
 ```bash
-# Clone the repository
-git clone https://github.com/BNGdrasil/Baedalus.git
-cd Baedalus
+# 1. Clone repository
+cd infra
 
-# Setup environment
+# 2. Environment setup
 make setup
 
-# Initialize and deploy infrastructure
+# 3. Edit terraform.tfvars
+# Enter OCI credentials for both regions
+vim terraform.tfvars
+
+# 4. Deploy infrastructure
 make init
 make plan
 make apply
+
+# 5. Check outputs
+make output
+make show-ips
+make show-ssh
 ```
 
-#### Manual Setup
+### Quick Deploy (Fully Automated)
 
 ```bash
-# Copy and configure environment variables
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your OCI credentials
-
-# Initialize and deploy
-terraform init
-terraform plan
-terraform apply
-```
-
-### Access Points
-
-Once deployed, you can access:
-
-- **Instance SSH**: `ssh ubuntu@<public_ip>`
-- **Application Services**: `http://<public_ip>:8000` (when applications are deployed)
-- **Infrastructure Status**: `terraform show`
-
-### Application Deployment
-
-```bash
-# Deploy applications to the provisioned infrastructure
-make deploy SERVER_IP=<server_ip>
-
-# Or use the deployment script directly
-./scripts/deploy.sh <server_ip> [ssh_user]
+# Run everything at once
+make quick-deploy
 ```
 
 ---
 
-## Infrastructure Configuration
+## 🏗️ Infrastructure Architecture
 
-### Core Components
+### Network Topology
 
-- **VCN & Networking** (`main.tf`): Virtual Cloud Network with public/private subnet architecture
-- **Compute Resources** (`main.tf`): ARM-based Ubuntu instances with auto-scaling capabilities
-- **Security Configuration** (`main.tf`): Security lists, network ACLs, and access controls
-- **Automation Scripts** (`scripts/`): Deployment and initialization automation
-- **Variable Management** (`variables.tf`): Centralized configuration management
+```mermaid
+graph TB
+    subgraph "Internet"
+        CF[☁️ Cloudflare<br/>DNS & WAF]
+    end
+    
+    subgraph "Chuncheon Region - ap-chuncheon-1"
+        subgraph "VCN 10.0.0.0/16"
+            subgraph "Public Subnet 10.0.1.0/24"
+                VM1[VM1: Client<br/>1 OCPU, 6GB<br/>Nginx]
+                VM2[VM2: Core APIs<br/>2 OCPU, 12GB<br/>Gateway + Auth]
+            end
+            subgraph "Private Subnet 10.0.2.0/24"
+                VM3[VM3: Database<br/>1 OCPU, 6GB<br/>PostgreSQL + Redis + MongoDB]
+            end
+            NAT1[NAT Gateway]
+            IGW1[Internet Gateway]
+            DRG1[DRG]
+        end
+    end
+    
+    subgraph "Osaka Region - ap-osaka-1"
+        subgraph "VCN 10.1.0.0/16"
+            subgraph "Private Subnet 10.1.2.0/24"
+                VM4[VM4: Monitoring<br/>1 OCPU, 6GB<br/>Prometheus + Grafana]
+                VM5[VM5: Backup<br/>2 OCPU, 12GB<br/>Long-term Storage]
+                VM6[VM6: Playground<br/>1 OCPU, 6GB<br/>Dev Environment]
+            end
+            NAT2[NAT Gateway]
+            DRG2[DRG]
+        end
+    end
+    
+    CF --> IGW1
+    IGW1 --> VM1
+    IGW1 --> VM2
+    VM1 --> NAT1
+    VM2 --> NAT1
+    VM3 --> NAT1
+    
+    VM2 --> VM3
+    DRG1 -.RPC Peering.-> DRG2
+    VM4 -.Monitor.-> DRG2
+    VM5 -.Backup.-> DRG2
+    
+    style VM1 fill:#4CAF50,color:#fff
+    style VM2 fill:#2196F3,color:#fff
+    style VM3 fill:#9C27B0,color:#fff
+    style VM4 fill:#607D8B,color:#fff
+    style VM5 fill:#FF9800,color:#fff
+    style VM6 fill:#795548,color:#fff
+```
 
-### Project Structure
+### Resource Allocation
+
+| VM | Location | OCPU | RAM | Storage | Role | Services |
+|----|----------|------|-----|---------|------|----------|
+| VM1 | Chuncheon (Public) | 1 | 6GB | 50GB | Client | Nginx reverse proxy + static files |
+| VM2 | Chuncheon (Public) | 2 | 12GB | 50GB | Core APIs | Gateway + Auth Server + Redis |
+| VM3 | Chuncheon (Private) | 1 | 6GB | 80GB | Database | PostgreSQL + Redis + MongoDB |
+| VM4 | Osaka (Private) | 1 | 6GB | 80GB | Monitoring | Prometheus + Grafana + Loki |
+| VM5 | Osaka (Private) | 2 | 12GB | 70GB | Backup | Long-term storage + remote backups |
+| VM6 | Osaka (Private) | 1 | 6GB | 50GB | Playground | Development & testing environment |
+| **Total** | **2 Regions** | **8** | **48GB** | **380GB** | - | **All within OCI Free Tier** |
+
+---
+
+## 📁 Project Structure
 
 ```
 infra/
-├── main.tf                 # Main Terraform configuration
-├── variables.tf            # Variable definitions
-├── terraform.tfvars.example # Environment variables template
+├── main.tf              # Providers and data sources
+├── variables.tf         # Variable definitions
+├── network.tf          # VCN, Subnet, Security Lists
+├── chuncheon.tf        # Chuncheon region VM resources
+├── osaka.tf            # Osaka region VM resources
+├── outputs.tf          # Output values
+├── terraform.tfvars.example  # Environment variable template
+├── Makefile            # Automation commands
 ├── scripts/
-│   ├── deploy.sh          # Application deployment script
-│   └── user_data.sh       # Instance initialization script
-├── Makefile               # Automation commands
-└── README.md             # Project documentation
+│   ├── user_data_vm1.sh    # VM1 initialization script
+│   ├── user_data_vm2.sh    # VM2 initialization script
+│   ├── user_data_vm3.sh    # VM3 initialization script
+│   ├── user_data_vm4.sh    # VM4 initialization script
+│   ├── user_data_vm5.sh    # VM5 initialization script
+│   ├── user_data_vm6.sh    # VM6 initialization script
+│   └── deploy.sh           # Application deployment script
+└── README.md           # This file
 ```
 
 ---
 
-## Infrastructure Components
+## 🔧 Configuration
 
-### Networking
+### terraform.tfvars Setup
 
-- **VCN CIDR**: 10.0.0.0/16
-- **Public Subnet**: 10.0.1.0/24 (current implementation)
-- **Private Subnet**: 10.0.2.0/24 (planned)
-- **Internet Gateway**: External connectivity
-- **NAT Gateway**: Private subnet internet access (planned)
+```hcl
+# Chuncheon Region (Account 1)
+tenancy_ocid_chuncheon     = "ocid1.tenancy.oc1..aaaaaa..."
+user_ocid_chuncheon        = "ocid1.user.oc1..aaaaaa..."
+fingerprint_chuncheon      = "xx:xx:xx:..."
+private_key_path_chuncheon = "~/.oci/chuncheon_api_key.pem"
+compartment_id_chuncheon   = "ocid1.compartment.oc1..aaaaaa..."
 
-### Security
+# Osaka Region (Account 2)
+tenancy_ocid_osaka     = "ocid1.tenancy.oc1..aaaaaa..."
+user_ocid_osaka        = "ocid1.user.oc1..aaaaaa..."
+fingerprint_osaka      = "yy:yy:yy:..."
+private_key_path_osaka = "~/.oci/osaka_api_key.pem"
+compartment_id_osaka   = "ocid1.compartment.oc1..aaaaaa..."
 
-- **Security Lists**: SSH (22), HTTP (80), HTTPS (443)
-- **Public IP**: Reserved static IP assignment
-- **SSH Access**: Key-based authentication only
-
-### Compute Resources
-
-- **Instance Type**: VM.Standard.A1.Flex (ARM-based)
-- **Operating System**: Canonical Ubuntu 22.04 LTS
-- **Storage**: Boot volume with automatic expansion
-- **Initialization**: Automated Docker setup via user_data
-
----
-
-## Development Roadmap
-
-### Phase 1: Basic Infrastructure ✅
-- [x] Single VM deployment on OCI
-- [x] Basic networking with public subnet
-- [x] Docker containerization setup
-- [x] Automated deployment scripts
-
-### Phase 2: Multi-VM Architecture
-- [ ] Private subnet implementation
-- [ ] NAT Gateway for private resources
-- [ ] Multiple VM deployment (6 VMs total)
-- [ ] Load balancer configuration
-- [ ] Database and cache services isolation
-
-### Phase 3: Enhanced Security & Monitoring
-- [ ] Enhanced security groups and rules
-- [ ] Monitoring and logging infrastructure
-- [ ] Backup and disaster recovery
-- [ ] SSL/TLS certificate automation
-
-### Phase 4: Multi-Cloud & OpenStack Migration
-- [ ] Multi-CSP support (AWS, Azure)
-- [ ] OpenStack provider integration
-- [ ] Home lab infrastructure templates
-- [ ] Hybrid cloud networking
+# Service Configuration
+domain_name       = "bnbong.xyz"
+ssh_public_key    = "ssh-rsa AAAAB3NzaC1..."
+postgres_password = "your-secure-password"
+jwt_secret_key    = "your-secret-key-min-32-chars"
+```
 
 ---
 
-## Makefile Commands
+## 📝 Makefile Commands
+
+### Basic Commands
 
 ```bash
-# View all available commands
-make help
-
-# Infrastructure management
+make help          # Show all commands
+make setup         # Initial environment setup
 make init          # Initialize Terraform
-make plan          # Show deployment plan
-make apply         # Apply infrastructure changes
+make plan          # Review deployment plan
+make apply         # Deploy infrastructure
 make destroy       # Destroy infrastructure
+```
 
-# Code quality and validation
-make lint          # Format and validate Terraform code
-make validate      # Validate Terraform configuration
+### Code Quality
 
-# Deployment and monitoring
-make deploy        # Deploy applications
-make output        # Show infrastructure outputs
+```bash
+make fmt           # Format code
+make validate      # Validate code
+make lint          # Format + Validate
+```
+
+### State Management
+
+```bash
+make output        # Show all outputs
 make show          # Show current state
+make show-ips      # Show IP addresses only
+make show-ssh      # Show SSH commands
+make summary       # Resource summary
 ```
 
----
-
-## API Reference
-
-### Infrastructure Outputs
-
-| Output | Description | Example |
-|--------|-------------|---------|
-| `public_ip` | Reserved public IP address of the main instance | `129.159.XXX.XXX` |
-| `instance_id` | Oracle Cloud Infrastructure instance OCID | `ocid1.instance.oc1.iad.xxx` |
-
-### Terraform State Management
+### SSH Access
 
 ```bash
-# View current state
-terraform show
-
-# List all resources
-terraform state list
-
-# Get specific output
-terraform output public_ip
+make ssh-vm1       # Connect to VM1 (Public)
+make ssh-vm2       # Connect to VM2 (Public)
+make ssh-vm3       # Connect to VM3 (via Jump Host)
+make ssh-vm4       # Connect to VM4 (via Jump Host)
+make ssh-vm5       # Connect to VM5 (via Jump Host)
+make ssh-vm6       # Connect to VM6 (via Jump Host)
 ```
 
-### Resource Inspection
+### Deployment and Monitoring
 
 ```bash
-# Check instance status
-terraform state show oci_core_instance.bnbong_server
-
-# Validate configuration
-terraform validate
-
-# Plan changes
-terraform plan
+make deploy-vm1    # Deploy to VM1
+make deploy-vm2    # Deploy to VM2
+make deploy-all    # Deploy all
+make logs-vm1      # VM1 logs
+make logs-vm2      # VM2 logs
+make health        # Health check
 ```
 
 ---
 
-## Security
+## 🔐 Security
 
-### Security Features
+### Network Security
 
-- **Network Isolation**: VCN with controlled subnet access
-- **SSH Key Authentication**: Public key authentication only
-- **Security Lists**: Configurable port-based access control
-- **Reserved IP**: Static IP assignment for consistent access
-- **Secret Management**: Environment-based credential storage
-- **Audit Logging**: OCI native logging and monitoring
+- **Public Subnet**: Only VM1, VM2 accessible from outside
+- **Private Subnet**: VM3, VM4, VM5, VM6 internal network only
+- **NAT Gateway**: Outbound traffic for private subnets
+- **Security Lists**: Fine-grained port-based access control
 
-### Security Best Practices
+### Access Control
 
-1. **Never commit secrets** to version control
-2. **Use environment variables** for OCI credentials
-3. **Enable MFA** for OCI console access
-4. **Configure security lists** restrictively for production
-5. **Monitor infrastructure changes** regularly
-6. **Keep Terraform state** secure and encrypted
+- **SSH**: Key-based authentication only
+- **Jump Host**: Private VMs accessed via VM2
+- **Cloudflare**: WAF and DDoS protection
+- **Secrets**: Sensitive information in terraform.tfvars (gitignored)
 
----
+### Best Practices
 
-## BNGdrasil Ecosystem
-
-Baedalus is part of the larger **[BNGdrasil](https://github.com/BNGdrasil)** cloud infrastructure project:
-
-- **🏗️ [Baedalus](https://github.com/BNGdrasil/Baedalus)** - Infrastructure as Code (this project)
-- **🌉 [Bifrost](https://github.com/BNGdrasil/Bifrost)** - API Gateway & Service Mesh
-- **🔐 [Bidar](https://github.com/BNGdrasil/Bidar)** - Authentication & Authorization Server
-- **🌐 [Bsgard](https://github.com/BNGdrasil/Bsgard)** - Custom VPC & OpenStack Networking
-- **🎨 [Bantheon](https://github.com/BNGdrasil/Bantheon)** - Web Frontend & Portfolio
-- **🎮 [Blysium](https://github.com/BNGdrasil/Blysium)** - Gaming Platform
-
-Each component is designed to work independently while integrating seamlessly with others.
+1. ✅ Never commit `terraform.tfvars`
+2. ✅ Store SSH keys securely
+3. ✅ Enable MFA in OCI Console
+4. ✅ Rotate secret keys regularly
+5. ✅ Encrypt Terraform State
 
 ---
 
-## License
+## 🚀 Deployment Workflow
+
+### Step 1: Provision Infrastructure
+
+```bash
+# Create infrastructure
+make init
+make plan
+make apply
+
+# Verify creation
+make output
+make summary
+```
+
+### Step 2: Verify VM Access
+
+```bash
+# Access public VMs
+make ssh-vm1
+make ssh-vm2
+
+# Access private VMs (via Jump Host)
+make ssh-vm3
+```
+
+### Step 3: Deploy Applications
+
+```bash
+# Individual deployment
+make deploy-vm1
+make deploy-vm2
+
+# Or deploy all
+make deploy-all
+```
+
+### Step 4: Monitor Status
+
+```bash
+# Check service status
+make health
+
+# View logs
+make logs-vm1
+make logs-vm2
+
+# Access Grafana (VM5)
+ssh -L 3000:localhost:3000 ubuntu@<VM5_IP>
+# http://localhost:3000
+```
+
+---
+
+## 📊 Monitoring & Observability
+
+### Prometheus (VM5)
+
+- **URL**: `http://localhost:9090` (via SSH tunnel)
+- **Metrics**: All VM and service metrics collected
+- **Retention**: 30 days
+
+### Grafana (VM5)
+
+- **URL**: `http://localhost:3000` (via SSH tunnel)
+- **Credentials**: admin / admin (initial password)
+- **Dashboards**: VM resources, service status, API performance
+
+### Loki (VM5)
+
+- **URL**: `http://localhost:3100`
+- **Log Retention**: 7 days
+- **Sources**: Application logs from all VMs
+
+---
+
+## 🔄 Backup & DR
+
+### Automated Backup (VM4)
+
+- **Frequency**: Daily backup (midnight)
+- **Retention**: 7 days
+- **Location**: VM4 `/backups` directory
+
+### PostgreSQL Replication (VM6)
+
+- **Type**: Streaming Replication
+- **Delay**: < 1 second
+- **Purpose**: Disaster recovery, read load distribution
+
+### Verify Backups
+
+```bash
+# Check VM4 backups
+make ssh-vm4
+ls -lh /opt/bnbong/postgres/backups/
+
+# Check VM6 replica status
+make ssh-vm6
+docker exec vm6-postgres-replica pg_isready
+```
+
+---
+
+## 🛠️ Troubleshooting
+
+### VM Won't Start
+
+```bash
+# 1. Check VM status
+make ssh-vm1
+systemctl status bnbong-vm1.service
+
+# 2. View logs
+journalctl -u bnbong-vm1.service -f
+
+# 3. Check Docker services
+docker ps -a
+docker-compose logs
+```
+
+### Database Connection Error
+
+```bash
+# Access VM4 to check PostgreSQL
+make ssh-vm4
+docker exec vm4-postgres pg_isready
+
+# Test connection
+docker exec vm4-postgres psql -U bnbong -d bnbong -c "SELECT 1;"
+```
+
+### Cross-Region Communication Issue
+
+```bash
+# Test connection from VM2 to VM4
+make ssh-vm2
+ping <VM4_PRIVATE_IP>
+telnet <VM4_PRIVATE_IP> 5432
+```
+
+---
+
+## 🎯 Future Roadmap
+
+### Phase 1: Current (Complete) ✅
+- [x] Multi-region infrastructure
+- [x] 6 VM deployment
+- [x] Public/Private subnet separation
+- [x] Automated initialization scripts
+
+### Phase 2: Improvements Planned
+- [ ] Terraform Remote State (OCI Object Storage)
+- [ ] CI/CD pipeline integration
+- [ ] Auto-scaling configuration
+- [ ] VPN or FastConnect setup
+
+### Phase 3: Expansion
+- [ ] Multi-CSP support (AWS, Azure)
+- [ ] Kubernetes migration
+- [ ] Service Mesh adoption
+- [ ] OpenStack home lab integration
+
+---
+
+## 📚 Related Projects
+
+- **🌉 [Bifrost](https://github.com/BNGdrasil/Bifrost)** - API Gateway
+- **🔐 [Bidar](https://github.com/BNGdrasil/Bidar)** - Auth Server
+- **🎨 [Bantheon](https://github.com/BNGdrasil/Bantheon)** - Web Client
+- **🎮 [Blysium](https://github.com/BNGdrasil/Blysium)** - Game Platform
+- **🌐 [Bsgard](https://github.com/BNGdrasil/Bsgard)** - Custom VPC
+
+---
+
+## 📄 License
 
 This project is used for personal learning and development purposes.
+
+---
+
+## 🤝 Contributing
+
+This project is for personal learning purposes, but feedback and suggestions are always welcome!
+
+---
+
+<div align="center">
+
+**[BNGdrasil](https://github.com/BNGdrasil) - Building a personal cloud nation, one service at a time.**
+
+</div>

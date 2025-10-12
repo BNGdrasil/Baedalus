@@ -1,16 +1,40 @@
-# OCI Configuration
-tenancy_ocid     = "ocid1.tenancy.oc1..example"
-user_ocid        = "ocid1.user.oc1..example"
-fingerprint      = "xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"
-private_key_path = "/path/to/your/private_key.pem"
-region           = "ap-northeast-2a"
+# ========================================
+# Chuncheon Region Configuration
+# ========================================
 
-# Compartment
-compartment_id = "ocid1.compartment.oc1..example"
+tenancy_ocid_chuncheon     = "ocid1.tenancy.oc1..aaaaaaaa_your_chuncheon_tenancy_ocid"
+user_ocid_chuncheon        = "ocid1.user.oc1..aaaaaaaa_your_chuncheon_user_ocid"
+fingerprint_chuncheon      = "xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"
+private_key_path_chuncheon = "~/.oci/chuncheon_api_key.pem"
+region_chuncheon           = "ap-chuncheon-1"
+compartment_id_chuncheon   = "ocid1.compartment.oc1..aaaaaaaa_your_chuncheon_compartment_ocid"
 
-# Instance Configuration
+# ========================================
+# Osaka Region Configuration
+# ========================================
+
+tenancy_ocid_osaka     = "ocid1.tenancy.oc1..aaaaaaaa_your_osaka_tenancy_ocid"
+user_ocid_osaka        = "ocid1.user.oc1..aaaaaaaa_your_osaka_user_ocid"
+fingerprint_osaka      = "yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy"
+private_key_path_osaka = "~/.oci/osaka_api_key.pem"
+region_osaka           = "ap-osaka-1"
+compartment_id_osaka   = "ocid1.compartment.oc1..aaaaaaaa_your_osaka_compartment_ocid"
+
+# ========================================
+# General Configuration
+# ========================================
+
 instance_shape = "VM.Standard.A1.Flex"
-ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... your_public_key"
+domain_name    = "bnbong.xyz"
 
-# Domain Configuration
-domain_name = "bnbong.xyz"
+# ========================================
+# Service Configuration
+# ========================================
+
+postgres_user     = "bnbong"
+postgres_password = "your-super-secure-postgres-password-change-me"
+jwt_secret_key    = "your-super-secret-jwt-key-at-least-32-characters-long"
+
+# Optional: Cloudflare API token for DNS automation
+# cloudflare_api_token = "your_cloudflare_api_token"
