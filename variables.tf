@@ -86,7 +86,7 @@ variable "ssh_public_key" {
 variable "domain_name" {
   description = "Domain name for the application"
   type        = string
-  default     = "bnbong.xyz"
+  default     = "bnbong.com"
 }
 
 # ========================================
@@ -145,7 +145,7 @@ variable "vm_configs" {
       subnet_type             = "private"
     }
     vm6 = {
-      display_name            = "vm6-playground"
+      display_name            = "vm6-sandbox"
       ocpus                   = 1
       memory_in_gbs           = 6
       boot_volume_size_in_gbs = 50

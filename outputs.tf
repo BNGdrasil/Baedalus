@@ -42,7 +42,7 @@ output "vm5_private_ip" {
 }
 
 output "vm6_private_ip" {
-  description = "Private IP address of VM6 (Playground)"
+  description = "Private IP address of VM6 (Sandbox)"
   value       = oci_core_instance.vm6_playground.private_ip
 }
 
@@ -95,7 +95,6 @@ output "service_urls" {
   value = {
     main_site       = "https://${var.domain_name}"
     api_gateway     = "https://api.${var.domain_name}"
-    playground      = "https://playground.${var.domain_name}"
     monitoring_note = "Monitoring (VM5) is accessible only via SSH tunnel to VM2"
   }
 }
@@ -125,4 +124,3 @@ output "resource_summary" {
     }
   }
 }
-

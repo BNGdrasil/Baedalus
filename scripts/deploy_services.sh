@@ -77,7 +77,7 @@ DEBUG=false
 LOG_LEVEL=INFO
 
 # Domain
-DOMAIN_NAME=bnbong.xyz
+DOMAIN_NAME=bnbong.com
 
 # Database (VM4 in Osaka)
 POSTGRES_USER=bnbong
@@ -212,7 +212,7 @@ log_info "Updating nginx configuration on VM1..."
 ssh ubuntu@$VM1_IP "sudo tee /etc/nginx/sites-available/default > /dev/null << 'NGINX_EOF'
 server {
     listen 80;
-    server_name bnbong.xyz www.bnbong.xyz;
+    server_name bnbong.com www.bnbong.com;
 
     root /opt/bnbong/client/dist;
     index index.html;

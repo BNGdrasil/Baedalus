@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# bnbong.xyz 배포 스크립트
+# bnbong.com 배포 스크립트
 # 이 스크립트는 로컬에서 실행하여 서버에 애플리케이션을 배포합니다
 
 set -e
@@ -46,7 +46,7 @@ if [ ! -f "docker-compose.yml" ]; then
     exit 1
 fi
 
-if [ ! -d "gateway" ] || [ ! -d "auth-server" ] || [ ! -d "client" ] || [ ! -d "playground" ]; then
+if [ ! -d "gateway" ] || [ ! -d "auth-server" ] || [ ! -d "client" ]; then
     log_error "필요한 서비스 디렉토리가 없습니다."
     exit 1
 fi
@@ -102,7 +102,6 @@ log_info "서버 IP: $SERVER_IP"
 log_info "API Gateway: http://$SERVER_IP:8000"
 log_info "Auth Server: http://$SERVER_IP:8001"
 log_info "Client: http://$SERVER_IP:3000"
-log_info "Playground: http://$SERVER_IP:3001"
 
 # 9. 로그 확인 명령어 안내
 echo ""

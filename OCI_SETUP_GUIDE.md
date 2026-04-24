@@ -263,7 +263,7 @@ instance_shape = "VM.Standard.A1.Flex"
 ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC..."
 # ↑ Paste output from: cat ~/.ssh/bngdrasil_vm_key.pub
 
-domain_name    = "bnbong.xyz"
+domain_name    = "bnbong.com"
 # ↑ Your domain name (or change to your own)
 
 # ========================================
@@ -532,9 +532,11 @@ See [DEPLOYMENT.md](../DEPLOYMENT.md) for application deployment instructions.
 If you have a domain, configure DNS records:
 
 ```
-A     bnbong.xyz          → <VM1_PUBLIC_IP>
-A     api.bnbong.xyz      → <VM2_PUBLIC_IP>
-A     playground.bnbong.xyz → <VM1_PUBLIC_IP>
+A     bnbong.com          → <VM1_PUBLIC_IP>
+A     www.bnbong.com      → <VM1_PUBLIC_IP>
+A     api.bnbong.com      → <VM1_PUBLIC_IP>
+A     admin.bnbong.com    → <VM1_PUBLIC_IP>
+A     monitoring.bnbong.com → <VM1_PUBLIC_IP>
 ```
 
 ### 4. Setup Monitoring

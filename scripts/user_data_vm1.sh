@@ -1,5 +1,5 @@
 #!/bin/bash
-# VM1: Frontend & Proxy (Nginx + Client + Playground)
+# VM1: Frontend & Proxy (Nginx + Client)
 # OCPU: 1, RAM: 6GB
 
 set -e
@@ -36,11 +36,14 @@ systemctl start docker
 
 # Create application directory
 echo "Setting up application directory..."
-mkdir -p /opt/bnbong/{nginx/conf.d,nginx/ssl,client,playground}
+mkdir -p /opt/bnbong/{nginx/conf.d,nginx/ssl,client}
 cd /opt/bnbong
 
 # Create Nginx configuration
-cat > nginx/nginx.conf << 'NGINX_EOF'
+# Note: VM2 private IP for API proxying
+VM2_IP="10.0.1.60"
+
+cat > nginx/nginx.conf << NGINX_EOF
 events {
     worker_connections 2048;
 }
@@ -57,42 +60,105 @@ http {
     types_hash_max_size 2048;
 
     # Logging
-    access_log /var/log/nginx/access.log;
+    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                    '\$status \$body_bytes_sent "\$http_referer" '
+                    '"\$http_user_agent" "\$http_x_forwarded_for"';
+    
+    access_log /var/log/nginx/access.log main;
     error_log /var/log/nginx/error.log;
 
     # Gzip compression
     gzip on;
     gzip_vary on;
     gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_comp_level 6;
     gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss;
 
+    # Rate limiting
+    limit_req_zone \$binary_remote_addr zone=api:10m rate=10r/s;
+    limit_req_zone \$binary_remote_addr zone=login:10m rate=5r/m;
+
+    # Upstream servers (VM2 - Core APIs)
+    upstream gateway {
+        server $VM2_IP:8000;
+    }
+
+    upstream auth_server {
+        server $VM2_IP:8001;
+    }
+
     # Security headers
-    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Frame-Options "DENY" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
-    # Main site
+    # Main site (Portfolio)
     server {
         listen 80;
         server_name ${domain_name} www.${domain_name};
         
+        root /usr/share/nginx/html/client;
+        index index.html;
+        
+        # Static files
         location / {
-            root /usr/share/nginx/html/client;
-            index index.html;
-            try_files $uri $uri/ /index.html;
+            try_files \$uri \$uri/ /index.html;
+        }
+        
+        # Cache static assets
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
         }
     }
 
-    # Playground
+    # API Gateway
     server {
         listen 80;
-        server_name playground.${domain_name};
+        server_name api.${domain_name};
         
+        # API Gateway with rate limiting
         location / {
-            root /usr/share/nginx/html/playground;
-            index index.html;
-            try_files $uri $uri/ /index.html;
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://gateway;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            
+            # Cloudflare headers (if behind Cloudflare)
+            proxy_set_header CF-Connecting-IP \$http_cf_connecting_ip;
+            proxy_set_header CF-Ray \$http_cf_ray;
+            
+            # Timeouts
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
         }
+        
+        # Auth endpoints (direct access if needed)
+        location /auth {
+            limit_req zone=login burst=5 nodelay;
+            proxy_pass http://auth_server;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            
+            # Timeouts
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+        }
+    }
+
+    # Default server (reject unknown hosts)
+    server {
+        listen 80 default_server;
+        server_name _;
+        return 444;
     }
 }
 NGINX_EOF
@@ -111,7 +177,6 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./client/dist:/usr/share/nginx/html/client:ro
-      - ./playground/dist:/usr/share/nginx/html/playground:ro
       - ./nginx/ssl:/etc/nginx/ssl:ro
     restart: unless-stopped
     networks:
@@ -123,9 +188,8 @@ networks:
 COMPOSE_EOF
 
 # Create placeholder directories
-mkdir -p client/dist playground/dist
+mkdir -p client/dist
 echo "<h1>BNGdrasil - Coming Soon</h1>" > client/dist/index.html
-echo "<h1>Blysium Playground - Coming Soon</h1>" > playground/dist/index.html
 
 # Create systemd service
 cat > /etc/systemd/system/bnbong-vm1.service << 'SYSTEMD_EOF'
@@ -155,4 +219,3 @@ echo "=== VM1 Initialization Completed ==="
 echo "Services: Nginx (Frontend Proxy)"
 echo "Status: $(systemctl is-active bnbong-vm1.service)"
 date
-

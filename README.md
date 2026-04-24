@@ -32,7 +32,7 @@
 - **Osaka Region (ap-osaka-1)**: Monitoring & Backup (OCPU 4, RAM 24GB)
   - VM4 (1 OCPU, 6GB, 80GB): Monitoring - Prometheus + Grafana + Loki
   - VM5 (2 OCPU, 12GB, 70GB): Backup - Long-term storage & remote backups
-  - VM6 (1 OCPU, 6GB, 50GB): Playground - Development & testing environment
+  - VM6 (1 OCPU, 6GB, 50GB): Sandbox - Development & testing environment
 
 ### 💰 Cost: $0 (OCI Free Tier)
 
@@ -112,7 +112,7 @@ graph TB
             subgraph "Private Subnet 10.1.2.0/24"
                 VM4[VM4: Monitoring<br/>1 OCPU, 6GB<br/>Prometheus + Grafana]
                 VM5[VM5: Backup<br/>2 OCPU, 12GB<br/>Long-term Storage]
-                VM6[VM6: Playground<br/>1 OCPU, 6GB<br/>Dev Environment]
+                VM6[VM6: Sandbox<br/>1 OCPU, 6GB<br/>Dev Environment]
             end
             NAT2[NAT Gateway]
             DRG2[DRG]
@@ -148,7 +148,7 @@ graph TB
 | VM3 | Chuncheon (Private) | 1 | 6GB | 80GB | Database | PostgreSQL + Redis + MongoDB |
 | VM4 | Osaka (Private) | 1 | 6GB | 80GB | Monitoring | Prometheus + Grafana + Loki |
 | VM5 | Osaka (Private) | 2 | 12GB | 70GB | Backup | Long-term storage + remote backups |
-| VM6 | Osaka (Private) | 1 | 6GB | 50GB | Playground | Development & testing environment |
+| VM6 | Osaka (Private) | 1 | 6GB | 50GB | Sandbox | Development & testing environment |
 | **Total** | **2 Regions** | **8** | **48GB** | **380GB** | - | **All within OCI Free Tier** |
 
 ---
@@ -198,7 +198,7 @@ private_key_path_osaka = "~/.oci/osaka_api_key.pem"
 compartment_id_osaka   = "ocid1.compartment.oc1..aaaaaa..."
 
 # Service Configuration
-domain_name       = "bnbong.xyz"
+domain_name       = "bnbong.com"
 ssh_public_key    = "ssh-rsa AAAAB3NzaC1..."
 postgres_password = "your-secure-password"
 jwt_secret_key    = "your-secret-key-min-32-chars"
@@ -457,7 +457,6 @@ telnet <VM4_PRIVATE_IP> 5432
 - **🌉 [Bifrost](https://github.com/BNGdrasil/Bifrost)** - API Gateway
 - **🔐 [Bidar](https://github.com/BNGdrasil/Bidar)** - Auth Server
 - **🎨 [Bantheon](https://github.com/BNGdrasil/Bantheon)** - Web Client
-- **🎮 [Blysium](https://github.com/BNGdrasil/Blysium)** - Game Platform
 - **🌐 [Bsgard](https://github.com/BNGdrasil/Bsgard)** - Custom VPC
 
 ---

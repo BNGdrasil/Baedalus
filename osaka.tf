@@ -98,7 +98,7 @@ resource "oci_core_instance" "vm5_backup" {
   depends_on = [oci_core_instance.vm3_database]
 }
 
-# VM6: Playground & Development (Private Subnet)
+# VM6: Sandbox & Development (Private Subnet)
 resource "oci_core_instance" "vm6_playground" {
   provider            = oci.osaka
   availability_domain = data.oci_identity_availability_domains.osaka_ads.availability_domains[0].name
@@ -137,4 +137,3 @@ resource "oci_core_instance" "vm6_playground" {
     ]
   }
 }
-

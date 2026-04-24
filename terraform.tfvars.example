@@ -26,7 +26,7 @@ compartment_id_osaka   = "ocid1.compartment.oc1..aaaaaaaa_your_osaka_compartment
 
 instance_shape = "VM.Standard.A1.Flex"
 ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... your_public_key"
-domain_name    = "bnbong.xyz"
+domain_name    = "bnbong.com"
 
 # ========================================
 # Service Configuration

@@ -1,5 +1,5 @@
 #!/bin/bash
-# VM6: Playground & Development Environment
+# VM6: Sandbox & Development Environment
 # OCPU: 1, RAM: 6GB
 
 set -e
@@ -62,14 +62,14 @@ apt-get install -y \
     traceroute \
     dnsutils
 
-# Create playground directory
-echo "Setting up playground environment..."
-mkdir -p /opt/playground/{projects,data,scripts}
-cd /opt/playground
+# Create sandbox directory
+echo "Setting up sandbox environment..."
+mkdir -p /opt/sandbox/{projects,data,scripts}
+cd /opt/sandbox
 
 # Create a simple README
 cat > README.md << 'README_EOF'
-# BNGdrasil Playground Environment
+# BNGdrasil Sandbox Environment
 
 This VM is designated for development, testing, and experimentation.
 
@@ -83,13 +83,13 @@ This VM is designated for development, testing, and experimentation.
 - Redis client
 
 ## Directory Structure
-- `/opt/playground/projects`: Your project files
-- `/opt/playground/data`: Test data
-- `/opt/playground/scripts`: Utility scripts
+- `/opt/sandbox/projects`: Your project files
+- `/opt/sandbox/data`: Test data
+- `/opt/sandbox/scripts`: Utility scripts
 
 ## Quick Start
 ```bash
-cd /opt/playground/projects
+cd /opt/sandbox/projects
 # Start your development here
 ```
 
@@ -110,7 +110,7 @@ services:
   # Example: Nginx for testing
   # nginx:
   #   image: nginx:alpine
-  #   container_name: playground-nginx
+  #   container_name: sandbox-nginx
   #   ports:
   #     - "8080:80"
   #   volumes:
@@ -120,7 +120,7 @@ services:
   # Example: PostgreSQL for testing
   # postgres:
   #   image: postgres:15-alpine
-  #   container_name: playground-postgres
+  #   container_name: sandbox-postgres
   #   environment:
   #     - POSTGRES_USER=testuser
   #     - POSTGRES_PASSWORD=testpass
@@ -134,7 +134,7 @@ services:
   # Example: Redis for testing
   # redis:
   #   image: redis:7-alpine
-  #   container_name: playground-redis
+  #   container_name: sandbox-redis
   #   ports:
   #     - "6379:6379"
   #   restart: unless-stopped
@@ -142,7 +142,7 @@ services:
   # Monitoring agent (always active)
   node-exporter:
     image: prom/node-exporter:latest
-    container_name: playground-node-exporter
+    container_name: sandbox-node-exporter
     ports:
       - "9100:9100"
     command:
@@ -160,33 +160,33 @@ services:
 COMPOSE_EOF
 
 # Create a welcome script
-cat > /etc/profile.d/playground-welcome.sh << 'WELCOME_EOF'
+cat > /etc/profile.d/sandbox-welcome.sh << 'WELCOME_EOF'
 #!/bin/bash
 if [ -n "$PS1" ]; then
     echo "======================================"
-    echo "  BNGdrasil Playground Environment"
+    echo "  BNGdrasil Sandbox Environment"
     echo "======================================"
     echo ""
-    echo "Workspace: /opt/playground"
-    echo "README: /opt/playground/README.md"
+    echo "Workspace: /opt/sandbox"
+    echo "README: /opt/sandbox/README.md"
     echo ""
     echo "Quick commands:"
-    echo "  - cd /opt/playground"
+    echo "  - cd /opt/sandbox"
     echo "  - docker ps"
     echo "  - docker-compose up -d"
     echo ""
 fi
 WELCOME_EOF
-chmod +x /etc/profile.d/playground-welcome.sh
+chmod +x /etc/profile.d/sandbox-welcome.sh
 
 # Start node-exporter by default
 echo "Starting monitoring agent..."
-cd /opt/playground
+cd /opt/sandbox
 docker-compose up -d node-exporter
 
 echo "=== VM6 Initialization Completed ==="
-echo "Playground environment ready!"
-echo "Workspace: /opt/playground"
+echo "Sandbox environment ready!"
+echo "Workspace: /opt/sandbox"
 echo "Available tools: Docker, Git, Python3, Node.js, PostgreSQL client, MongoDB client, Redis client"
 echo "Node Exporter: http://localhost:9100"
 date
