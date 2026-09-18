@@ -1,0 +1,131 @@
+# 최소 alert rule 모음
+#
+# 통지 경로는 Grafana alerting이다. Alertmanager는 이번 범위에서 도입하지 않았으며,
+# receiver가 비어 있는 상태로 두면 경보가 아무 곳에도 도달하지 않기 때문이다.
+# Grafana에서 이 규칙들의 상태를 조회해 통지 규칙을 연결한다.
+#
+# job label의 출처
+#   prometheus.yml의 msa-services job이 file_sd의 service label을 `msa-<service>`
+#   형태로 job에 복사한다. 따라서 Bifrost는 job="msa-gateway", Bidar는
+#   job="msa-auth-server"가 된다.
+#
+# 두 서비스가 같은 metric 이름을 서로 다른 label로 노출한다는 점에 주의해야 한다.
+#   Bifrost(직접 계측, bifrost/src/core/metrics.py)
+#     http_requests_total{method, service, status_class}   status_class는 "5xx" 형태
+#     http_request_duration_seconds{method, service}
+#   Bidar(prometheus-fastapi-instrumentator 기본 계측, bidar/src/main.py)
+#     http_requests_total{method, status, handler}         status는 "500" 같은 실제 코드
+#     http_request_duration_seconds{method, handler}
+#     http_requests_inprogress
+#   should_group_status_codes=False이므로 Bidar의 status는 묶이지 않은 원래 코드다.
+#   하나의 식으로 두 형태를 같이 다루면 label 불일치로 조용히 빈 결과가 나오므로
+#   서비스별로 규칙을 나눈다.
+
+groups:
+  - name: basic-availability
+    interval: 30s
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.job }} target이 5분 이상 응답하지 않는다'
+          description: '{{ $labels.instance }}의 {{ $labels.job }} scrape가 실패하고 있다. 컨테이너 상태와 네트워크를 확인한다.'
+
+  - name: basic-errors
+    interval: 30s
+    rules:
+      # Bifrost는 상태 코드를 status_class로 묶어서 노출한다.
+      - alert: GatewayHighServerErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="msa-gateway",status_class="5xx"}[5m]))
+            /
+          sum(rate(http_requests_total{job="msa-gateway"}[5m]))
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: gateway
+        annotations:
+          summary: 'Bifrost 게이트웨이의 5xx 응답 비율이 5%를 넘는다'
+          description: '10분 동안 5xx 비율이 기준을 넘었다. 최근 배포와 등록된 서비스의 상태를 확인한다.'
+
+      # 어느 upstream에서 실패가 몰리는지 구분한다. service label은 등록된 서비스
+      # 수만큼만 늘어나므로 카디널리티가 제한된다.
+      - alert: GatewayUpstreamHighServerErrorRate
+        expr: |
+          sum by (service) (rate(http_requests_total{job="msa-gateway",status_class="5xx"}[5m]))
+            /
+          sum by (service) (rate(http_requests_total{job="msa-gateway"}[5m]))
+            > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '게이트웨이가 프록시하는 {{ $labels.service }}의 5xx 비율이 10%를 넘는다'
+          description: '해당 upstream 서비스의 상태를 먼저 확인한다. service가 gateway이면 게이트웨이 자체 endpoint의 오류다.'
+
+      # Bidar는 instrumentator 기본 계측이라 status가 묶이지 않은 실제 코드다.
+      - alert: AuthServerHighServerErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="msa-auth-server",status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{job="msa-auth-server"}[5m]))
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: auth-server
+        annotations:
+          summary: 'Bidar 인증 서버의 5xx 응답 비율이 5%를 넘는다'
+          description: '10분 동안 5xx 비율이 기준을 넘었다. DB 연결과 최근 배포를 확인한다.'
+
+  - name: basic-backup
+    interval: 30s
+    rules:
+      # 백업 job이 node_exporter의 textfile collector로 내보내는 지표다.
+      # 마지막 성공 시각이 8시간을 넘기면 경보한다. 제안한 RPO가 6시간이므로
+      # 한 번 걸러도 바로 울리지 않을 만큼의 여유를 둔 값이다.
+      #
+      # 이 시계열이 한 번도 보고된 적이 없으면 규칙 자체가 평가되지 않는다.
+      # 따라서 "백업이 도는지"를 이 규칙만으로 판단하지 않는다. textfile collector
+      # 경로 설정과 첫 보고 여부는 배포 후에 직접 확인한다.
+      - alert: BackupStale
+        expr: time() - bngdrasil_backup_last_success_timestamp_seconds > 8 * 3600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.instance }}의 백업이 8시간 넘게 성공하지 않았다'
+          description: '마지막 성공 이후 {{ $value | humanizeDuration }}이 지났다. 백업 job의 로그와 전송 대상 저장소를 확인한다.'
+
+  - name: basic-capacity
+    interval: 30s
+    rules:
+      - alert: DiskSpaceLow
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            /
+          node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+            < 0.15
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.instance }}의 {{ $labels.mountpoint }} 여유 공간이 15% 미만이다'
+          description: '로그, Docker 이미지, 백업 파일이 쌓였는지 확인한다.'
+
+      - alert: DiskSpaceCritical
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            /
+          node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+            < 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.instance }}의 {{ $labels.mountpoint }} 여유 공간이 5% 미만이다'
+          description: 'DB 쓰기 실패가 발생할 수 있다. 즉시 공간을 확보한다.'

@@ -1,4 +1,14 @@
 #!/bin/bash
+# DEPRECATED: 이 스크립트는 더 이상 사용하지 않는다.
+#
+# 폐기 사유
+#   - 애플리케이션 DB를 VM4(오사카)로 가정한다. 실제 DB는 VM3의 호스트 PostgreSQL 14다.
+#   - gateway/ auth-server/ 라는 옛 디렉터리 이름을 참조한다. 현재 소스는 bifrost/ bidar/ 다.
+#   - VM2의 /opt/bnbong/.env를 기본 비밀번호로 덮어쓴다. 운영 환경 파일을 파괴한다.
+#   - VM1의 Nginx 설정을 통째로 교체한다. 현재 운영 vhost 구성과 다르다.
+#
+# 대체 경로: baedalus/vm2-deployment/deploy.sh
+# 내용은 과거 배포본을 해석할 때 참고하기 위해 남겨 두었다. 실행하지 않는다.
 # BNGdrasil Services Deployment Script
 
 set -e

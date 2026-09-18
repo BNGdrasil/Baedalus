@@ -1,0 +1,162 @@
+# VM2 모니터링 compose
+#
+# 운영 배치 위치: /opt/bnbong/docker-compose.monitoring.yml
+# compose project: bnbong (working_dir /opt/bnbong)
+# 따라서 아래 상대 경로는 모두 /opt/bnbong 기준이며, 이 저장소의 monitoring/
+# 디렉터리를 /opt/bnbong/monitoring/으로 전송해야 한다.
+#
+# 이미지 태그는 2026-09-18에 실제로 실행 중이던 버전으로 고정했다.
+# latest 태그는 재시작할 때마다 다른 버전이 뜨므로 사용하지 않는다.
+#   prometheus 3.7.2 / grafana 12.2.1 / loki 3.5.7 / promtail 3.5.7
+
+services:
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:v3.7.2
+    container_name: vm2-prometheus
+    ports:
+      # SEC-04: VM1 Nginx는 Grafana만 프록시한다. Prometheus는 외부에 게시하지 않는다.
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/targets:/etc/prometheus/targets:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - api-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Node Exporter (VM2 호스트 지표)
+  # OBS-02: 이전 prometheus.yml의 vm2-node target은 localhost:9100이었고, 이 주소는
+  # Prometheus 컨테이너 자신을 가리켜 아무 지표도 수집하지 못했다. 실제 exporter를
+  # 같은 네트워크에 올리고 target을 node-exporter:9100으로 바꾼다.
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    container_name: vm2-node-exporter
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/host/root'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+      # 백업 job이 마지막 성공 시각을 .prom 파일로 남기면 이 경로에서 읽는다.
+      # basic.yml의 BackupStale 규칙이 그 지표를 사용한다.
+      - '--collector.textfile.directory=/var/lib/node_exporter/textfile_collector'
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+      # 호스트의 textfile collector 디렉터리. 백업 job이 이 위치에 .prom 파일을
+      # 원자적으로 교체해 두면 node-exporter가 다음 scrape에서 읽어 간다.
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro
+    networks:
+      - api-network
+    restart: unless-stopped
+
+  # Redis Exporter
+  # OBS-02: 이전 redis target은 6379를 HTTP /metrics로 긁으려 했다. 그 포트는
+  # Redis 프로토콜이므로 항상 실패한다. exporter를 두고 target을 9121로 바꾼다.
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.78.0
+    container_name: vm2-redis-exporter
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    networks:
+      - api-network
+    restart: unless-stopped
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:12.2.1
+    container_name: vm2-grafana
+    ports:
+      # VM1 Nginx가 10.0.1.60:3000으로 프록시하므로 private IP 바인딩이 필요하다.
+      # 값이 비면 모든 인터페이스로 조용히 넓어지므로 `:?`로 중단시킨다.
+      - "${VM2_PRIVATE_IP:?VM2_PRIVATE_IP must be set}:3000:3000"
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_SERVER_ROOT_URL=https://monitoring.bnbong.com
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - ./monitoring/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - api-network
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Loki
+  loki:
+    image: grafana/loki:3.5.7
+    container_name: vm2-loki
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - api-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Promtail
+  # 수집기 교체 예정: Promtail은 2026-03-02에 지원이 끝난다. Alloy 전환은 이번
+  # 범위 밖이며, 전환할 때 label 구성과 재시작 후 중복/유실을 따로 검증한다.
+  promtail:
+    image: grafana/promtail:3.5.7
+    container_name: vm2-promtail
+    volumes:
+      - ./monitoring/loki/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # docker_sd_configs가 컨테이너 이름과 compose label을 읽으려면 소켓이 필요하다.
+      # 읽기 전용으로 mount하지만 Docker API 전체를 볼 수 있는 권한이므로,
+      # 수집기를 Alloy로 교체할 때 이 권한도 함께 재검토한다.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # OBS-02: positions 파일을 /tmp에 두면 컨테이너를 다시 만들 때 사라져서
+      # 같은 로그를 다시 읽는다. 전용 volume에 보관한다.
+      - promtail_positions:/var/lib/promtail
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - api-network
+    depends_on:
+      loki:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  promtail_positions:
+
+networks:
+  api-network:
+    # core compose가 만드는 네트워크 이름과 같아야 한다.
+    name: api-network
+    external: true

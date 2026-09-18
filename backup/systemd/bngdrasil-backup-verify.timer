@@ -1,0 +1,13 @@
+[Unit]
+Description=BNGdrasil 격리 복원 훈련 주간 실행
+Documentation=file:///opt/bngdrasil-backup/README.md
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=1800
+AccuracySec=5min
+Unit=bngdrasil-backup-verify.service
+
+[Install]
+WantedBy=timers.target

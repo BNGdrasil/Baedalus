@@ -1,6 +1,26 @@
 # ========================================
 # Osaka Region VM Instances
 # ========================================
+#
+# 퇴역 정리 (I09)
+#   VM5와 VM6는 운영자 설명상 이미 삭제된 인스턴스다. 정의를 파일에서 완전히
+#   지우는 대신 `count = var.enable_vmN ? 1 : 0` 형태로 바꾸고 기본값을 false로
+#   두었다. 그 이유는 다음과 같다.
+#     - terraform.tfstate에는 두 인스턴스가 아직 RUNNING 상태로 남아 있다.
+#       실제 OCI 자원과 state를 대조하기 전에는 무엇이 남아 있는지 확정할 수 없다.
+#     - 정의만 삭제하면 이후에 다시 확인할 근거가 사라지고, 되살려야 할 때
+#       작성 내용을 복원하기 어렵다.
+#     - 기본값 false는 실수로 apply했을 때 삭제한 VM이 다시 생성되는 사고를 막는다.
+#   실제 state 정리 절차
+#     1. OCI 콘솔이나 CLI로 vm5-backup, vm6-sandbox 인스턴스와 boot volume의
+#        잔존 여부를 확인한다.
+#     2. 자원이 없으면 `terraform state rm oci_core_instance.vm5_backup`과
+#        `terraform state rm oci_core_instance.vm6_playground`로 state에서만 제거한다.
+#     3. 자원이 남아 있으면 삭제 여부를 먼저 결정하고 plan을 검토한다.
+#   이 저장소의 어떤 작업도 apply를 실행하지 않는다.
+#
+#   VM4는 미구성 예비 자원이므로 정의를 그대로 유지한다. Docker와 /opt/bnbong이
+#   없고 애플리케이션 DB도 구성되어 있지 않으므로, replica나 DR 자원으로 계산하지 않는다.
 
 # VM4: Monitoring & Observability (Private Subnet)
 resource "oci_core_instance" "vm4_monitoring" {
@@ -52,8 +72,11 @@ resource "oci_core_instance" "vm4_monitoring" {
   ]
 }
 
-# VM5: Backup & Long-term Storage (Private Subnet)
+# VM5: Backup & Long-term Storage (Private Subnet) — 퇴역. 기본 비활성.
+# cloud-init 스크립트는 scripts/legacy/user_data_vm5.sh로 옮겼다.
 resource "oci_core_instance" "vm5_backup" {
+  count = var.enable_vm5 ? 1 : 0
+
   provider            = oci.osaka
   availability_domain = data.oci_identity_availability_domains.osaka_ads.availability_domains[0].name
   compartment_id      = var.compartment_id_osaka
@@ -80,7 +103,7 @@ resource "oci_core_instance" "vm5_backup" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
-    user_data = base64encode(templatefile("${path.module}/scripts/user_data_vm5.sh", {
+    user_data = base64encode(templatefile("${path.module}/scripts/legacy/user_data_vm5.sh", {
       postgres_user     = var.postgres_user
       postgres_password = var.postgres_password
       vm3_private_ip    = oci_core_instance.vm3_database.private_ip
@@ -98,8 +121,11 @@ resource "oci_core_instance" "vm5_backup" {
   depends_on = [oci_core_instance.vm3_database]
 }
 
-# VM6: Sandbox & Development (Private Subnet)
+# VM6: Sandbox & Development (Private Subnet) — 퇴역. 기본 비활성.
+# cloud-init 스크립트는 scripts/legacy/user_data_vm6.sh로 옮겼다.
 resource "oci_core_instance" "vm6_playground" {
+  count = var.enable_vm6 ? 1 : 0
+
   provider            = oci.osaka
   availability_domain = data.oci_identity_availability_domains.osaka_ads.availability_domains[0].name
   compartment_id      = var.compartment_id_osaka
@@ -126,7 +152,7 @@ resource "oci_core_instance" "vm6_playground" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
-    user_data           = base64encode(file("${path.module}/scripts/user_data_vm6.sh"))
+    user_data           = base64encode(file("${path.module}/scripts/legacy/user_data_vm6.sh"))
   }
 
   preserve_boot_volume = false

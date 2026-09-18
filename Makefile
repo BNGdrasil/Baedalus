@@ -1,4 +1,4 @@
-.PHONY: help init plan apply destroy fmt validate clean output show deploy-all
+.PHONY: help init plan apply destroy fmt validate clean clean-all backup-state output show deploy-all
 
 # Colors
 GREEN  := \033[0;32m
@@ -73,7 +73,7 @@ state-list:
 # Specific Outputs
 show-ips:
 	@echo "$(GREEN)VM IP Addresses:$(NC)"
-	@terraform output -json | jq -r '.vm1_public_ip.value, .vm2_public_ip.value, .vm3_private_ip.value, .vm4_private_ip.value, .vm5_private_ip.value, .vm6_private_ip.value'
+	@terraform output -json | jq -r '.vm1_public_ip.value, .vm2_public_ip.value, .vm3_private_ip.value, .vm4_private_ip.value'
 
 show-ssh:
 	@echo "$(GREEN)SSH Connection Commands:$(NC)"
@@ -86,7 +86,7 @@ deploy-vm1:
 		exit 1; \
 	fi
 	@echo "$(GREEN)Deploying to VM1 (Frontend)...$(NC)"
-	./scripts/deploy.sh $$(terraform output -raw vm1_public_ip) vm1
+	./scripts/deploy.sh $$(terraform output -raw vm1_public_ip) ubuntu
 
 deploy-vm2:
 	@if [ -z "$$(terraform output -raw vm2_public_ip 2>/dev/null)" ]; then \
@@ -94,7 +94,7 @@ deploy-vm2:
 		exit 1; \
 	fi
 	@echo "$(GREEN)Deploying to VM2 (Core APIs)...$(NC)"
-	./scripts/deploy.sh $$(terraform output -raw vm2_public_ip) vm2
+	./scripts/deploy.sh $$(terraform output -raw vm2_public_ip) ubuntu
 
 deploy-all:
 	@echo "$(GREEN)Deploying applications to all VMs...$(NC)"
@@ -115,11 +115,7 @@ ssh-vm3:
 ssh-vm4:
 	@ssh -J ubuntu@$$(terraform output -raw vm2_public_ip) ubuntu@$$(terraform output -raw vm4_private_ip)
 
-ssh-vm5:
-	@ssh -J ubuntu@$$(terraform output -raw vm2_public_ip) ubuntu@$$(terraform output -raw vm5_private_ip)
-
-ssh-vm6:
-	@ssh -J ubuntu@$$(terraform output -raw vm2_public_ip) ubuntu@$$(terraform output -raw vm6_private_ip)
+# VM5, VM6는 퇴역했습니다. 접속 대상이 없으므로 ssh 타겟도 제거했습니다.
 
 # Logs
 logs-vm1:
@@ -144,13 +140,20 @@ clean:
 	@rm -f .terraform.lock.hcl
 	@echo "$(GREEN)Clean completed!$(NC)"
 
+# DATA-03: clean-all이 *.tfstate와 백업을 함께 지우던 동작을 제거했습니다.
+# state를 잃으면 현재 관리 중인 OCI 자원의 주소를 되찾을 수 없고, 이후 apply가
+# 이미 존재하는 자원을 다시 만들려고 시도합니다. state 파일은 일반 정리 대상이
+# 아니며, 정말 폐기해야 한다면 아래 backup-state로 사본을 만든 뒤 수동으로 처리합니다.
 clean-all: clean
-	@echo "$(RED)WARNING: This will delete ALL Terraform state files!$(NC)"
-	@echo "$(YELLOW)Press Ctrl+C to cancel, or Enter to continue...$(NC)"
-	@read dummy
-	@rm -f *.tfstate
-	@rm -f *.tfstate.backup
-	@echo "$(GREEN)All files cleaned!$(NC)"
+	@echo "$(YELLOW)clean-all은 .terraform 캐시와 lock 파일만 정리합니다.$(NC)"
+	@echo "$(YELLOW)Terraform state는 삭제하지 않습니다. DATA-03을 참고하세요.$(NC)"
+
+backup-state:
+	@echo "$(GREEN)Backing up Terraform state...$(NC)"
+	@ts=$$(date -u +%Y%m%dT%H%M%SZ); \
+	mkdir -p state-backups; \
+	cp terraform.tfstate state-backups/terraform.tfstate.$$ts; \
+	echo "Saved: state-backups/terraform.tfstate.$$ts"
 
 # Documentation
 docs:

@@ -1,480 +1,207 @@
-<p align="center">
-    <img align="top" width="30%" src="https://github.com/BNGdrasil/BNGdrasil/blob/main/images/Baedalus.png" alt="Baedalus"/>
-</p>
+# Baedalus
 
-<div align="center">
+Baedalus는 BNGdrasil 프로젝트의 인프라를 코드로 관리하는 저장소입니다. 다음 네 가지를 한곳에서
+다룹니다.
 
-# 🏗️ Baedalus (Bnbong + daedalus)
+- Oracle Cloud Infrastructure(OCI)의 네트워크와 컴퓨트 인스턴스를 Terraform으로 정의합니다.
+- 각 VM의 cloud-init 부트스트랩 스크립트를 `scripts/`에 둡니다. 이 스크립트는 호스트 준비까지만
+  담당하며 애플리케이션 release는 다루지 않습니다.
+- VM2에서 동작하는 애플리케이션(Bifrost 게이트웨이, Bidar 인증 서버, Redis)의 배포 정의를
+  `vm2-deployment/`에 둡니다.
+- VM2의 관측 스택과 VM3의 반복 백업 체계를 각각 `monitoring/`과 `backup/`에 둡니다.
+- GitHub Actions로 배포를 수행하는 워크플로와 그 서버 측 스크립트를 `.github/workflows/`와
+  `vm2-deployment/`에 둡니다. 전체 구조와 최초 준비 절차는
+  [GitHub Actions 배포 설정](docs/github-actions-setup.md)에 있습니다.
 
-**Multi-Region Cloud Infrastructure as Code**
-
-[![Terraform](https://img.shields.io/badge/Terraform-1.0+-623CE4?style=flat-square&logo=terraform&logoColor=white)](https://terraform.io)
-[![Oracle Cloud](https://img.shields.io/badge/Oracle%20Cloud-F80000?style=flat-square&logo=oracle&logoColor=white)](https://cloud.oracle.com)
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com)
-
-*Infrastructure as Code for [BNGdrasil](https://github.com/BNGdrasil/BNGdrasil) - A comprehensive cloud infrastructure project*
-
-</div>
-
----
-
-## 📋 Overview
-
-**Baedalus** is a Terraform-based IaC project that manages the core infrastructure of the BNGdrasil project.
-
-### 🌏 Multi-Region Architecture
-
-- **Chuncheon Region (ap-chuncheon-1)**: Main Services (OCPU 4, RAM 24GB)
-  - VM1 (1 OCPU, 6GB, 50GB): Client - Nginx reverse proxy & static files
-  - VM2 (2 OCPU, 12GB, 50GB): Core APIs - Gateway + Auth Server
-  - VM3 (1 OCPU, 6GB, 80GB): Database - PostgreSQL + Redis + MongoDB
-
-- **Osaka Region (ap-osaka-1)**: Monitoring & Backup (OCPU 4, RAM 24GB)
-  - VM4 (1 OCPU, 6GB, 80GB): Monitoring - Prometheus + Grafana + Loki
-  - VM5 (2 OCPU, 12GB, 70GB): Backup - Long-term storage & remote backups
-  - VM6 (1 OCPU, 6GB, 50GB): Sandbox - Development & testing environment
-
-### 💰 Cost: $0 (OCI Free Tier)
-
-All resources operate within Oracle Cloud Free Tier limits. Main services in Chuncheon region minimize cross-region data transfer costs.
+문서에 적힌 값은 2026-09-18에 운영 서버를 읽기 전용으로 관측한 결과를 기준으로 삼습니다. 실제
+컨테이너와 이미지와 마운트의 기준선은 [배포 기준선](docs/deployment-inventory.md)에 있습니다.
 
 ---
 
-## 🚀 Quick Start
+## 실제 운영 VM 구성
 
-### Prerequisites
+Terraform 정의에는 VM1부터 VM6까지 여섯 대가 들어 있지만, 실제로 운영에 쓰이는 VM은 VM1과 VM2와
+VM3 세 대뿐입니다. 설계 문서에 적힌 여섯 대 구성과 현재 상태를 혼동하지 않아야 합니다.
 
-- Terraform >= 1.0
-- 2 Oracle Cloud Infrastructure accounts (Chuncheon, Osaka)
-- SSH key pair
-- OCI CLI setup (optional)
+| VM | 리전, subnet | private IP | 현재 상태와 역할 |
+|---|---|---|---|
+| VM1 | 춘천 public | 10.0.1.133 | 운영 중입니다. Nginx가 단일 진입점을 맡고 정적 사이트를 서비스합니다. |
+| VM2 | 춘천 public | 10.0.1.60 | 운영 중입니다. Bidar, Bifrost, Wegis, Overlock, Redis, 관측 스택이 동작합니다. |
+| VM3 | 춘천 private | 10.0.2.134 | 운영 중입니다. 호스트 PostgreSQL 14와 호스트 mongod와 Redis 컨테이너가 있습니다. |
+| VM4 | 오사카 private | 10.1.2.111 | 미구성 예비 자원입니다. SSH로 접속은 되지만 Docker와 `/opt/bnbong`이 없습니다. |
+| VM5 | 오사카 private | state상 10.1.2.3 | 퇴역 이력이 있습니다. `enable_vm5` 기본값이 false입니다. |
+| VM6 | 오사카 private | state상 10.1.2.229 | 퇴역 이력이 있습니다. `enable_vm6` 기본값이 false입니다. |
 
-### Installation
+VM4는 replica나 재해 복구 자원으로 계산하지 않습니다. 빈 자원을 유지하는 비용과 복구 이점을
+비교한 뒤에 유지 여부를 결정해야 합니다.
+
+VM5와 VM6는 운영자 설명상 삭제한 인스턴스이며 OCPU를 다른 인스턴스로 합쳤다고 합니다. 다만
+로컬 `terraform.tfstate`에는 두 인스턴스가 여전히 `RUNNING` 상태로 남아 있습니다. 즉 state와
+실제 OCI 자원이 어긋나 있으므로, 실제 자원을 조회해 state와 맞추기 전에는 apply하지 않습니다.
+정리 절차는 아래 "VM5와 VM6의 state 정리"에 적었습니다.
+
+---
+
+## 디렉터리 구조
+
+```
+baedalus/
+├── main.tf                     provider 정의, availability domain과 image data source
+├── variables.tf                변수 정의. enable_vm5, enable_vm6, admin_cidr, api_client_cidr 포함
+├── network.tf                  VCN, subnet, route table, security list
+├── chuncheon.tf                VM1, VM2, VM3 인스턴스 정의
+├── osaka.tf                    VM4 인스턴스 정의와 비활성 상태의 VM5, VM6 정의
+├── outputs.tf                  IP 주소, SSH 명령, 자원 요약 출력
+├── Makefile                    init, plan, fmt, validate, backup-state 등 자동화 명령
+├── terraform.tfvars.example    tfvars 템플릿. 실제 값은 추적하지 않습니다
+├── scripts/                    VM별 cloud-init 스크립트와 정적 사이트 배포 스크립트
+│   └── legacy/                 더 이상 호출하지 않는 스크립트 보관소
+├── vm2-deployment/             VM2 애플리케이션 release(compose, deploy.sh, env.template)
+│   └── legacy/                 대체된 서비스 등록 방식의 보관소
+├── monitoring/                 VM2 관측 스택(Prometheus, Grafana, Loki, Promtail, exporter)
+├── backup/                     VM3와 VM2의 반복 백업 스크립트와 systemd 유닛
+├── docs/                       배포 기준선 문서와 GitHub Actions 배포 설정 안내
+└── .github/workflows/          Terraform 검증과 모니터링, 백업 배포 워크플로
+```
+
+---
+
+## Terraform 사용 절차
+
+먼저 자격 증명을 준비합니다. 절차는 [OCI 준비 안내](OCI_SETUP_GUIDE.md)에 있습니다.
 
 ```bash
-# 1. Clone repository
-cd infra
-
-# 2. Environment setup
-make setup
-
-# 3. Edit terraform.tfvars
-# Enter OCI credentials for both regions
-vim terraform.tfvars
-
-# 4. Deploy infrastructure
-make init
-make plan
-make apply
-
-# 5. Check outputs
-make output
-make show-ips
-make show-ssh
+make setup      # terraform.tfvars가 없으면 예시 파일을 복사합니다
+make init       # provider plugin을 내려받습니다
+make fmt        # terraform fmt -recursive
+make validate   # terraform validate
+make plan       # 변경 계획을 확인합니다
 ```
 
-### Quick Deploy (Fully Automated)
+`make plan`까지는 언제든 실행해도 안전합니다. `terraform validate`는 자격 증명 없이도 구성만
+검사하며, GitHub Actions의 `Terraform Validation` 워크플로도 pull request에서 같은 검사를
+수행합니다. 포맷이 깨져 있으면 워크플로가 실패합니다.
+
+### CI에서 plan과 apply를 하지 않는 이유
+
+`Terraform Validation` 워크플로에는 `plan`과 `apply` 단계를 두지 않았습니다. state가 저장소 바깥의
+로컬 파일인 `terraform.tfstate`에만 있어서, runner에는 현재 관리 중인 자원 정보가 전혀 없기
+때문입니다. 그 상태로 `plan`을 실행하면 이미 존재하는 자원을 새로 만들겠다는 계획이 나오고, 그
+계획을 그대로 `apply`하면 운영 인프라가 훼손됩니다.
+
+원격 backend로 state를 옮긴 뒤에 다시 검토합니다. OCI Object Storage의 S3 호환 endpoint를
+backend로 사용할 수 있으며, 도입하기 전에 저장 위치의 암호화와 버전 관리와 접근 권한과 잠금
+지원을 먼저 확인해야 합니다. 아래 "VM5와 VM6의 state 정리"를 끝내기 전에는 이전 작업도 시작하지
+않습니다.
+
+### apply는 state 대조를 마친 뒤에 실행합니다
+
+**현재 상태에서 `make apply`를 실행하면 안 됩니다.** state에 남아 있는 VM5와 VM6가 실제 자원과
+어긋나 있어서, plan에 의도하지 않은 생성이나 삭제가 섞여 들어갈 수 있습니다. 아래 순서를 먼저
+끝내야 합니다.
+
+1. OCI 콘솔이나 CLI로 `vm5-backup`과 `vm6-sandbox` 인스턴스, 그리고 남은 boot volume의 잔존
+   여부를 조회합니다.
+2. state 사본을 남깁니다.
+3. state를 실제 자원과 맞춥니다.
+4. `terraform plan`에 의도하지 않은 생성과 삭제와 교체가 없는지 확인합니다.
+
+### state 백업
+
+state에는 OCI 자원 주소와 민감한 변수 값이 들어 있습니다. apply 전후에 사본을 남깁니다.
 
 ```bash
-# Run everything at once
-make quick-deploy
+make backup-state   # state-backups/terraform.tfstate.<UTC 시각>에 사본을 만듭니다
 ```
+
+state를 잃으면 현재 관리 중인 자원의 주소를 되찾을 수 없고, 이후 apply가 이미 존재하는 자원을
+다시 만들려고 시도합니다. `make clean`과 `make clean-all`은 `.terraform` 캐시와 lock 파일만
+정리하며 state 파일에는 손대지 않습니다. `.gitignore`가 `*.tfstate`를 제외하고 있으므로 사본을
+공개 저장소에 올리지 않습니다.
+
+backend는 `main.tf`에서 local backend로 명시했습니다. remote backend는 아직 도입하지 않았으며,
+도입하려면 저장 위치의 암호화와 버전 관리와 접근 권한과 잠금 지원을 먼저 확인해야 합니다.
 
 ---
 
-## 🏗️ Infrastructure Architecture
+## VM5와 VM6의 state 정리
 
-### Network Topology
+`enable_vm5`와 `enable_vm6`가 false이면 두 리소스의 `count`가 0이 됩니다. 그런데 state에는 두
+인스턴스가 남아 있으므로 plan에는 destroy하겠다는 내용이 표시됩니다. `moved` 블록으로는 이 표시를
+없앨 수 없습니다. `moved`는 같은 구성 안에서 리소스 주소를 옮길 때 쓰는 기능이고, 여기에서 필요한
+것은 관리 대상에서 제외하는 조치이기 때문입니다.
 
-```mermaid
-graph TB
-    subgraph "Internet"
-        CF[☁️ Cloudflare<br/>DNS & WAF]
-    end
-    
-    subgraph "Chuncheon Region - ap-chuncheon-1"
-        subgraph "VCN 10.0.0.0/16"
-            subgraph "Public Subnet 10.0.1.0/24"
-                VM1[VM1: Client<br/>1 OCPU, 6GB<br/>Nginx]
-                VM2[VM2: Core APIs<br/>2 OCPU, 12GB<br/>Gateway + Auth]
-            end
-            subgraph "Private Subnet 10.0.2.0/24"
-                VM3[VM3: Database<br/>1 OCPU, 6GB<br/>PostgreSQL + Redis + MongoDB]
-            end
-            NAT1[NAT Gateway]
-            IGW1[Internet Gateway]
-            DRG1[DRG]
-        end
-    end
-    
-    subgraph "Osaka Region - ap-osaka-1"
-        subgraph "VCN 10.1.0.0/16"
-            subgraph "Private Subnet 10.1.2.0/24"
-                VM4[VM4: Monitoring<br/>1 OCPU, 6GB<br/>Prometheus + Grafana]
-                VM5[VM5: Backup<br/>2 OCPU, 12GB<br/>Long-term Storage]
-                VM6[VM6: Sandbox<br/>1 OCPU, 6GB<br/>Dev Environment]
-            end
-            NAT2[NAT Gateway]
-            DRG2[DRG]
-        end
-    end
-    
-    CF --> IGW1
-    IGW1 --> VM1
-    IGW1 --> VM2
-    VM1 --> NAT1
-    VM2 --> NAT1
-    VM3 --> NAT1
-    
-    VM2 --> VM3
-    DRG1 -.RPC Peering.-> DRG2
-    VM4 -.Monitor.-> DRG2
-    VM5 -.Backup.-> DRG2
-    
-    style VM1 fill:#4CAF50,color:#fff
-    style VM2 fill:#2196F3,color:#fff
-    style VM3 fill:#9C27B0,color:#fff
-    style VM4 fill:#607D8B,color:#fff
-    style VM5 fill:#FF9800,color:#fff
-    style VM6 fill:#795548,color:#fff
+```bash
+# 1) 오사카 compartment에서 두 인스턴스가 실제로 없는지 확인합니다
+oci compute instance list \
+  --compartment-id <오사카 compartment OCID> \
+  --region ap-osaka-1
+
+# 2) 남은 boot volume도 함께 확인합니다
+oci bv boot-volume list \
+  --compartment-id <오사카 compartment OCID> \
+  --availability-domain <AD 이름> \
+  --region ap-osaka-1
+
+# 3) 자원이 없다면 state 사본을 만든 뒤 state에서만 제거합니다
+make backup-state
+terraform state rm oci_core_instance.vm5_backup oci_core_instance.vm6_playground
+
+# 4) plan이 No changes.를 보고하는지 확인합니다
+terraform plan
 ```
 
-### Resource Allocation
-
-| VM | Location | OCPU | RAM | Storage | Role | Services |
-|----|----------|------|-----|---------|------|----------|
-| VM1 | Chuncheon (Public) | 1 | 6GB | 50GB | Client | Nginx reverse proxy + static files |
-| VM2 | Chuncheon (Public) | 2 | 12GB | 50GB | Core APIs | Gateway + Auth Server + Redis |
-| VM3 | Chuncheon (Private) | 1 | 6GB | 80GB | Database | PostgreSQL + Redis + MongoDB |
-| VM4 | Osaka (Private) | 1 | 6GB | 80GB | Monitoring | Prometheus + Grafana + Loki |
-| VM5 | Osaka (Private) | 2 | 12GB | 70GB | Backup | Long-term storage + remote backups |
-| VM6 | Osaka (Private) | 1 | 6GB | 50GB | Sandbox | Development & testing environment |
-| **Total** | **2 Regions** | **8** | **48GB** | **380GB** | - | **All within OCI Free Tier** |
+자원이 남아 있다면 3번에서 멈추고 삭제 여부를 먼저 결정합니다. 다른 변경이 보이면 apply하지 말고
+원인을 먼저 확인합니다. 이 저장소의 작업에서는 위 절차를 아직 실행하지 않았습니다.
 
 ---
 
-## 📁 Project Structure
+## 보안 규칙 변수
 
-```
-infra/
-├── main.tf              # Providers and data sources
-├── variables.tf         # Variable definitions
-├── network.tf          # VCN, Subnet, Security Lists
-├── chuncheon.tf        # Chuncheon region VM resources
-├── osaka.tf            # Osaka region VM resources
-├── outputs.tf          # Output values
-├── terraform.tfvars.example  # Environment variable template
-├── Makefile            # Automation commands
-├── scripts/
-│   ├── user_data_vm1.sh    # VM1 initialization script
-│   ├── user_data_vm2.sh    # VM2 initialization script
-│   ├── user_data_vm3.sh    # VM3 initialization script
-│   ├── user_data_vm4.sh    # VM4 initialization script
-│   ├── user_data_vm5.sh    # VM5 initialization script
-│   ├── user_data_vm6.sh    # VM6 initialization script
-│   └── deploy.sh           # Application deployment script
-└── README.md           # This file
-```
+security list의 접근 범위를 두 변수로 조정합니다.
+
+| 변수 | 기본값 | 적용 대상과 주의점 |
+|---|---|---|
+| `admin_cidr` | `0.0.0.0/0` | 춘천 public subnet의 SSH(22번 포트) 출처입니다. 기본값은 현행 설정을 그대로 유지한 값이므로, 관리 접근 경로를 확인한 뒤에 좁혀야 합니다. 확인 없이 좁히면 운영자가 VM에 접속하지 못하게 됩니다. |
+| `api_client_cidr` | `10.0.1.0/24` | VM2의 Gateway(8000)와 Auth Server(8001)에 접근할 수 있는 출처입니다. 실제 호출자는 춘천 public subnet의 VM1 Nginx뿐입니다. |
+
+### SEC-04의 현재 범위
+
+`api_client_cidr`로 8000과 8001의 출처를 좁혔지만, 같은 security list에는 VCN 전체
+(`10.0.0.0/16`)에 모든 프로토콜을 허용하는 "Internal communication" 규칙이 그대로 남아 있습니다.
+**따라서 이번 제한으로 차단되는 것은 외부 인터넷에서 오는 직접 접근까지입니다.** 같은 VCN 안의
+VM은 여전히 VM2의 모든 포트에 도달할 수 있으며, 예를 들어 춘천 private subnet의 VM3에서 VM2의
+8000 포트로 연결할 수 있습니다.
+
+이 내부 규칙은 아직 바꾸지 않았습니다. VM1과 VM2와 VM3 사이에 실제로 필요한 포트와 방향을 먼저
+검증하지 않은 상태에서 좁히면 운영 중인 통신을 끊을 수 있기 때문입니다. 후속 작업에서 필요한
+포트만 남기는 형태로 분해합니다.
 
 ---
 
-## 🔧 Configuration
+## 비용
 
-### terraform.tfvars Setup
-
-```hcl
-# Chuncheon Region (Account 1)
-tenancy_ocid_chuncheon     = "ocid1.tenancy.oc1..aaaaaa..."
-user_ocid_chuncheon        = "ocid1.user.oc1..aaaaaa..."
-fingerprint_chuncheon      = "xx:xx:xx:..."
-private_key_path_chuncheon = "~/.oci/chuncheon_api_key.pem"
-compartment_id_chuncheon   = "ocid1.compartment.oc1..aaaaaa..."
-
-# Osaka Region (Account 2)
-tenancy_ocid_osaka     = "ocid1.tenancy.oc1..aaaaaa..."
-user_ocid_osaka        = "ocid1.user.oc1..aaaaaa..."
-fingerprint_osaka      = "yy:yy:yy:..."
-private_key_path_osaka = "~/.oci/osaka_api_key.pem"
-compartment_id_osaka   = "ocid1.compartment.oc1..aaaaaa..."
-
-# Service Configuration
-domain_name       = "bnbong.com"
-ssh_public_key    = "ssh-rsa AAAAB3NzaC1..."
-postgres_password = "your-secure-password"
-jwt_secret_key    = "your-secret-key-min-32-chars"
-```
+이 구성은 OCI Always Free 자원만 사용하도록 설계했습니다. 다만 **무료라고 단정할 수 없습니다.**
+Always Free 한도는 계정과 리전과 가입 시점에 따라 다르고, 무료 평가판 기간이 끝난 뒤 자원이
+유료로 전환되는 경우도 있습니다. 실제 청구 금액과 Always Free 조건과 home region을 계정마다 직접
+확인해야 하며, 이 확인은 아직 끝나지 않았습니다. OCI 콘솔의 Cost Analysis와 Budgets에서 현재
+사용량을 조회하고 예산 알림을 설정해 두기를 권장합니다.
 
 ---
 
-## 📝 Makefile Commands
-
-### Basic Commands
-
-```bash
-make help          # Show all commands
-make setup         # Initial environment setup
-make init          # Initialize Terraform
-make plan          # Review deployment plan
-make apply         # Deploy infrastructure
-make destroy       # Destroy infrastructure
-```
-
-### Code Quality
-
-```bash
-make fmt           # Format code
-make validate      # Validate code
-make lint          # Format + Validate
-```
-
-### State Management
-
-```bash
-make output        # Show all outputs
-make show          # Show current state
-make show-ips      # Show IP addresses only
-make show-ssh      # Show SSH commands
-make summary       # Resource summary
-```
-
-### SSH Access
-
-```bash
-make ssh-vm1       # Connect to VM1 (Public)
-make ssh-vm2       # Connect to VM2 (Public)
-make ssh-vm3       # Connect to VM3 (via Jump Host)
-make ssh-vm4       # Connect to VM4 (via Jump Host)
-make ssh-vm5       # Connect to VM5 (via Jump Host)
-make ssh-vm6       # Connect to VM6 (via Jump Host)
-```
-
-### Deployment and Monitoring
-
-```bash
-make deploy-vm1    # Deploy to VM1
-make deploy-vm2    # Deploy to VM2
-make deploy-all    # Deploy all
-make logs-vm1      # VM1 logs
-make logs-vm2      # VM2 logs
-make health        # Health check
-```
-
----
-
-## 🔐 Security
-
-### Network Security
-
-- **Public Subnet**: Only VM1, VM2 accessible from outside
-- **Private Subnet**: VM3, VM4, VM5, VM6 internal network only
-- **NAT Gateway**: Outbound traffic for private subnets
-- **Security Lists**: Fine-grained port-based access control
-
-### Access Control
-
-- **SSH**: Key-based authentication only
-- **Jump Host**: Private VMs accessed via VM2
-- **Cloudflare**: WAF and DDoS protection
-- **Secrets**: Sensitive information in terraform.tfvars (gitignored)
-
-### Best Practices
-
-1. ✅ Never commit `terraform.tfvars`
-2. ✅ Store SSH keys securely
-3. ✅ Enable MFA in OCI Console
-4. ✅ Rotate secret keys regularly
-5. ✅ Encrypt Terraform State
-
----
-
-## 🚀 Deployment Workflow
-
-### Step 1: Provision Infrastructure
-
-```bash
-# Create infrastructure
-make init
-make plan
-make apply
-
-# Verify creation
-make output
-make summary
-```
-
-### Step 2: Verify VM Access
-
-```bash
-# Access public VMs
-make ssh-vm1
-make ssh-vm2
-
-# Access private VMs (via Jump Host)
-make ssh-vm3
-```
-
-### Step 3: Deploy Applications
-
-```bash
-# Individual deployment
-make deploy-vm1
-make deploy-vm2
-
-# Or deploy all
-make deploy-all
-```
-
-### Step 4: Monitor Status
-
-```bash
-# Check service status
-make health
-
-# View logs
-make logs-vm1
-make logs-vm2
-
-# Access Grafana (VM5)
-ssh -L 3000:localhost:3000 ubuntu@<VM5_IP>
-# http://localhost:3000
-```
-
----
-
-## 📊 Monitoring & Observability
-
-### Prometheus (VM5)
-
-- **URL**: `http://localhost:9090` (via SSH tunnel)
-- **Metrics**: All VM and service metrics collected
-- **Retention**: 30 days
-
-### Grafana (VM5)
-
-- **URL**: `http://localhost:3000` (via SSH tunnel)
-- **Credentials**: admin / admin (initial password)
-- **Dashboards**: VM resources, service status, API performance
-
-### Loki (VM5)
-
-- **URL**: `http://localhost:3100`
-- **Log Retention**: 7 days
-- **Sources**: Application logs from all VMs
-
----
-
-## 🔄 Backup & DR
-
-### Automated Backup (VM4)
-
-- **Frequency**: Daily backup (midnight)
-- **Retention**: 7 days
-- **Location**: VM4 `/backups` directory
-
-### PostgreSQL Replication (VM6)
-
-- **Type**: Streaming Replication
-- **Delay**: < 1 second
-- **Purpose**: Disaster recovery, read load distribution
-
-### Verify Backups
-
-```bash
-# Check VM4 backups
-make ssh-vm4
-ls -lh /opt/bnbong/postgres/backups/
-
-# Check VM6 replica status
-make ssh-vm6
-docker exec vm6-postgres-replica pg_isready
-```
-
----
-
-## 🛠️ Troubleshooting
-
-### VM Won't Start
-
-```bash
-# 1. Check VM status
-make ssh-vm1
-systemctl status bnbong-vm1.service
-
-# 2. View logs
-journalctl -u bnbong-vm1.service -f
-
-# 3. Check Docker services
-docker ps -a
-docker-compose logs
-```
-
-### Database Connection Error
-
-```bash
-# Access VM4 to check PostgreSQL
-make ssh-vm4
-docker exec vm4-postgres pg_isready
-
-# Test connection
-docker exec vm4-postgres psql -U bnbong -d bnbong -c "SELECT 1;"
-```
-
-### Cross-Region Communication Issue
-
-```bash
-# Test connection from VM2 to VM4
-make ssh-vm2
-ping <VM4_PRIVATE_IP>
-telnet <VM4_PRIVATE_IP> 5432
-```
-
----
-
-## 🎯 Future Roadmap
-
-### Phase 1: Current (Complete) ✅
-- [x] Multi-region infrastructure
-- [x] 6 VM deployment
-- [x] Public/Private subnet separation
-- [x] Automated initialization scripts
-
-### Phase 2: Improvements Planned
-- [ ] Terraform Remote State (OCI Object Storage)
-- [ ] CI/CD pipeline integration
-- [ ] Auto-scaling configuration
-- [ ] VPN or FastConnect setup
-
-### Phase 3: Expansion
-- [ ] Multi-CSP support (AWS, Azure)
-- [ ] Kubernetes migration
-- [ ] Service Mesh adoption
-- [ ] OpenStack home lab integration
-
----
-
-## 📚 Related Projects
-
-- **🌉 [Bifrost](https://github.com/BNGdrasil/Bifrost)** - API Gateway
-- **🔐 [Bidar](https://github.com/BNGdrasil/Bidar)** - Auth Server
-- **🎨 [Bantheon](https://github.com/BNGdrasil/Bantheon)** - Web Client
-- **🌐 [Bsgard](https://github.com/BNGdrasil/Bsgard)** - Custom VPC
-
----
-
-## 📄 License
-
-This project is used for personal learning and development purposes.
-
----
-
-## 🤝 Contributing
-
-This project is for personal learning purposes, but feedback and suggestions are always welcome!
-
----
-
-<div align="center">
-
-**[BNGdrasil](https://github.com/BNGdrasil) - Building a personal cloud nation, one service at a time.**
-
-</div>
+## 하위 문서
+
+| 문서 | 다루는 내용 |
+|---|---|
+| [OCI_SETUP_GUIDE.md](OCI_SETUP_GUIDE.md) | OCI 계정과 API 키와 `terraform.tfvars`를 준비하는 절차를 설명합니다. |
+| [docs/github-actions-setup.md](docs/github-actions-setup.md) | 저장소별 배포 워크플로의 역할과 secret 구성, 최초 준비 절차, 롤백 절차를 설명합니다. |
+| [docs/deployment-inventory.md](docs/deployment-inventory.md) | 2026-09-18 기준의 실제 배포 기준선입니다. 컨테이너, 이미지, 네트워크, 마운트를 기록했습니다. |
+| [vm2-deployment/README.md](vm2-deployment/README.md) | VM2의 Gateway와 Auth Server를 배포하고 확인하고 되돌리는 절차를 설명합니다. |
+| [monitoring/README.md](monitoring/README.md) | VM2 관측 스택의 구성과 알림 규칙과 접근 방법을 설명합니다. |
+| [backup/README.md](backup/README.md) | VM3와 VM2의 반복 백업 체계와 복원 훈련 절차를 설명합니다. |
+| [scripts/legacy/README.md](scripts/legacy/README.md) | 더 이상 호출하지 않는 부트스트랩 스크립트의 보관 사유를 적었습니다. |
+| [vm2-deployment/legacy/README.md](vm2-deployment/legacy/README.md) | 대체된 서비스 등록 방식의 보관 사유를 적었습니다. |
+
+관련 저장소는 다음과 같습니다. [Bifrost](https://github.com/BNGdrasil/Bifrost)가 API 게이트웨이를,
+[Bidar](https://github.com/BNGdrasil/Bidar)가 인증 서버를,
+[Bantheon](https://github.com/BNGdrasil/Bantheon)이 웹 클라이언트와 VM1 Nginx 설정을 담당합니다.

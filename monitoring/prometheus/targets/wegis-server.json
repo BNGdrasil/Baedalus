@@ -1,0 +1,10 @@
+[
+  {
+    "targets": ["wegis_server:9000"],
+    "labels": {
+      "service": "wegis-server",
+      "team": "security",
+      "env": "production"
+    }
+  }
+]

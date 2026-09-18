@@ -1,0 +1,13 @@
+[Unit]
+Description=BNGdrasil 백업 전송 주기 실행
+Documentation=file:///opt/bngdrasil-backup/README.md
+
+[Timer]
+OnCalendar=*-*-* 01,13:30:00
+Persistent=true
+RandomizedDelaySec=900
+AccuracySec=1min
+Unit=bngdrasil-backup-ship.service
+
+[Install]
+WantedBy=timers.target

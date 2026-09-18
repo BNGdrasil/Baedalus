@@ -1,0 +1,21 @@
+[Unit]
+Description=BNGdrasil 백업 독립 보관 전송
+Documentation=file:///opt/bngdrasil-backup/README.md
+After=network-online.target bngdrasil-backup.service
+Wants=network-online.target
+OnFailure=bngdrasil-backup-notify@%n.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/opt/bngdrasil-backup/ship.sh
+EnvironmentFile=-/etc/bngdrasil-backup/env
+TimeoutStartSec=7200
+Nice=15
+IOSchedulingClass=idle
+ProtectHome=yes
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

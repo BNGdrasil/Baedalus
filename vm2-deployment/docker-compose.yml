@@ -1,0 +1,184 @@
+# VM2 core compose (Bidar / Bifrost / Redis)
+#
+# 운영 배치 위치: /opt/bnbong/docker-compose.yml
+# compose project: bnbong (working_dir /opt/bnbong)
+# 이 파일은 2026-09-18 백업의 실제 운영 compose를 기준으로 맞춘 것이다.
+#
+# 역할 분리
+#   - cloud-init(scripts/user_data_vm2.sh)은 호스트 준비까지만 담당한다.
+#   - 애플리케이션 release는 GitHub Actions가 GHCR에 올린 image를 VM2의
+#     deploy-image.sh가 교체하는 방식으로 이루어진다.
+#   - deploy.sh(소스 현장 build)는 GHCR image를 쓸 수 없을 때의 대체 경로다.
+#
+# `version:` 키는 Compose v2에서 폐기되었으므로 제거했다.
+
+services:
+  # Redis
+  #
+  # 현재 Bidar와 Bifrost는 REDIS_URL을 읽지 않는다. 두 앱의 Settings에서 해당
+  # 항목이 사라졌고, 로그인 제한과 게이트웨이 제한은 모두 in-process 계수기다.
+  # Wegis는 VM3의 Redis DB 4를 사용하므로 이 컨테이너를 쓰지 않는다.
+  # 즉 VM2 Redis의 현재 소비자를 아직 확인하지 못했다. 데이터(AOF)가 남아 있으므로
+  # 이번 변경에서 제거하지 않고, 소비자 확인 후 유지 여부를 따로 판단한다.
+  redis:
+    image: redis:7-alpine
+    container_name: vm2-redis
+    ports:
+      # SEC-04: Redis는 VM2 외부로 노출하지 않는다. 컨테이너 사이 통신은
+      # api-network의 DNS 이름(redis:6379)으로 이루어지므로 loopback 게시로 충분하다.
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    networks:
+      - api-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Auth Server (Bidar)
+  auth-server:
+    # build 블록은 남겨 둔다. GHCR에서 image를 받을 수 없을 때 deploy.sh가
+    # 소스를 전송하고 이 자리에서 build하는 대체 경로를 쓰기 때문이다.
+    # 평소 release 경로인 deploy-image.sh는 `--no-build`를 붙이므로 이 블록을
+    # 사용하지 않는다.
+    build:
+      context: ./bidar
+      dockerfile: Dockerfile
+    # 기본값을 GHCR 참조로 둔다. .env에 AUTH_SERVER_IMAGE가 없으면 이 값이 쓰인다.
+    image: ${AUTH_SERVER_IMAGE:-ghcr.io/bngdrasil/bidar:main}
+    # pull_policy: missing
+    #   Compose는 image가 로컬에 없을 때에만 registry에서 받아 온다는 뜻이며,
+    #   이는 Compose v2의 기본 동작이므로 명시하지 않는다. always로 바꾸면
+    #   deploy-image.sh가 이미 pull하여 digest까지 기록한 image를 한 번 더 받아
+    #   오고, 같은 태그가 registry에서 덮여 있으면 기록한 digest와 실제로 뜬
+    #   image가 달라진다. never로 바꾸면 수동 복구 상황에서 image를 받을 방법이
+    #   compose 밖으로 밀려난다. 그래서 기본 동작을 그대로 둔다.
+    container_name: vm2-auth
+    ports:
+      # SEC-04: VM1 Nginx의 auth_server upstream이 10.0.1.60:8001로 접근하므로
+      # VM2 private IP 바인딩이 필요하다. public IP에는 게시하지 않는다.
+      # `:?`를 붙인 이유는, 변수가 비어 있으면 바인딩이 조용히 모든 인터페이스로
+      # 넓어져서 SEC-04 조치가 무력해지기 때문이다. 값이 없으면 compose가 중단된다.
+      - "${VM2_PRIVATE_IP:?VM2_PRIVATE_IP must be set}:8001:8001"
+      - "127.0.0.1:8001:8001"
+    # bidar/src/core/config.py의 Settings가 실제로 읽는 값만 전달한다.
+    # 읽지 않는 변수를 남겨 두면 설정되어 있다는 착각을 만든다.
+    # REDIS_URL과 RATE_LIMIT_PER_MINUTE는 Bidar가 읽지 않으므로 제거했다.
+    # 로그인 제한은 LOGIN_RATE_LIMIT_PER_MINUTE 하나가 담당한다.
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - DEBUG=${DEBUG}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - HOST=0.0.0.0
+      - PORT=8001
+      # production에서 비어 있으면 기동이 실패한다.
+      - ALLOWED_HOSTS=${AUTH_ALLOWED_HOSTS}
+      - ALLOWED_ORIGINS=${AUTH_ALLOWED_ORIGINS}
+      # production에서 32자 미만이거나 예시 문구를 포함하면 기동이 실패한다.
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ALGORITHM=${JWT_ALGORITHM}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES}
+      - REFRESH_TOKEN_EXPIRE_DAYS=${REFRESH_TOKEN_EXPIRE_DAYS}
+      # POST /auth/token 전용 in-process 제한이다. worker마다 따로 센다.
+      - LOGIN_RATE_LIMIT_PER_MINUTE=${LOGIN_RATE_LIMIT_PER_MINUTE}
+      # production에서 비어 있으면 기동이 실패한다.
+      - DATABASE_URL=${DATABASE_URL}
+      # uvicorn이 X-Forwarded-* 헤더를 신뢰할 발신지다. VM1 Nginx만 신뢰한다(SEC-04).
+      # 이 값이 "*"이면 포트에 직접 닿은 쪽이 자기 주소를 위조할 수 있고,
+      # 로그인 제한이 실제 호출자를 구분하지 못한다.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - api-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # API Gateway (Bifrost)
+  gateway:
+    # auth-server와 같은 이유로 build 블록을 남겨 둔다. 자세한 설명은 위에 있다.
+    build:
+      context: ./bifrost
+      dockerfile: Dockerfile
+    # 기본값을 GHCR 참조로 둔다. .env에 GATEWAY_IMAGE가 없으면 이 값이 쓰인다.
+    image: ${GATEWAY_IMAGE:-ghcr.io/bngdrasil/bifrost:main}
+    # pull_policy: missing (기본 동작). 이유는 auth-server의 주석에 적었다.
+    container_name: vm2-gateway
+    ports:
+      # SEC-04: VM1 Nginx의 gateway upstream이 10.0.1.60:8000로 접근한다.
+      - "${VM2_PRIVATE_IP:?VM2_PRIVATE_IP must be set}:8000:8000"
+      - "127.0.0.1:8000:8000"
+    # bifrost/src/core/config.py의 Settings가 실제로 읽는 값만 전달한다.
+    #
+    # DEP-01: 기존 저장소 compose는 DATABASE_URL을 전달하지 않아서 Bifrost가
+    # 기본 접속 문자열로 되돌아갈 수 있었다. 운영 VM2는 ./bifrost/.env를 따로
+    # 읽어 이 값을 채우고 있었는데, 환경 파일이 두 곳으로 갈라지는 문제를 없애기
+    # 위해 /opt/bnbong/.env 하나만 쓰도록 변수를 이 파일에 명시한다.
+    #
+    # 제거한 변수
+    #   SERVICES_CONFIG_PATH: 서비스 등록부가 PostgreSQL의 services 테이블로
+    #     옮겨져서 Bifrost가 JSON 등록부를 더 이상 읽지 않는다.
+    #   REDIS_URL: Bifrost Settings에 해당 항목이 없다.
+    #   ALLOWED_ORIGINS: Bifrost는 BACKEND_CORS_ORIGINS와 CLIENT_ORIGIN만 읽는다.
+    environment:
+      # production에서 비어 있거나 32자 미만이거나 예시 값이면 기동이 실패한다.
+      - SECRET_KEY=${SECRET_KEY}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - DEBUG=${DEBUG}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - HOST=0.0.0.0
+      - PORT=8000
+      # CORS 대상은 BACKEND_CORS_ORIGINS와 CLIENT_ORIGIN을 합쳐서 결정된다.
+      - CLIENT_ORIGIN=${CLIENT_ORIGIN}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS}
+      # TrustedHostMiddleware가 검사하는 Host 헤더 허용 목록이다.
+      # 이 값이 비면 Bifrost는 오류 없이 미들웨어를 붙이지 않는다. 즉 Host 검사가
+      # 조용히 사라지므로 값을 비우지 않아야 한다(Bidar는 빈 값이면 기동이 실패한다).
+      - ALLOWED_HOSTS=${GATEWAY_ALLOWED_HOSTS}
+      - AUTH_SERVER_URL=http://auth-server:8001
+      # production에서 비어 있으면 기동이 실패한다.
+      - DATABASE_URL=${DATABASE_URL}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE}
+      - ENABLE_METRICS=${ENABLE_METRICS}
+      # 버퍼링 프록시이므로 요청 본문 크기에 상한을 둔다.
+      - MAX_REQUEST_BODY_BYTES=${MAX_REQUEST_BODY_BYTES}
+      # uvicorn이 X-Forwarded-* 헤더를 신뢰할 발신지다(SEC-04).
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS}
+      # AUTH_SERVER_USERS_PATH는 기본값 /users가 현재 Bidar 배포와 맞으므로
+      # 전달하지 않는다. Bidar가 사용자 관리 라우터를 옮길 때만 지정한다.
+    depends_on:
+      auth-server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - api-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  api-network:
+    # 실제 VM2의 docker network 이름은 api-network이다. 이름을 고정하지 않으면
+    # compose project 접두사가 붙어 bnbong_api-network가 되고,
+    # monitoring compose의 `external: true` 선언과 어긋난다.
+    name: api-network
+    driver: bridge

@@ -1,0 +1,10 @@
+[
+  {
+    "targets": ["redis-exporter:9121"],
+    "labels": {
+      "service": "redis",
+      "team": "infrastructure",
+      "env": "production"
+    }
+  }
+]

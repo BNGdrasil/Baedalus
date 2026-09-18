@@ -2,8 +2,15 @@
 
 # bnbong.com 배포 스크립트
 # 이 스크립트는 로컬에서 실행하여 서버에 애플리케이션을 배포합니다
+#
+# 사용법: ./scripts/deploy.sh <서버_IP> [SSH_USER]
+#   두 번째 인자는 SSH 계정 이름입니다. 이전 판의 Makefile은 이 자리에 vm1, vm2
+#   같은 역할 이름을 넘겨서 존재하지 않는 계정으로 접속을 시도했습니다.
+#
+# 참고: VM2의 Gateway/Auth Server release는 이 스크립트가 아니라
+#       baedalus/vm2-deployment/deploy.sh가 담당합니다.
 
-set -e
+set -euo pipefail
 
 # 색상 정의
 RED='\033[0;31m'
@@ -25,7 +32,7 @@ log_error() {
 }
 
 # 설정 확인
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     log_error "사용법: $0 <서버_IP> [SSH_USER]"
     echo "예시: $0 192.168.1.100 ubuntu"
     exit 1

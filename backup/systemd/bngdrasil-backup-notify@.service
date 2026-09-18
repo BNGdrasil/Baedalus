@@ -1,0 +1,11 @@
+[Unit]
+Description=BNGdrasil 백업 실패 알림 (%i)
+Documentation=file:///opt/bngdrasil-backup/README.md
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+EnvironmentFile=-/etc/bngdrasil-backup/env
+ExecStart=/opt/bngdrasil-backup/notify.sh failure %i "systemd 유닛 %i 가 실패했습니다. journalctl -u %i 로 확인하십시오."
+TimeoutStartSec=120

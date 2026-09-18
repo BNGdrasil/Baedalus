@@ -1,0 +1,120 @@
+name: Deploy Monitoring Stack
+
+# 수동 실행만 받는다. push 자동 실행을 붙이지 않는 이유는 두 가지다.
+# 첫째, 이 워크플로는 Prometheus와 Grafana와 Loki를 함께 재기동하므로 관측이
+# 잠시 끊긴다. 둘째, prometheus/targets의 내용은 운영에서 add-service.sh로
+# 바뀌어 있을 수 있어서 전송 전에 사람이 현재 상태를 확인하는 편이 안전하다.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # 같은 VM2에 동시에 rsync하면 파일이 섞인다.
+  group: deploy-monitoring-vm2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 'Deploy monitoring to VM2'
+    runs-on: ubuntu-latest
+    # 승인 규칙과 secret 범위를 environment로 묶는다.
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VM2_SSH_PRIVATE_KEY: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
+          VM2_SSH_KNOWN_HOSTS: ${{ secrets.VM2_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM2_SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # known_hosts를 secret으로 고정한다. StrictHostKeyChecking=no로 두면
+          # 중간자가 끼어들어도 배포가 그대로 진행된다.
+          printf '%s\n' "$VM2_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Transfer monitoring files
+        env:
+          VM2_HOST: ${{ secrets.VM2_HOST }}
+        run: |
+          set -euo pipefail
+          # --delete를 쓰는 이유는, 저장소에서 지운 rule 파일이 서버에 남아
+          # 계속 평가되는 상황을 막기 위해서다.
+          #
+          # prometheus/targets는 제외한다. 이 디렉터리의 JSON 파일은
+          # monitoring/scripts/add-service.sh가 운영 중에 만들고 지우는 대상이며,
+          # Prometheus가 30초마다 다시 읽는 서비스 디스커버리 입력이다. 저장소
+          # 사본으로 --delete하면 운영에서 추가한 target이 사라져서 해당 서비스의
+          # 지표 수집이 조용히 멈춘다. 저장소의 target 정의를 반영해야 할 때에는
+          # 아래 절차로 사람이 직접 판단하여 옮긴다.
+          #   ssh ubuntu@<VM2> 'ls /opt/bnbong/monitoring/prometheus/targets/'
+          #   scp monitoring/prometheus/targets/<파일> ubuntu@<VM2>:/opt/bnbong/monitoring/prometheus/targets/
+          rsync -az --delete \
+            --exclude 'prometheus/targets/' \
+            -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes" \
+            monitoring/ "ubuntu@${VM2_HOST}:/opt/bnbong/monitoring/"
+
+          rsync -az \
+            -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes" \
+            monitoring/docker-compose.monitoring.yml \
+            "ubuntu@${VM2_HOST}:/opt/bnbong/docker-compose.monitoring.yml"
+
+      - name: Apply compose and verify
+        env:
+          VM2_HOST: ${{ secrets.VM2_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
+            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH'
+          set -euo pipefail
+          cd /opt/bnbong
+
+          # 설정 파일의 문법 오류는 컨테이너를 올리기 전에 잡는다.
+          sudo docker compose -f docker-compose.monitoring.yml config --quiet
+
+          sudo docker compose -f docker-compose.monitoring.yml up -d
+          sudo docker compose -f docker-compose.monitoring.yml ps
+
+          # 기동 직후에는 아직 준비되지 않았을 수 있으므로 몇 차례 다시 확인한다.
+          check() {
+            local label="$1" url="$2"
+            for _ in $(seq 1 20); do
+              if curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
+                echo "  OK: $label"
+                return 0
+              fi
+              sleep 3
+            done
+            echo "  FAIL: $label ($url)" >&2
+            return 1
+          }
+
+          failed=0
+          check "Prometheus"  "http://127.0.0.1:9090/-/healthy"    || failed=1
+          check "Loki"        "http://127.0.0.1:3100/ready"        || failed=1
+          check "Grafana"     "http://127.0.0.1:3000/api/health"   || failed=1
+
+          if [ "$failed" -ne 0 ]; then
+            echo "확인에 실패했다. 아래로 원인을 찾는다." >&2
+            sudo docker compose -f docker-compose.monitoring.yml logs --tail 50 >&2
+            exit 1
+          fi
+
+          # target 수집 상태까지 확인한다. 컨테이너가 떠 있어도 scrape가 전부
+          # 실패하고 있으면 관측이 사실상 멈춘 것이다.
+          echo "수집에 실패한 target 목록:"
+          curl -fsS 'http://127.0.0.1:9090/api/v1/targets?state=active' \
+            | grep -o '"health":"[^"]*"' | sort | uniq -c
+          ENDSSH
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

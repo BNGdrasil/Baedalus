@@ -1,0 +1,13 @@
+[Unit]
+Description=BNGdrasil 백업 6시간 주기 실행
+Documentation=file:///opt/bngdrasil-backup/README.md
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:10:00
+Persistent=true
+RandomizedDelaySec=600
+AccuracySec=1min
+Unit=bngdrasil-backup.service
+
+[Install]
+WantedBy=timers.target

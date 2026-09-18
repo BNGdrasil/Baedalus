@@ -1,58 +1,81 @@
 name: Terraform Validation
 
+# 이 워크플로는 fmt와 validate까지만 수행한다. plan과 apply는 두지 않는다.
+# state가 저장소 바깥의 로컬 파일(terraform.tfstate)에만 있어서, runner에는
+# 현재 관리 중인 자원 정보가 없다. 그 상태로 plan을 돌리면 이미 존재하는 자원을
+# 새로 만들겠다는 계획이 나오고, apply는 실제 인프라를 훼손할 수 있다.
+# 원격 backend(OCI Object Storage의 S3 호환 endpoint)로 state를 옮기고 잠금과
+# 버전 관리를 확인한 뒤에 plan 도입을 다시 검토한다.
+# 근거와 이전 절차는 README.md의 "CI에서 plan과 apply를 하지 않는 이유"에 있다.
+
 on:
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+# DEP-04: 필요한 권한만 남긴다. PR 요약 댓글을 남기려면 pull-requests: write가 필요하고,
+# checkout에는 contents: read가 필요하다. 그 밖의 권한은 주지 않는다.
+permissions:
+  contents: read
+  pull-requests: write
 
 env:
-  TF_VERSION: '1.0'
+  # 로컬 개발과 state 파일이 사용하는 버전에 맞춘다.
+  TF_VERSION: '1.5.7'
 
 jobs:
   validate:
     name: 'Terraform Validation'
     runs-on: ubuntu-latest
-    
+
     defaults:
       run:
         working-directory: ./
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-    - name: Terraform Format Check
-      id: fmt
-      run: terraform fmt -check
-      continue-on-error: true
+      # DEP-04: 이전 판은 continue-on-error로 포맷 실패를 허용했다. 검증 job이
+      # 초록색인데 포맷이 깨져 있으면 gate 역할을 하지 못하므로 실패로 처리한다.
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
 
-    - name: Terraform Init
-      id: init
-      run: terraform init
+      # 자격 증명 없이 구성만 검사한다. plan은 실행하지 않는다.
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend=false -input=false
 
-    - name: Terraform Validate
-      id: validate
-      run: terraform validate
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
 
-    - name: Validation Summary
-      if: github.event_name == 'pull_request'
-      uses: actions/github-script@v7
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          const output = `## Terraform 코드 검증 결과 ✅
-          
-          - **코드 포맷팅**: \`${{ steps.fmt.outcome }}\`
-          - **초기화**: \`${{ steps.init.outcome }}\`
-          - **유효성 검증**: \`${{ steps.validate.outcome }}\`
-                    
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: output
-          })
+      - name: Validation Summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = [
+              '## Terraform 코드 검증 결과',
+              '',
+              '- **코드 포맷팅**: `' + process.env.FMT_OUTCOME + '`',
+              '- **초기화**: `' + process.env.INIT_OUTCOME + '`',
+              '- **유효성 검증**: `' + process.env.VALIDATE_OUTCOME + '`',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body,
+            });

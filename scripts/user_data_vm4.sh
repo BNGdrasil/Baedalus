@@ -1,6 +1,14 @@
 #!/bin/bash
 # VM4: Monitoring & Observability (Prometheus + Grafana + Loki)
 # OCPU: 1, RAM: 6GB
+#
+# 현황 주석 (I09)
+#   2026-09-18 실사 기준으로 VM4는 미구성 예비 자원이다. SSH로 접속은 되지만 Docker도
+#   /opt/bnbong도 없으며, 이 cloud-init이 만들려던 관측 스택은 실제로 VM2에서 동작한다.
+#   VM2의 구성은 baedalus/monitoring/에 있고 기준선은 docs/deployment-inventory.md에 있다.
+#   아래 Alertmanager 정의는 receiver가 비어 있어서 경보를 어디에도 보내지 않는다.
+#   현재 통지 경로는 VM2 Grafana alerting이다.
+#   VM4를 실제 관측 노드로 쓰기로 결정하기 전까지 이 스크립트를 apply 대상으로 삼지 않는다.
 
 set -e
 

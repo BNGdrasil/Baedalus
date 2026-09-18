@@ -1,0 +1,123 @@
+name: Deploy Backup Scripts
+
+# 수동 실행만 받는다. 백업 체계는 systemd timer가 실행 주체이고, 파일을 바꾸는
+# 순간 다음 실행부터 새 코드가 적용된다. 따라서 push마다 자동으로 밀어 넣지 않고
+# 사람이 시점을 고른다.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '설치 대상 VM'
+        required: true
+        type: choice
+        options:
+          - vm3
+          - vm2
+        default: vm3
+      run_now:
+        description: '설치 직후에 백업을 한 번 실행한다'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-backup-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 'Install backup scripts'
+    runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      SRC_DIR: /tmp/bngdrasil-backup-src
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VM2_SSH_PRIVATE_KEY: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
+          VM2_SSH_KNOWN_HOSTS: ${{ secrets.VM2_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM2_SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$VM2_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Resolve SSH target
+        id: target
+        env:
+          VM2_HOST: ${{ secrets.VM2_HOST }}
+          VM3_PRIVATE_IP: ${{ vars.VM3_PRIVATE_IP || '10.0.2.134' }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.target }}" = "vm3" ]; then
+            # VM3는 춘천 private subnet에 있어서 인터넷에서 직접 닿지 않는다.
+            # 같은 VCN의 VM2를 ProxyJump 경유지로 삼는다. VM2와 VM3가 같은 배포용
+            # 키를 신뢰해야 하므로, 키 등록 절차는 두 VM에 모두 적용한다.
+            echo "host=ubuntu@${VM3_PRIVATE_IP}" >> "$GITHUB_OUTPUT"
+            echo "jump=-J ubuntu@${VM2_HOST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "host=ubuntu@${VM2_HOST}" >> "$GITHUB_OUTPUT"
+            echo "jump=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Transfer backup sources
+        env:
+          SSH_HOST: ${{ steps.target.outputs.host }}
+          SSH_JUMP: ${{ steps.target.outputs.jump }}
+        run: |
+          set -euo pipefail
+          # ProxyJump 경유에서도 known_hosts 검사를 유지한다. 경유지인 VM2와
+          # 최종 목적지인 VM3의 host key가 모두 secret에 들어 있어야 한다.
+          SSH_CMD="ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes ${SSH_JUMP}"
+
+          # 전송 위치는 /tmp다. install.sh가 /opt/bngdrasil-backup으로 옮기며,
+          # 운영 환경 파일인 /etc/bngdrasil-backup/env에는 손대지 않는다.
+          $SSH_CMD "$SSH_HOST" "rm -rf '${SRC_DIR}' && mkdir -p '${SRC_DIR}'"
+          rsync -az --delete -e "$SSH_CMD" backup/ "${SSH_HOST}:${SRC_DIR}/"
+          $SSH_CMD "$SSH_HOST" "chmod +x '${SRC_DIR}'/*.sh"
+
+      - name: Install
+        env:
+          SSH_HOST: ${{ steps.target.outputs.host }}
+          SSH_JUMP: ${{ steps.target.outputs.jump }}
+          RUN_NOW: ${{ inputs.run_now }}
+        run: |
+          set -euo pipefail
+          SSH_CMD="ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes ${SSH_JUMP}"
+
+          $SSH_CMD "$SSH_HOST" "SRC_DIR='${SRC_DIR}' RUN_NOW='${RUN_NOW}' bash -s" <<'ENDSSH'
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          # --no-enable을 쓰는 이유는 timer 활성화를 사람의 판단으로 남기기
+          # 위해서다. 설정이 잘못된 상태로 timer가 돌기 시작하면 6시간마다
+          # 실패하면서 알림만 쌓이고 백업은 하나도 남지 않는다. 최초 한 번은
+          # run.sh의 결과를 직접 확인한 뒤에 활성화한다.
+          sudo ./install.sh --no-enable
+
+          echo "설치한 파일:"
+          sudo ls -l /opt/bngdrasil-backup
+
+          echo "timer 상태(활성화는 수동으로 수행한다):"
+          systemctl list-timers 'bngdrasil-*' --all || true
+
+          if [ "$RUN_NOW" = "true" ]; then
+            echo "백업을 한 번 실행한다."
+            sudo /opt/bngdrasil-backup/run.sh
+          fi
+          ENDSSH
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

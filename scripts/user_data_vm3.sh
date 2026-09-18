@@ -1,6 +1,15 @@
 #!/bin/bash
 # VM3: Database Layer (PostgreSQL + Redis + MongoDB)
 # OCPU: 1, RAM: 6GB
+#
+# NOTE (2026-09-18): The live VM3 runs host PostgreSQL 14 managed by systemd, not the
+# container database defined below. The container DB definitions in this bootstrap file
+# therefore differ from the actual deployment. See
+# bngdrasil/docs/operations-improvement/07-implementation-plan.md (I00, I02, I04) before
+# reusing this file to rebuild VM3.
+#
+# Backups are no longer part of this bootstrap. Install them with baedalus/backup/install.sh
+# (systemd timer based, host PostgreSQL aware). See baedalus/backup/README.md.
 
 set -e
 
@@ -145,30 +154,13 @@ services:
       - db-network
     command: mongod --wiredTigerCacheSizeGB 2
 
-  # PostgreSQL backup container (runs daily)
-  postgres-backup:
-    image: postgres:15-alpine
-    container_name: vm3-backup
-    environment:
-      - POSTGRES_USER=$${POSTGRES_USER}
-      - POSTGRES_PASSWORD=$${POSTGRES_PASSWORD}
-      - POSTGRES_HOST=postgres
-      - BACKUP_DIR=/backups
-    volumes:
-      - ./postgres/backups:/backups
-    command: |
-      sh -c 'while true; do
-        sleep 86400;
-        pg_dump -h postgres -U $${POSTGRES_USER} -d bnbong | gzip > /backups/bnbong_$$(date +%Y%m%d_%H%M%S).sql.gz;
-        pg_dump -h postgres -U $${POSTGRES_USER} -d auth | gzip > /backups/auth_$$(date +%Y%m%d_%H%M%S).sql.gz;
-        pg_dump -h postgres -U $${POSTGRES_USER} -d wegis | gzip > /backups/wegis_$$(date +%Y%m%d_%H%M%S).sql.gz;
-        find /backups -name "*.sql.gz" -mtime +7 -delete;
-      done'
-    depends_on:
-      - postgres
-    restart: unless-stopped
-    networks:
-      - db-network
+  # NOTE: The old postgres-backup container was removed on 2026-09-18.
+  # It never set PGPASSWORD, piped pg_dump into gzip without propagating failures, and
+  # waited 24 hours before its first run, so a "completed" log did not mean a restorable
+  # dump existed (see docs/operations-improvement/02-findings.md, DATA-01).
+  # Backups now run on the host through baedalus/backup/install.sh, which dumps the host
+  # PostgreSQL 14 instance, verifies each dump with pg_restore --list, records checksums,
+  # and reports failures through systemd and the notification hook.
 
 volumes:
   postgres_data:
@@ -213,7 +205,7 @@ systemctl enable bnbong-vm3.service
 systemctl start bnbong-vm3.service
 
 echo "=== VM3 Initialization Completed ==="
-echo "Services: PostgreSQL, Redis, MongoDB, Automated Backups"
+echo "Services: PostgreSQL, Redis, MongoDB"
 echo "Databases: bnbong, auth, wegis"
-echo "Backup: Daily at midnight, 7-day retention"
+echo "Backup: not configured here. Install baedalus/backup/install.sh on the host."
 date

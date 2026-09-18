@@ -1,0 +1,11 @@
+[
+  {
+    "targets": ["auth-server:8001"],
+    "labels": {
+      "service": "auth-server",
+      "team": "identity",
+      "env": "production"
+    }
+  }
+]
+

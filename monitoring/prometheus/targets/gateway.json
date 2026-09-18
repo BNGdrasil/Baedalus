@@ -1,0 +1,11 @@
+[
+  {
+    "targets": ["gateway:8000"],
+    "labels": {
+      "service": "gateway",
+      "team": "platform",
+      "env": "production"
+    }
+  }
+]
+

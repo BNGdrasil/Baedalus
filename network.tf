@@ -64,9 +64,12 @@ resource "oci_core_security_list" "chuncheon_public_sl" {
   display_name   = "chuncheon-public-security-list"
 
   # SSH
+  # SEC-04: 기본값은 현행 설정과 같은 0.0.0.0/0이다. 관리 접근 경로(고정 IP,
+  # 사무실 대역, bastion 등)를 확인한 뒤 var.admin_cidr로 좁힌다. 확인 전에
+  # 값을 바꾸면 운영자가 VM에 접속하지 못할 수 있다.
   ingress_security_rules {
     protocol  = "6"
-    source    = "0.0.0.0/0"
+    source    = var.admin_cidr
     stateless = false
     tcp_options {
       min = 22
@@ -97,9 +100,13 @@ resource "oci_core_security_list" "chuncheon_public_sl" {
   }
 
   # API Gateway
+  # SEC-04: 8000/8001을 0.0.0.0/0에 열어 두면 Cloudflare와 VM1 Nginx를 건너뛰고
+  # VM2에 직접 연결할 수 있다. 그렇게 되면 Nginx의 요청 제한과 헤더 정리를
+  # 우회하며, 앱이 X-Forwarded-* 헤더를 신뢰하는 경우 클라이언트 IP도 위조된다.
+  # 실제 호출자는 춘천 public subnet의 VM1뿐이므로 그 대역으로 제한한다.
   ingress_security_rules {
     protocol  = "6"
-    source    = "0.0.0.0/0"
+    source    = var.api_client_cidr
     stateless = false
     tcp_options {
       min = 8000
@@ -110,7 +117,7 @@ resource "oci_core_security_list" "chuncheon_public_sl" {
   # Auth Server
   ingress_security_rules {
     protocol  = "6"
-    source    = "0.0.0.0/0"
+    source    = var.api_client_cidr
     stateless = false
     tcp_options {
       min = 8001
@@ -119,6 +126,14 @@ resource "oci_core_security_list" "chuncheon_public_sl" {
   }
 
   # Internal communication (all VCN traffic)
+  #
+  # SEC-04 범위 주의: 이 규칙이 VCN 전체(10.0.0.0/16)에 모든 프로토콜을 허용하므로,
+  # 위에서 8000과 8001을 var.api_client_cidr로 좁힌 효과는 **외부 인터넷 차단까지**다.
+  # 같은 VCN 안의 VM은 이 규칙을 통해 여전히 VM2의 모든 포트에 접근할 수 있다.
+  # 예를 들어 춘천 private subnet(10.0.2.0/24)의 VM3에서 VM2의 8000 포트로 연결할 수 있다.
+  # 규칙 자체는 이번 변경에서 바꾸지 않았다. VM1과 VM2, VM3 사이에 실제로 필요한
+  # 포트와 방향을 먼저 검증하지 않은 상태에서 좁히면 운영 중인 통신을 끊을 수 있다.
+  # 후속 작업에서 필요한 포트만 남기는 형태로 분해한다.
   ingress_security_rules {
     protocol  = "all"
     source    = "10.0.0.0/16"

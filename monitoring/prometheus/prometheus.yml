@@ -1,0 +1,61 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'chuncheon-main'
+    environment: 'production'
+
+# OBS-02: alert rule 파일을 연결한다. 통지는 Alertmanager 대신 Grafana alerting을
+# 사용하므로 이 규칙은 Grafana가 조회하는 Prometheus 경보 상태로만 노출된다.
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+
+scrape_configs:
+  # VM1 (Frontend). 2026-09-18 기준 VM1의 node-exporter 컨테이너는 exited 상태다.
+  # 이 target은 exporter를 다시 띄우기 전까지 down으로 남는다.
+  - job_name: 'vm1-node'
+    static_configs:
+      - targets: ['10.0.1.133:9100']
+        labels:
+          instance: 'vm1'
+          role: 'frontend'
+
+  # VM2 호스트 지표. monitoring compose의 node-exporter 컨테이너를 가리킨다.
+  # 이전 판의 localhost:9100은 Prometheus 컨테이너 자신이어서 수집이 되지 않았다.
+  - job_name: 'vm2-node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          instance: 'vm2'
+          role: 'api-gateway'
+
+  # VM2 서비스(파일 기반 서비스 디스커버리)
+  - job_name: 'msa-services'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/targets/*.json'
+        refresh_interval: 30s
+    metrics_path: '/metrics'
+    relabel_configs:
+      # service 라벨 유지
+      - source_labels: [service]
+        target_label: job
+        replacement: 'msa-${1}'
+
+  # VM3 (Database). VM3의 node-exporter 컨테이너도 현재 exited 상태다.
+  - job_name: 'vm3-node'
+    static_configs:
+      - targets: ['10.0.2.134:9100']
+        labels:
+          instance: 'vm3'
+          role: 'database'
+
+  # Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Grafana
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']

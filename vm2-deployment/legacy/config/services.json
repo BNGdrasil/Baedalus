@@ -1,0 +1,23 @@
+{
+  "auth-server": {
+    "url": "http://auth-server:8001",
+    "health_check": "/health",
+    "timeout": 30,
+    "rate_limit": 100,
+    "retry": {
+      "max_attempts": 3,
+      "backoff_factor": 2
+    }
+  },
+  "example-service": {
+    "url": "https://example-service.bnbong.com",
+    "health_check": "/health",
+    "timeout": 30,
+    "rate_limit": 100,
+    "retry": {
+      "max_attempts": 3,
+      "backoff_factor": 2
+    }
+  }
+}
+

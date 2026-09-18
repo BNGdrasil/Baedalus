@@ -1,0 +1,55 @@
+# Wegis server compose (VM2)
+#
+# 2026-09-18 실사 결과: 운영 중인 wegis_server 컨테이너에는 compose label이 없고
+# api-network에 직접 연결되어 있다. 즉 이 파일이 아니라 수동 `docker run`으로
+# 기동되어 있었다. 네트워크와 컨테이너 이름을 실제 배포본에 맞추어
+# 이 파일로 같은 상태를 재현할 수 있게 정리했다.
+#
+# 변경 요지
+#   - msa-network를 api-network(external)로 통일했다. 그 이름의 네트워크는
+#     VM2에 존재하지 않았고, gateway/auth-server와 같은 네트워크여야 한다.
+#   - container_name을 wegis_server로 맞추었다. Bifrost 등록부가 목적지를
+#     http://wegis_server:9000으로 지정하고 있으므로 이름이 달라지면 프록시가 끊긴다.
+#   - 9000 포트를 loopback에만 게시한다. VM1 Nginx는 Wegis에 직접 접근하지 않고
+#     gateway를 거치므로 외부 게시가 필요하지 않다(SEC-04).
+#   - models mount 경로를 운영 배포본과 같은 .deploy-assets/models로 맞추었다.
+
+services:
+  # Wegis Server (Phishing Detection API)
+  wegis-server:
+    build:
+      context: ./Wegis_server
+      dockerfile: Dockerfile
+    image: ${WEGIS_IMAGE:-wegis-server:local}
+    container_name: wegis_server
+    env_file:
+      - ./Wegis_server/.env
+    ports:
+      - "127.0.0.1:9000:9000"
+    # 접속 정보와 앱 설정은 ./Wegis_server/.env 하나가 담당한다.
+    # 저장소 compose에 있던 MONGODB_* / DATABASE_URL 블록은 실제 운영 환경 파일에
+    # 존재하지 않는 변수였고, 현재 Wegis는 피드백을 PostgreSQL에 저장하므로 삭제했다.
+    # MongoDB는 퇴역 관찰 단계이며 Wegis 쪽 접속 설정은 남아 있지 않다.
+    environment:
+      - HOST=0.0.0.0
+      - PORT=9000
+      - AUTH_SERVER_URL=http://auth-server:8001
+
+    volumes:
+      - ./Wegis_server/.deploy-assets/models:/app/models
+      - ./Wegis_server/log:/app/log
+    networks:
+      - api-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    command: ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "9000"]
+
+networks:
+  api-network:
+    name: api-network
+    external: true

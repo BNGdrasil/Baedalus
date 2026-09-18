@@ -1,4 +1,6 @@
 #!/bin/bash
+# DEPRECATED: VM5는 퇴역한 인스턴스다. osaka.tf의 enable_vm5 기본값은 false이며
+# 이 cloud-init 스크립트는 어떤 리소스에서도 참조하지 않는다.
 # VM5: Backup & Long-term Storage
 # OCPU: 2, RAM: 12GB
 

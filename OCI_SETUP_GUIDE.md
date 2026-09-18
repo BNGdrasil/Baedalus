@@ -1,715 +1,149 @@
-# OCI Setup Guide for BNGdrasil
+# OCI 준비 안내
 
-**Complete step-by-step guide to deploy BNGdrasil infrastructure on Oracle Cloud Infrastructure using Terraform**
+이 문서는 Baedalus의 Terraform 구성을 실행하기 위해 필요한 준비물만 다룹니다. 계정을 만들고 API
+키를 발급하고 `terraform.tfvars`를 채우는 절차까지가 범위입니다. 인프라를 실제로 적용하는 절차와
+운영 중인 자원을 다루는 주의 사항은 [저장소 README](README.md)에 있습니다.
 
----
-
-## 📋 Table of Contents
-
-1. [Prerequisites](#prerequisites)
-2. [OCI Account Setup](#oci-account-setup)
-3. [Local Environment Setup](#local-environment-setup)
-4. [Terraform Configuration](#terraform-configuration)
-5. [Infrastructure Deployment](#infrastructure-deployment)
-6. [Verification and Testing](#verification-and-testing)
-7. [Next Steps](#next-steps)
+실제 OCID와 지문과 비밀번호는 이 문서에 적지 않습니다. 아래 예시는 모두 형식을 보여 주기 위한
+자리표시자입니다.
 
 ---
 
-## Prerequisites
+## 1. 준비물
 
-### Required Accounts
+다음 소프트웨어가 필요합니다.
 
-- **2 OCI accounts** (for Free Tier maximization):
-  - Account 1: Chuncheon region (ap-chuncheon-1)
-  - Account 2: Osaka region (ap-osaka-1)
-- **Email addresses**: 2 different emails for account registration
-- **Credit card**: For account verification (no charges within Free Tier)
+- Terraform 1.0 이상. 저장소의 GitHub Actions 워크플로는 1.5.7을 사용합니다.
+- Git과 SSH 클라이언트.
+- OCI CLI. 필수는 아니지만 인스턴스와 boot volume의 잔존 여부를 조회할 때 사용합니다.
 
-### Required Software
+계정은 두 개가 필요합니다. 춘천 리전(`ap-chuncheon-1`)을 home region으로 하는 계정 하나와, 오사카
+리전(`ap-osaka-1`)을 home region으로 하는 계정 하나입니다. 계정을 만들 때 home region을 나중에
+바꿀 수 없으므로 가입 화면에서 정확히 선택해야 합니다.
 
-- **Terraform** >= 1.0
-- **Git**
-- **SSH client**
-- **Text editor** (vim, VS Code, etc.)
+계정 확인 과정에서 신용카드 정보를 입력하게 됩니다. Always Free 한도 안에서는 청구가 발생하지
+않는다고 안내되지만, 한도는 계정과 리전과 가입 시점에 따라 다릅니다. 가입한 뒤 콘솔의 Cost
+Analysis에서 실제 사용량을 확인하고 Budgets에서 예산 알림을 설정해 두기를 권장합니다.
 
 ---
 
-## OCI Account Setup
+## 2. Compartment 생성
 
-### Step 1: Create OCI Accounts
+두 계정에서 각각 다음을 수행합니다.
 
-#### Account 1 - Chuncheon Region
+1. 콘솔에서 **Identity & Security**로 이동한 다음 **Compartments**를 엽니다.
+2. **Create Compartment**를 누르고 이름과 설명을 입력합니다.
+3. 만들어진 compartment의 OCID를 복사해 둡니다. `compartment_id_chuncheon`과
+   `compartment_id_osaka`에 넣을 값입니다.
 
-1. Go to [Oracle Cloud Free Tier](https://www.oracle.com/cloud/free/)
-2. Click **Start for free**
-3. Fill in registration information:
-   - Email: `your-email-1@example.com`
-   - Country/Territory: **South Korea**
-   - Choose **Home Region**: **South Korea Central (Chuncheon)**
-4. Complete email verification
-5. Enter credit card information (for verification only)
-6. Complete account creation
+---
 
-#### Account 2 - Osaka Region
+## 3. API 키 발급
 
-1. Repeat the process with a different email
-2. Registration information:
-   - Email: `your-email-2@example.com`
-   - Country/Territory: **Japan**
-   - Choose **Home Region**: **Japan East (Osaka)**
-3. Complete account creation
-
-### Step 2: Verify Free Tier Resources
-
-Login to each account and verify:
-
-```
-Resources Available per Account:
-- ARM Ampere A1 Compute: 4 OCPUs, 24 GB RAM
-- Block Storage: 200 GB
-- Outbound Data Transfer: 10 TB/month
-- Load Balancer: 1 instance (10 Mbps)
-```
-
-### Step 3: Create Compartments
-
-For each account:
-
-1. Navigate to **Identity & Security** → **Compartments**
-2. Click **Create Compartment**
-3. Enter:
-   - Name: `bngdrasil-compartment`
-   - Description: `BNGdrasil infrastructure resources`
-4. Click **Create Compartment**
-5. **Copy the Compartment OCID** (you'll need this later)
-
-### Step 4: Generate API Keys
-
-#### For Chuncheon Account:
+Terraform provider가 사용할 API 키를 리전별로 따로 만듭니다.
 
 ```bash
-# Create .oci directory
 mkdir -p ~/.oci
 cd ~/.oci
 
-# Generate API key pair
+# 춘천 계정용 키
 openssl genrsa -out chuncheon_api_key.pem 2048
 openssl rsa -pubout -in chuncheon_api_key.pem -out chuncheon_api_key_public.pem
-
-# Set proper permissions
 chmod 600 chuncheon_api_key.pem
-```
 
-#### For Osaka Account:
-
-```bash
-cd ~/.oci
-
-# Generate API key pair
+# 오사카 계정용 키
 openssl genrsa -out osaka_api_key.pem 2048
 openssl rsa -pubout -in osaka_api_key.pem -out osaka_api_key_public.pem
-
-# Set proper permissions
 chmod 600 osaka_api_key.pem
 ```
 
-### Step 5: Upload API Keys to OCI Console
+공개 키를 콘솔에 등록합니다.
 
-#### For Chuncheon Account:
+1. 콘솔 오른쪽 위의 프로필 메뉴에서 **User Settings**를 엽니다.
+2. **API Keys**에서 **Add API Key**를 누릅니다.
+3. **Paste Public Key**를 선택하고 `*_api_key_public.pem`의 내용을 붙여 넣습니다.
+4. 등록을 마치면 화면에 지문(fingerprint)이 표시됩니다. 이 값을 복사해 둡니다.
+5. 같은 화면에서 사용자 OCID를, 프로필 메뉴의 **Tenancy**에서 tenancy OCID를 복사해 둡니다.
 
-1. Login to OCI Console (Chuncheon account)
-2. Click **Profile icon** → **User Settings**
-3. In left sidebar, click **API Keys**
-4. Click **Add API Key**
-5. Select **Paste Public Key**
-6. Paste content from `chuncheon_api_key_public.pem`:
-   ```bash
-   cat ~/.oci/chuncheon_api_key_public.pem
-   ```
-7. Click **Add**
-8. **Copy the Configuration File Preview** - you'll need:
-   - `user` OCID
-   - `fingerprint`
-   - `tenancy` OCID
-   - `region`
+개인 키 파일은 저장소에 넣지 않습니다. `.gitignore`가 `*.pem`을 제외하고 있지만, 파일을
+`~/.oci` 밖으로 옮기지 않는 편이 안전합니다.
 
-#### For Osaka Account:
+---
 
-Repeat the same process for the Osaka account with `osaka_api_key_public.pem`
+## 4. VM 접속용 SSH 키
 
-### Step 6: Create SSH Key for VM Access
+API 키와는 별개로 VM에 접속할 SSH 키가 필요합니다.
 
 ```bash
-# Generate SSH key pair for VM access
-ssh-keygen -t rsa -b 4096 -f ~/.ssh/bngdrasil_vm_key
-
-# Don't set a passphrase (press Enter twice)
-
-# Copy public key content
+ssh-keygen -t ed25519 -f ~/.ssh/bngdrasil_vm_key -C "bngdrasil"
 cat ~/.ssh/bngdrasil_vm_key.pub
-# Save this output - you'll paste it in terraform.tfvars
 ```
+
+출력된 공개 키 한 줄을 `terraform.tfvars`의 `ssh_public_key`에 넣습니다. 이 값은 cloud-init이
+각 인스턴스의 `ubuntu` 계정에 등록합니다.
 
 ---
 
-## Local Environment Setup
+## 5. terraform.tfvars 작성
 
-### Step 1: Install Terraform
-
-#### macOS:
-
-```bash
-brew install terraform
-```
-
-#### Linux (Ubuntu/Debian):
+예시 파일을 복사한 뒤 값을 채웁니다. `make setup`도 같은 일을 하며, 이미 파일이 있으면
+덮어쓰지 않습니다.
 
 ```bash
-wget -O- https://apt.releases.hashicorp.com/gpg | \
-    sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-
-echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
-    https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
-    sudo tee /etc/apt/sources.list.d/hashicorp.list
-
-sudo apt update
-sudo apt install terraform
-```
-
-#### Verify Installation:
-
-```bash
-terraform version
-# Should output: Terraform v1.x.x
-```
-
-### Step 2: Install Additional Tools
-
-```bash
-# macOS
-brew install jq
-
-# Linux
-sudo apt install jq
-```
-
-### Step 3: Clone BNGdrasil Repository
-
-```bash
-cd ~/projects  # Or your preferred directory
-git clone https://github.com/BNGdrasil/BNGdrasil.git
-cd BNGdrasil/infra
-```
-
----
-
-## Terraform Configuration
-
-### Step 1: Create terraform.tfvars
-
-```bash
-cd ~/projects/BNGdrasil/infra
-
-# Copy example file
 cp terraform.tfvars.example terraform.tfvars
-
-# Edit the file
-vim terraform.tfvars
 ```
 
-### Step 2: Fill in terraform.tfvars
+채워야 하는 값은 다음과 같습니다.
 
-Open `terraform.tfvars` and fill in the following:
+| 변수 | 값의 출처 |
+|---|---|
+| `tenancy_ocid_chuncheon`, `tenancy_ocid_osaka` | 프로필 메뉴의 Tenancy 화면에 있는 OCID입니다. |
+| `user_ocid_chuncheon`, `user_ocid_osaka` | User Settings 화면에 있는 사용자 OCID입니다. |
+| `fingerprint_chuncheon`, `fingerprint_osaka` | API Key를 등록한 뒤 표시되는 지문입니다. |
+| `private_key_path_chuncheon`, `private_key_path_osaka` | 3단계에서 만든 개인 키 파일의 경로입니다. |
+| `compartment_id_chuncheon`, `compartment_id_osaka` | 2단계에서 만든 compartment의 OCID입니다. |
+| `ssh_public_key` | 4단계에서 출력한 공개 키 한 줄입니다. |
+| `postgres_password` | VM3 PostgreSQL 계정의 비밀번호입니다. |
+| `jwt_secret_key` | 32자 이상이어야 합니다. 예시 문구를 그대로 두면 애플리케이션이 기동에 실패합니다. |
 
-```hcl
-# ========================================
-# Chuncheon Region (Account 1)
-# ========================================
-tenancy_ocid_chuncheon     = "ocid1.tenancy.oc1..aaaaaaaa..."
-# ↑ From OCI Console: Profile → Tenancy → OCID
+`region_chuncheon`, `region_osaka`, `instance_shape`, `domain_name`, `postgres_user`에는 기본값이
+있으므로 다르게 쓸 때에만 지정합니다.
 
-user_ocid_chuncheon        = "ocid1.user.oc1..aaaaaaaa..."
-# ↑ From OCI Console: Profile → User Settings → OCID
-
-fingerprint_chuncheon      = "xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"
-# ↑ From API Keys section after uploading public key
-
-private_key_path_chuncheon = "~/.oci/chuncheon_api_key.pem"
-# ↑ Path to your private key file
-
-region_chuncheon           = "ap-chuncheon-1"
-# ↑ Region identifier
-
-compartment_id_chuncheon   = "ocid1.compartment.oc1..aaaaaaaa..."
-# ↑ From Compartments section
-
-# ========================================
-# Osaka Region (Account 2)
-# ========================================
-tenancy_ocid_osaka     = "ocid1.tenancy.oc1..aaaaaaaa..."
-user_ocid_osaka        = "ocid1.user.oc1..aaaaaaaa..."
-fingerprint_osaka      = "yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy:yy"
-private_key_path_osaka = "~/.oci/osaka_api_key.pem"
-region_osaka           = "ap-osaka-1"
-compartment_id_osaka   = "ocid1.compartment.oc1..aaaaaaaa..."
-
-# ========================================
-# General Configuration
-# ========================================
-instance_shape = "VM.Standard.A1.Flex"
-# ↑ ARM-based instance type (Free Tier eligible)
-
-ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC..."
-# ↑ Paste output from: cat ~/.ssh/bngdrasil_vm_key.pub
-
-domain_name    = "bnbong.com"
-# ↑ Your domain name (or change to your own)
-
-# ========================================
-# Service Configuration
-# ========================================
-postgres_user     = "bnbong"
-
-postgres_password = "MySecurePassword123!@#"
-# ↑ CHANGE THIS! Minimum 16 characters recommended
-
-jwt_secret_key    = "your-super-secret-jwt-key-min-32-chars-change-this"
-# ↑ CHANGE THIS! Minimum 32 characters required
-```
-
-### Step 3: Verify Configuration
-
-```bash
-# Check that your API keys exist
-ls -la ~/.oci/
-
-# Should show:
-# chuncheon_api_key.pem
-# chuncheon_api_key_public.pem
-# osaka_api_key.pem
-# osaka_api_key_public.pem
-```
+`terraform.tfvars`는 `.gitignore`가 제외하고 있습니다. 파일에 실제 비밀 값이 들어가므로 저장소에
+올리지 않아야 하고, 사본을 만들 때에도 권한을 600으로 유지하는 편이 좋습니다.
 
 ---
 
-## Infrastructure Deployment
+## 6. 준비 확인
 
-### Step 1: Initialize Terraform
-
-```bash
-cd ~/projects/BNGdrasil/infra
-
-# Initialize Terraform (downloads provider plugins)
-make init
-
-# Or manually:
-terraform init
-```
-
-**Expected Output:**
-```
-Initializing the backend...
-Initializing provider plugins...
-- Finding oracle/oci versions matching "~> 5.0"...
-- Installing oracle/oci v5.x.x...
-
-Terraform has been successfully initialized!
-```
-
-### Step 2: Validate Configuration
+값을 다 채웠으면 자격 증명 없이 구성만 검사한 다음, provider 인증까지 확인합니다.
 
 ```bash
-# Validate Terraform files
-make validate
-
-# Or manually:
-terraform validate
+make fmt        # terraform fmt -recursive
+make validate   # terraform validate
+make init       # provider plugin을 내려받습니다
+make plan       # 자격 증명이 올바르면 계획이 출력됩니다
 ```
 
-### Step 3: Plan Deployment
+`Error 401`이 나오면 지문과 사용자 OCID와 개인 키 경로가 서로 맞는지 확인합니다. 지문은 다음
+명령으로 개인 키에서 다시 계산할 수 있으며, 이 값이 콘솔에 표시된 지문과 같아야 합니다.
 
 ```bash
-# Generate and review execution plan
-make plan
-
-# Or manually:
-terraform plan
+openssl rsa -pubout -outform DER -in ~/.oci/chuncheon_api_key.pem \
+  | openssl md5 -c
 ```
 
-**Review the Plan:**
-- Check that it will create **6 VMs** (3 in Chuncheon, 3 in Osaka)
-- Verify **VCN and subnet** configurations
-- Confirm **Security Lists** settings
-- Review **OCPU and RAM** allocations
-
-### Step 4: Deploy Infrastructure
-
-```bash
-# Apply the Terraform configuration
-make apply
-
-# Or manually:
-terraform apply
-```
-
-When prompted:
-```
-Do you want to perform these actions?
-  Terraform will perform the actions described above.
-  Only 'yes' will be accepted to approve.
-
-  Enter a value: yes  ← Type 'yes' and press Enter
-```
-
-**Deployment Time:** Approximately 10-15 minutes
-
-**What's Being Created:**
-
-1. **Chuncheon Region:**
-   - VCN (Virtual Cloud Network)
-   - Public Subnet (10.0.1.0/24)
-   - Private Subnet (10.0.2.0/24)
-   - Internet Gateway
-   - NAT Gateway
-   - Security Lists
-   - VM1: Frontend (1 OCPU, 6GB RAM)
-   - VM2: Core APIs (1 OCPU, 6GB RAM)
-   - VM3: Wegis AI (2 OCPU, 12GB RAM)
-
-2. **Osaka Region:**
-   - VCN
-   - Private Subnet (10.1.2.0/24)
-   - NAT Gateway
-   - Security Lists
-   - VM4: Database (1 OCPU, 6GB RAM)
-   - VM5: Monitoring (2 OCPU, 12GB RAM)
-   - VM6: Backup (1 OCPU, 6GB RAM)
+`plan`이 정상적으로 출력되었다고 해서 바로 `apply`로 넘어가면 안 됩니다. 이 저장소가 관리하는
+자원 중 일부는 state와 실제 OCI 자원이 어긋나 있습니다. apply 전에 밟아야 하는 대조 절차는
+[저장소 README](README.md)의 "Terraform 사용 절차"와 "VM5와 VM6의 state 정리"에 있습니다.
 
 ---
 
-## Verification and Testing
+## 7. 다음 단계
 
-### Step 1: Check Terraform Outputs
+계정 준비가 끝난 뒤의 작업은 다음 문서로 이어집니다.
 
-```bash
-# Display all outputs
-make output
-
-# Or manually:
-terraform output
-```
-
-**Expected Output:**
-```
-vm1_public_ip  = "129.154.XXX.XXX"
-vm2_public_ip  = "129.154.XXX.XXX"
-vm3_private_ip = "10.0.2.5"
-vm4_private_ip = "10.1.2.5"
-vm5_private_ip = "10.1.2.6"
-vm6_private_ip = "10.1.2.7"
-
-ssh_connections = {
-  "vm1" = "ssh ubuntu@129.154.XXX.XXX"
-  "vm2" = "ssh ubuntu@129.154.XXX.XXX"
-  "vm3" = "ssh -J ubuntu@129.154.XXX.XXX ubuntu@10.0.2.5"
-  ...
-}
-```
-
-### Step 2: Test SSH Connections
-
-#### Test VM1 (Public):
-
-```bash
-# Save VM1 public IP
-export VM1_IP=$(terraform output -raw vm1_public_ip)
-
-# Test SSH connection
-ssh -i ~/.ssh/bngdrasil_vm_key ubuntu@$VM1_IP
-
-# Once connected:
-ubuntu@vm1:~$ hostname
-# Should output: vm1
-
-ubuntu@vm1:~$ docker ps
-# Should show running containers
-
-ubuntu@vm1:~$ exit
-```
-
-#### Test VM2 (Public):
-
-```bash
-# Save VM2 public IP
-export VM2_IP=$(terraform output -raw vm2_public_ip)
-
-# Test SSH connection
-ssh -i ~/.ssh/bngdrasil_vm_key ubuntu@$VM2_IP
-
-# Check services
-ubuntu@vm2:~$ docker ps
-ubuntu@vm2:~$ curl http://localhost:8000/health
-ubuntu@vm2:~$ exit
-```
-
-#### Test VM3 (Private via Jump Host):
-
-```bash
-# Connect via VM2 as jump host
-ssh -i ~/.ssh/bngdrasil_vm_key -J ubuntu@$VM2_IP ubuntu@10.0.2.5
-
-# Check Wegis service
-ubuntu@vm3:~$ docker ps
-ubuntu@vm3:~$ exit
-```
-
-### Step 3: Verify Services
-
-```bash
-# Check all VM statuses
-make health
-
-# View VM1 logs
-make logs-vm1
-
-# View VM2 logs
-make logs-vm2
-```
-
-### Step 4: Verify in OCI Console
-
-1. **Chuncheon Account:**
-   - Go to **Compute** → **Instances**
-   - Should see: vm1-frontend-proxy, vm2-core-apis, vm3-wegis-ai
-   - Check that all are **Running**
-
-2. **Osaka Account:**
-   - Go to **Compute** → **Instances**
-   - Should see: vm4-database, vm5-monitoring, vm6-backup-dr
-   - Check that all are **Running**
-
----
-
-## Next Steps
-
-### 1. Configure SSH Config (Optional but Recommended)
-
-Add to `~/.ssh/config`:
-
-```
-# BNGdrasil VMs
-Host bnbong-vm1
-    HostName 129.154.XXX.XXX  # Replace with actual IP
-    User ubuntu
-    IdentityFile ~/.ssh/bngdrasil_vm_key
-
-Host bnbong-vm2
-    HostName 129.154.XXX.XXX  # Replace with actual IP
-    User ubuntu
-    IdentityFile ~/.ssh/bngdrasil_vm_key
-
-Host bnbong-vm3
-    HostName 10.0.2.5
-    User ubuntu
-    IdentityFile ~/.ssh/bngdrasil_vm_key
-    ProxyJump bnbong-vm2
-```
-
-Now you can connect with:
-```bash
-ssh bnbong-vm1
-ssh bnbong-vm2
-ssh bnbong-vm3
-```
-
-### 2. Deploy Applications
-
-See [DEPLOYMENT.md](../DEPLOYMENT.md) for application deployment instructions.
-
-### 3. Configure DNS
-
-If you have a domain, configure DNS records:
-
-```
-A     bnbong.com          → <VM1_PUBLIC_IP>
-A     www.bnbong.com      → <VM1_PUBLIC_IP>
-A     api.bnbong.com      → <VM1_PUBLIC_IP>
-A     admin.bnbong.com    → <VM1_PUBLIC_IP>
-A     monitoring.bnbong.com → <VM1_PUBLIC_IP>
-```
-
-### 4. Setup Monitoring
-
-Access Grafana via SSH tunnel:
-
-```bash
-# Create tunnel to VM5
-ssh -L 3000:localhost:3000 -J ubuntu@<VM2_IP> ubuntu@<VM5_PRIVATE_IP>
-
-# Open browser to:
-http://localhost:3000
-
-# Login: admin / admin
-```
-
----
-
-## Troubleshooting
-
-### Issue: Terraform can't find OCI provider
-
-**Solution:**
-```bash
-rm -rf .terraform
-terraform init
-```
-
-### Issue: "Error 401: The required information to complete authentication was not provided"
-
-**Solution:** Check that API keys are correctly configured:
-```bash
-# Verify fingerprint matches
-cat ~/.oci/chuncheon_api_key_public.pem | openssl rsa -pubin -outform DER | openssl md5 -c
-
-# Compare with fingerprint in OCI Console
-```
-
-### Issue: "Out of capacity" when creating instances
-
-**Solution:** OCI Free Tier resources may be temporarily unavailable. Try:
-1. Wait 30 minutes and try again
-2. Try a different Availability Domain
-3. Contact OCI support for Free Tier availability
-
-### Issue: Can't SSH to VMs
-
-**Solution:**
-```bash
-# Check Security Lists in OCI Console
-# Ensure port 22 is open for your IP
-
-# Check that you're using correct key
-ssh -i ~/.ssh/bngdrasil_vm_key -v ubuntu@<VM_IP>
-```
-
-### Issue: Services not starting on VMs
-
-**Solution:**
-```bash
-# SSH to VM
-ssh ubuntu@<VM_IP>
-
-# Check systemd service
-sudo systemctl status bnbong-vm1.service
-
-# View logs
-sudo journalctl -u bnbong-vm1.service -f
-
-# Restart service
-sudo systemctl restart bnbong-vm1.service
-```
-
----
-
-## Resource Management
-
-### View Current Resources
-
-```bash
-# List all managed resources
-terraform state list
-
-# Show detailed resource info
-make show
-
-# Resource summary
-make summary
-```
-
-### Modify Resources
-
-To change VM configurations, edit `infra/variables.tf`:
-
-```hcl
-variable "vm_configs" {
-  default = {
-    vm1 = {
-      ocpus = 1  # Change to 2 to increase CPU
-      memory_in_gbs = 6  # Change to 12 to increase RAM
-      ...
-    }
-  }
-}
-```
-
-Then apply changes:
-```bash
-terraform plan
-terraform apply
-```
-
-### Destroy Infrastructure
-
-**⚠️ WARNING: This will delete ALL resources!**
-
-```bash
-# Review what will be destroyed
-terraform plan -destroy
-
-# Destroy all resources
-make destroy
-
-# Confirm with: yes
-```
-
----
-
-## Cost Monitoring
-
-### Check Free Tier Usage
-
-1. Login to each OCI account
-2. Go to **Governance & Administration** → **Cost Management** → **Cost Analysis**
-3. View **Cost and Usage Reports**
-
-**Free Tier Limits (per account):**
-- ✅ ARM A1: 4 OCPU, 24GB RAM (Always Free)
-- ✅ Block Storage: 200GB (Always Free)
-- ✅ Outbound Traffic: 10TB/month (Always Free)
-- ⚠️ Additional resources will incur charges
-
-### Set Up Budget Alerts
-
-1. Go to **Governance & Administration** → **Budgets**
-2. Create **Budget Alert**
-3. Set threshold: $1.00
-4. Add your email for notifications
-
----
-
-## Additional Resources
-
-- [Terraform OCI Provider Docs](https://registry.terraform.io/providers/oracle/oci/latest/docs)
-- [OCI Free Tier FAQ](https://www.oracle.com/cloud/free/faq/)
-- [BNGdrasil Architecture Overview](../README.md)
-- [Application Deployment Guide](../DEPLOYMENT.md)
-
----
-
-## Summary Checklist
-
-- [  ] Created 2 OCI accounts (Chuncheon, Osaka)
-- [ ] Generated API keys for both accounts
-- [ ] Uploaded public keys to OCI Console
-- [ ] Created SSH key for VM access
-- [ ] Installed Terraform locally
-- [ ] Configured `terraform.tfvars`
-- [ ] Ran `terraform init`
-- [ ] Ran `terraform plan` (reviewed resources)
-- [ ] Ran `terraform apply` (deployed infrastructure)
-- [ ] Verified all 6 VMs are running
-- [ ] Tested SSH connections to VMs
-- [ ] Checked services are running
-- [ ] Configured DNS (optional)
-- [ ] Set up monitoring access
+- 실제 배포 상태를 먼저 파악하려면 [배포 기준선](docs/deployment-inventory.md)을 읽습니다.
+- VM2의 애플리케이션을 배포하려면 [vm2-deployment/README.md](vm2-deployment/README.md)를 따릅니다.
+- 관측 스택을 다루려면 [monitoring/README.md](monitoring/README.md)를 읽습니다.
+- 백업 체계를 설치하려면 [backup/README.md](backup/README.md)를 따릅니다.
