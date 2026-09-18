@@ -1,8 +1,10 @@
 """Local regression checks; no Docker daemon, SSH, or production data needed."""
+import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +76,198 @@ exit 0''',
             self.assertFalse((state / 'ship-last-run.json').exists())
             self.assertFalse((root / 'metrics/bngdrasil-backup-ship.prom').exists())
             self.assertFalse((run / 'SHIPPED').exists())
+
+
+class BackupRetentionAndShip(unittest.TestCase):
+    """R2: 보존 정책과 전송과 잠금이 서로 맞물려 동작하는지 확인한다."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.state = self.root / 'state'
+        self.state.mkdir()
+        self.metrics = self.root / 'metrics'
+        self.notify_log = self.root / 'notify.log'
+        self.notify = self.bin / 'notify-stub.sh'
+        self.notify.write_text('#!/bin/sh\nprintf "%s|%s|%s\\n" "$1" "$2" "$3" >> "$NOTIFY_LOG"\n')
+        self.notify.chmod(0o755)
+        self.recipients = self.root / 'recipients'
+        self.recipients.write_text('test-placeholder-not-a-real-recipient\n')
+        self.recipients.chmod(0o600)
+        self.addCleanup(self._tmp.cleanup)
+
+    def stub(self, name, body):
+        p = self.bin / name
+        p.write_text('#!/bin/sh\n' + body + '\n')
+        p.chmod(0o755)
+
+    def env(self, **extra):
+        base = dict(
+            os.environ,
+            PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
+            BK_ENV_FILE=str(self.root / 'absent-env'),
+            BK_SECRET_DIR=str(self.root),
+            BACKUP_ROOT=str(self.root),
+            STATE_DIR=str(self.state),
+            LOCK_DIR=str(self.root / 'locks'),
+            BK_LOCK_FILE=str(self.state / 'backup.lock'),
+            BK_LOCK_WAIT_SEC='0',
+            METRICS_DIR=str(self.metrics),
+            METRICS_ENABLED='1',
+            NOTIFY_SCRIPT=str(self.notify),
+            NOTIFY_LOG=str(self.notify_log),
+            AGE_RECIPIENTS_FILE=str(self.recipients),
+            SHIP_ENCRYPTION='age',
+            SHIP_SSH_DIR=str(self.root / 'ssh'),
+            SHIP_OUTBOUND_DIR=str(self.root / 'outbound'),
+        )
+        base.pop('BK_LOCK_HELD', None)
+        base.update(extra)
+        return base
+
+    def make_runs(self, run_ids, shipped=False, group='postgresql'):
+        made = []
+        for run_id in run_ids:
+            d = self.root / group / run_id
+            d.mkdir(parents=True)
+            (d / 'SUCCESS').touch()
+            (d / 'postgresql-bngdrasil.dump').write_text('dummy dump ' + run_id + '\n')
+            if shipped:
+                (d / 'SHIPPED').touch()
+            made.append(d)
+        return made
+
+    def run_script(self, name, *args, **env_extra):
+        return subprocess.run(['bash', str(ROOT / 'backup' / name), *args],
+                              env=self.env(**env_extra), capture_output=True,
+                              text=True, timeout=60)
+
+    # --- 1. 미전송 성공본은 dry-run 에서도 실제 실행에서도 삭제되지 않는다 ------------
+    def test_unshipped_successes_are_never_deleted(self):
+        runs = self.make_runs(['20260101T001000Z', '20260101T061000Z', '20260101T121000Z'])
+
+        dry = self.run_script('retention.sh', '--dry-run')
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertNotIn('삭제 예정', dry.stdout)
+
+        real = self.run_script('retention.sh')
+        self.assertEqual(real.returncode, 0, real.stdout + real.stderr)
+        self.assertNotIn('삭제:', real.stdout)
+        for d in runs:
+            self.assertTrue(d.exists(), d)
+        self.assertEqual(self.notify_log.exists(), False)
+
+        metric = (self.metrics / 'bngdrasil-backup-unshipped.prom').read_text()
+        self.assertIn('bngdrasil_backup_unshipped_total{component="postgresql"} 3', metric)
+
+    # --- 1-b. SHIPPED 표시를 붙이면 세대 정책대로 정리된다 ---------------------------
+    def test_shipped_successes_follow_generation_policy(self):
+        runs = self.make_runs(['20260101T001000Z', '20260101T061000Z', '20260101T121000Z'],
+                              shipped=True)
+        result = self.run_script('retention.sh')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(runs[2].exists(), '같은 날의 가장 최근 성공본은 남아야 한다')
+        self.assertFalse(runs[0].exists(), result.stdout)
+        self.assertFalse(runs[1].exists(), result.stdout)
+
+    # --- 1-c. 전송을 쓰지 않는 호스트에서는 SHIPPED 를 요구하지 않는다 -----------------
+    def test_retention_without_shipping_still_cleans_up(self):
+        runs = self.make_runs(['20260101T001000Z', '20260101T061000Z', '20260101T121000Z'])
+        result = self.run_script('retention.sh', SHIP_ENABLED='false')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(runs[2].exists())
+        self.assertFalse(runs[0].exists())
+
+    # --- 2. 미전송이 허용치를 넘으면 삭제하지 않은 채 실패로 드러낸다 -------------------
+    def test_unshipped_pileup_fails_and_notifies(self):
+        runs = self.make_runs(['2026010%dT001000Z' % i for i in range(1, 10)])
+        result = self.run_script('retention.sh', RETENTION_MAX_UNSHIPPED='8')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for d in runs:
+            self.assertTrue(d.exists(), d)
+        self.assertTrue(self.notify_log.exists(), result.stdout + result.stderr)
+        logged = self.notify_log.read_text()
+        self.assertIn('warning|retention|', logged)
+        self.assertIn('허용치', logged)
+
+    # --- 3. 전송 실패는 run.sh 전체 결과에 반영되고 로컬 성공본은 남는다 ---------------
+    def test_ship_failure_surfaces_in_run_and_retry_path_recovers(self):
+        run_dir = self.make_runs(['20260101T001000Z'])[0]
+        self.stub('age', 'exec cat')
+        self.stub('rsync', 'exit 1')
+        self.stub('ssh', 'exit 0')
+
+        failed = self.run_script('run.sh', RUN_POSTGRESQL='false', REDIS_TARGETS='',
+                                 SQLITE_TARGETS='', RUN_NOTIFY='0', SHIP_ENABLED='true')
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        last_run = (self.state / 'last-run.json').read_text()
+        self.assertIn('"failed_steps": "ship"', last_run)
+        self.assertIn('"status": "failed"', last_run)
+        self.assertTrue((run_dir / 'SUCCESS').exists())
+        self.assertFalse((run_dir / 'SHIPPED').exists())
+        self.assertFalse((run_dir / 'SHIPPING').exists())
+        self.assertEqual(list((self.root / 'outbound').glob('*')), [])
+
+        # 재시도 timer 가 실행하는 경로. 미전송분만 다시 보낸다.
+        self.stub('rsync', 'exit 0')
+        retry = self.run_script('ship.sh')
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertTrue((run_dir / 'SHIPPED').exists())
+        self.assertFalse((run_dir / 'SHIPPING').exists())
+        self.assertIn('성공 1건', retry.stdout)
+        metric = (self.metrics / 'bngdrasil-backup-unshipped.prom').read_text()
+        self.assertIn('bngdrasil_backup_unshipped_total{component="postgresql"} 0', metric)
+
+    # --- 3-b. 원격 검증에 실패하면 SHIPPED 표시를 남기지 않는다 ----------------------
+    def test_remote_verification_failure_blocks_shipped_marker(self):
+        run_dir = self.make_runs(['20260101T001000Z'])[0]
+        self.stub('age', 'exec cat')
+        self.stub('rsync', 'exit 0')
+        # 첫 번째 호출(원격 디렉터리 준비)은 성공하고 검증 호출은 실패하게 만든다.
+        self.stub('ssh', 'case "$*" in *sha256sum*) exit 1 ;; esac\nexit 0')
+        result = self.run_script('ship.sh')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse((run_dir / 'SHIPPED').exists())
+        self.assertFalse((run_dir / 'SHIPPING').exists())
+        self.assertTrue((run_dir / 'SUCCESS').exists())
+        self.assertIn('원격 체크섬 검증에 실패', result.stderr)
+
+    # --- 4. 전송 중에는 보존 정책이 같은 잠금에 막힌다 -------------------------------
+    def test_retention_is_blocked_while_shipping_holds_the_lock(self):
+        run_dir = self.make_runs(['20260101T001000Z'])[0]
+        self.stub('age', 'exec cat')
+        self.stub('rsync', 'sleep 5\nexit 0')
+        self.stub('ssh', 'exit 0')
+        with subprocess.Popen(['bash', str(ROOT / 'backup/ship.sh')], env=self.env(),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as shipping:
+            try:
+                marker = run_dir / 'SHIPPING'
+                deadline = time.time() + 20
+                while not marker.exists() and time.time() < deadline:
+                    if shipping.poll() is not None:
+                        self.fail('ship.sh 가 잠금을 잡기 전에 끝났다')
+                    time.sleep(0.05)
+                self.assertTrue(marker.exists(), 'SHIPPING 표시가 생기지 않았다')
+                blocked = self.run_script('retention.sh', BK_LOCK_WAIT_SEC='1')
+                self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+                self.assertIn('잠금', blocked.stderr)
+                self.assertTrue(run_dir.exists())
+            finally:
+                shipping.wait(timeout=60)
+        self.assertEqual(shipping.returncode, 0)
+
+    # --- 5. 디스크 여유 부족 경로는 그대로 유지된다 ----------------------------------
+    def test_pg_backup_refuses_to_start_without_free_space(self):
+        result = self.run_script('pg-backup.sh', PG_MIN_FREE_BYTES=str(1 << 62),
+                                 PG_DATABASES='dummy', PG_DUMP_CMD='false',
+                                 PG_DUMPALL_CMD='false', PG_RESTORE_CMD='false')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('디스크 여유가 부족합니다', result.stderr)
+        self.assertEqual(list((self.root / 'postgresql').glob('2*')), [])
+        state = json.loads((self.state / 'postgresql-last-run.json').read_text())
+        self.assertEqual(state['status'], 'failed')
 
 
 if __name__ == '__main__':

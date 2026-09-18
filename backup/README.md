@@ -8,12 +8,12 @@
 
 | 파일 | 역할 |
 |---|---|
-| `run.sh` | PostgreSQL, Redis, SQLite, 보존 정책을 차례로 실행하고 단계별 실패를 집계합니다. systemd 유닛이 이 파일을 실행합니다. `RUN_POSTGRESQL=false`를 지정하면 PostgreSQL 단계를 건너뜁니다. |
+| `run.sh` | PostgreSQL, Redis, SQLite, 보존 정책, 독립 보관 전송을 차례로 실행하고 단계별 실패를 집계합니다. systemd 유닛이 이 파일을 실행합니다. `RUN_POSTGRESQL=false`를 지정하면 PostgreSQL 단계를 건너뛰고, `SHIP_ENABLED=false`를 지정하면 전송 단계를 건너뜁니다. |
 | `pg-backup.sh` | 호스트 PostgreSQL의 각 데이터베이스를 custom format으로 덤프하고 검증합니다. |
 | `redis-backup.sh` | Redis 스냅샷을 받아 `redis-check-rdb`로 검증합니다. 컨테이너 모드와 호스트 모드를 모두 지원합니다. |
 | `sqlite-backup.sh` | SQLite 온라인 백업 API로 복사한 뒤 `PRAGMA integrity_check`로 확인합니다. |
-| `retention.sh` | 일 7세대, 주 4세대, 월 3세대를 남기고 나머지를 정리합니다. |
-| `ship.sh` | 성공한 백업을 암호화하여 VM3 밖의 보관 위치로 전송합니다. |
+| `retention.sh` | 독립 보관 위치로 보낸 성공본만 일 7세대, 주 4세대, 월 3세대로 남기고 나머지를 정리합니다. 아직 보내지 못한 성공본은 삭제하지 않습니다. |
+| `ship.sh` | 성공한 백업을 암호화하여 VM3 밖의 보관 위치로 전송하고, 원격에서 체크섬을 다시 확인한 뒤에 전송 완료 표시를 남깁니다. |
 | `notify.sh` | 성공과 실패를 webhook 또는 syslog로 알립니다. |
 | `verify-restore.sh` | 일회용 PostgreSQL에 최신 덤프를 복원하고 테이블 수와 행 수를 기록합니다. |
 | `install.sh` | VM3에 설치하고 systemd timer를 활성화합니다. 여러 번 실행해도 결과가 같습니다. |
@@ -22,6 +22,26 @@
 | `systemd/` | service 유닛과 timer 유닛을 담고 있습니다. |
 
 설치한 뒤의 경로는 다음과 같이 고정됩니다. 스크립트는 `/opt/bngdrasil-backup`에 두고, 환경 파일은 `/etc/bngdrasil-backup/env`에 두며, 백업 데이터는 `/var/backups/bngdrasil` 아래에 쌓입니다.
+
+## 복구 목표와 실행 주기
+
+이 체계가 목표로 삼는 복구 시점 목표는 다음 표와 같습니다. 두 목표를 구분하는 이유는 로컬 백업과 독립 보관 사본이 서로 다른 고장을 막아 주기 때문입니다. 데이터베이스 내용을 잘못 지운 사고는 로컬 백업으로 복구하지만, VM3 자체를 잃는 사고는 독립 보관 사본이 있어야 복구할 수 있습니다.
+
+| 구분 | 목표 | 실행 주체 | 실패했을 때 울리는 경보 |
+|---|---|---|---|
+| 로컬 백업 RPO | 6시간 | `bngdrasil-backup.timer`가 00시, 06시, 12시, 18시 10분에 `run.sh`를 실행합니다. | `BackupStale`(8시간) |
+| 오프사이트 RPO | 6시간 | `run.sh`가 백업을 마친 직후 마지막 단계에서 `ship.sh`를 실행합니다. `SHIP_ENABLED=true`일 때에만 수행합니다. | `BackupShipStale`(14시간) |
+| 전송 재시도 | 2시간 | `bngdrasil-backup-ship.timer`가 홀수 시 40분에 `ship.sh`를 실행하여 아직 보내지 못한 백업만 다시 보냅니다. | `BackupUnshippedPileup`(미전송 4개 초과) |
+
+오프사이트 전송을 백업 직후에 수행하므로 두 목표가 모두 6시간입니다. 전송에 실패하면 그 사실이 `run.sh`의 전체 결과에 반영되어 실행 자체가 실패로 끝납니다. 별도의 전송 timer는 정상 경로가 아니라 재시도 경로이며, 경보 기준 14시간은 6시간 주기에 재시도가 몇 번 실패할 여유를 더한 값입니다.
+
+전송 설정을 갖추지 않은 호스트에서는 `/etc/bngdrasil-backup/env`에 `SHIP_ENABLED=false`를 반드시 지정해야 합니다. 이 값을 지정하지 않으면 매 실행이 전송 단계에서 실패하고, 보존 정책도 전송 완료 표시를 기다리느라 오래된 백업을 정리하지 못합니다.
+
+## 잠금
+
+`run.sh`와 `retention.sh`와 `ship.sh`는 `BK_LOCK_FILE`이 가리키는 같은 잠금 파일을 사용합니다. 기본 경로는 `/var/backups/bngdrasil/state/backup.lock`입니다. 세 스크립트가 같은 백업 디렉터리를 동시에 건드리면 전송 중인 원본을 보존 정책이 지우는 경합이 생기기 때문입니다.
+
+`run.sh`가 잠금을 잡은 상태에서 두 스크립트를 순차로 실행하므로, 두 스크립트는 `BK_LOCK_HELD` 환경 변수를 물려받아 잠금을 다시 얻으려고 하지 않습니다. 이렇게 하여 중첩 실행에서 교착이 생기지 않도록 했습니다. 잠금을 이미 다른 작업이 쥐고 있으면 `BK_LOCK_WAIT_SEC`(기본값 300초)만큼 기다린 뒤 실패합니다. 구성 요소별 백업 스크립트는 예전처럼 `LOCK_DIR` 아래의 개별 잠금을 계속 사용합니다.
 
 ## 백업이 동작하는 방식
 
@@ -59,19 +79,46 @@ bngdrasil_backup_last_run_status{component="postgresql"} 0
 bngdrasil_backup_last_run_timestamp_seconds{component="postgresql"} 1789665747
 ```
 
-`component` 라벨에는 `postgresql`, `redis-vm3`, `sqlite-grafana`, `ship`, `all` 같은 값이 들어갑니다. 경보는 `bngdrasil_backup_last_run_status`가 1인 상태와, `bngdrasil_backup_last_success_timestamp_seconds`가 일정 시간 이상 갱신되지 않는 상태를 함께 보는 방식을 권장합니다. 백업이 아예 실행되지 않는 고장은 뒤쪽 조건에서만 드러나기 때문입니다.
+`retention.sh`와 `ship.sh`는 아직 독립 보관 위치로 보내지 못한 성공본의 개수도 함께 내보냅니다.
+
+```
+bngdrasil_backup_unshipped_total{component="postgresql"} 0
+```
+
+`component` 라벨에는 `postgresql`, `redis-vm3`, `sqlite-grafana`, `ship`, `all` 같은 값이 들어갑니다. 경보는 `bngdrasil_backup_last_run_status`가 1인 상태와, `bngdrasil_backup_last_success_timestamp_seconds`가 일정 시간 이상 갱신되지 않는 상태를 함께 보는 방식을 권장합니다. 백업이 아예 실행되지 않는 고장은 뒤쪽 조건에서만 드러나기 때문입니다. `ship` component는 전송 주기가 로컬 백업과 다르므로 경보 기준을 따로 두어야 합니다.
+
+## 경보
+
+`monitoring/prometheus/rules/basic.yml`의 `basic-backup` 그룹에 네 가지 규칙을 두었습니다. 각 규칙에는 무엇을 먼저 확인해야 하는지를 적은 `action` annotation이 붙어 있습니다.
+
+| 규칙 | 조건 | 심각도 | 첫 대응 |
+|---|---|---|---|
+| `BackupStale` | `component`가 `ship`이 아닌 백업의 마지막 성공이 8시간을 넘겼습니다. | critical | `journalctl -u bngdrasil-backup.service`로 실패 단계를 확인하고 `state/last-run.json`의 `failed_steps`를 읽습니다. |
+| `BackupShipStale` | `component="ship"`의 마지막 성공이 14시간을 넘겼습니다. | critical | VM2를 경유하는 SSH 연결과 키 권한, VM4 보관 디렉터리의 여유 공간을 점검한 뒤 `ship.sh`를 수동으로 실행합니다. |
+| `BackupUnshippedPileup` | 전송하지 못한 성공본이 한 구성 요소에서 4개를 넘었습니다. | warning | 전송 경로를 복구합니다. 전송이 다시 성공하면 다음 정리 실행에서 세대 정책대로 줄어듭니다. |
+| `BackupDiskLow` | 백업이 쌓이는 파티션의 여유 공간이 10GiB 미만입니다. | warning | `du -sh /var/backups/bngdrasil/*`로 원인을 찾습니다. 미전송 백업이 원인이면 전송을 먼저 복구합니다. |
+
+`BackupDiskLow`는 `/var/backups`와 `/var`와 `/` 가운데 여유가 가장 적은 파일시스템을 봅니다. `/var/backups`를 별도 파티션으로 분리하면 그 mountpoint가 자동으로 선택됩니다.
 
 ## 보존 정책
 
-`retention.sh`는 `SUCCESS` 표시가 있는 디렉터리만 세대로 계산합니다. 기본값은 일 7세대, 주 4세대, 월 3세대이며 환경 파일에서 조정할 수 있습니다. 같은 날에 여러 번 실행했다면 그날의 가장 최근 성공본만 일 세대로 계산합니다.
+`retention.sh`는 `SUCCESS` 표시와 `SHIPPED` 표시를 모두 가진 디렉터리만 세대로 계산합니다. 기본값은 일 7세대, 주 4세대, 월 3세대이며 환경 파일에서 조정할 수 있습니다. 같은 날에 여러 번 실행했다면 그날의 가장 최근 성공본만 일 세대로 계산합니다.
 
-안전 장치를 세 가지 두었습니다. 첫째, 성공한 백업이 하나뿐이면 어떤 경우에도 삭제하지 않습니다. 둘째, 해당 구성 요소의 마지막 실행이 성공 상태가 아니면 그 구성 요소의 정리를 통째로 건너뜁니다. 셋째, 실패한 실행 디렉터리는 성공본이 남아 있고 `RETENTION_FAILED_DAYS`를 넘겼을 때에만 정리합니다. `--dry-run` 옵션을 주면 삭제 대상만 출력하고 실제로 지우지는 않습니다.
+독립 보관 사본이 아직 없는 백업을 보존 정책이 지우는 상황을 막기 위해, 미전송 성공본은 세대 계산에서 아예 제외하고 그대로 보존합니다. 전송이 진행 중인 디렉터리에는 `ship.sh`가 `SHIPPING` 표시를 남기며, 이 표시가 있는 디렉터리도 삭제 대상에서 빠집니다. 전송 실패가 이어지면 미전송 백업이 계속 쌓이므로, 그 개수가 `RETENTION_MAX_UNSHIPPED`(기본값 8, 6시간 주기 기준으로 48시간분)를 넘으면 `retention.sh`는 백업을 지우는 대신 exit code 1로 끝나고 `notify.sh`로 경고를 보냅니다. 디스크가 차 가는 상황을 조용히 넘기지 않고 실패로 드러내려는 의도입니다.
+
+전송을 사용하지 않는 호스트에서는 `SHIP_ENABLED=false`를 지정하십시오. 그러면 `RETENTION_REQUIRE_SHIPPED`가 같은 값을 물려받아 전송 완료 표시를 요구하지 않고 예전과 같은 세대 정책으로만 정리합니다.
+
+나머지 안전 장치는 그대로 유지했습니다. 첫째, 성공한 백업이 하나뿐이면 어떤 경우에도 삭제하지 않습니다. 둘째, 해당 구성 요소의 마지막 실행이 성공 상태가 아니면 그 구성 요소의 정리를 통째로 건너뜁니다. 셋째, 실패한 실행 디렉터리는 성공본이 남아 있고 `RETENTION_FAILED_DAYS`를 넘겼을 때에만 정리합니다. `--dry-run` 옵션을 주면 삭제 대상만 출력하고 실제로 지우지 않으며, 상태 파일과 metric도 건드리지 않습니다.
 
 ## 독립 보관
 
 `ship.sh`는 성공한 백업 디렉터리를 tar로 묶고 암호화한 다음 rsync로 전송합니다. 암호화하지 않고 보내는 경로는 막아 두었으므로 `SHIP_ENCRYPTION`을 `age` 또는 `gpg`로 지정해야 합니다. 키는 `/etc/bngdrasil-backup/` 아래 권한 600 파일에서만 읽으며, 권한이 그보다 넓으면 전송을 시작하지 않고 실패합니다. 스크립트 안에는 키 값을 두지 않았습니다.
 
-기본 대상은 VM4입니다. VM4는 오사카 리전에 있고 현재 확인된 연결 수단은 SSH뿐이므로 VM2를 경유하는 설정이 필요합니다. 이 설정은 root 홈의 `~/.ssh/config`가 아니라 `/etc/bngdrasil-backup/ssh/config`에 둡니다. service 유닛이 `ProtectHome=yes`로 실행되어 root 홈에 닿지 않기 때문이며, `ship.sh`가 `ssh -F`로 설정 파일을, `ssh -i`로 개인 키를 명시하므로 홈 디렉터리에 의존하지 않습니다. `install.sh`가 `/etc/bngdrasil-backup/ssh/` 디렉터리를 권한 700으로 만들고 주석 처리한 예시가 담긴 `config` 템플릿을 권한 600으로 만들어 둡니다. 개인 키는 `id_ed25519`라는 이름으로 같은 디렉터리에 두고 권한을 600으로 맞춥니다. `known_hosts`도 같은 디렉터리를 사용합니다. 접속할 호스트는 `SHIP_SSH_HOST`로 지정하며, 그 값은 설정 파일에 정의한 `Host` 별칭과 같아야 합니다. 전송에 성공한 백업 디렉터리에는 `SHIPPED` 표시 파일을 남기므로 다음 실행에서 같은 백업을 다시 보내지 않습니다. 전송에 실패하면 exit code가 0이 아닌 값이 되지만 로컬의 성공 백업은 그대로 남습니다. 전송 실패 때문에 유일한 정상본을 잃는 일은 없습니다.
+`run.sh`가 백업을 마친 직후 마지막 단계에서 `ship.sh`를 실행하므로, 정상 경로에서는 백업과 전송의 간격이 한 번의 실행 안으로 들어옵니다. 앞 단계 가운데 일부가 실패했더라도 성공한 백업은 보내야 하므로 전송 단계는 실패 여부와 상관없이 실행합니다. 전송이 실패하면 `run.sh`의 전체 결과가 실패가 되고, 2시간 주기의 `bngdrasil-backup-ship.timer`가 아직 보내지 못한 백업만 다시 보냅니다.
+
+전송을 마치면 원격에서 `sha256sum -c`로 체크섬을 다시 계산하여 대조하고, 이 확인을 통과한 경우에만 `SHIPPED` 표시를 남깁니다. 보존 정책이 이 표시를 삭제 허용의 근거로 삼기 때문에, 검증하지 않은 전송을 완료로 기록하면 오프사이트 사본이 없는 백업이 지워질 수 있습니다. 검증에 실패하면 원격에 도착한 불완전한 사본을 지우고 실패로 끝납니다. `SHIP_TARGET`으로 rsync 대상을 직접 지정한 경우에는 검증에 사용할 접속 정보를 `SHIP_VERIFY_SSH_HOST`와 `SHIP_VERIFY_REMOTE_DIR`에 따로 적어야 합니다. `SHIP_VERIFY=0`으로 검증을 끌 수는 있지만, 그때에는 경고를 남기면서 검증 없이 완료로 기록한다는 점을 알고 있어야 합니다.
+
+기본 대상은 VM4입니다. VM4는 오사카 리전에 있고 현재 확인된 연결 수단은 SSH뿐이므로 VM2를 경유하는 설정이 필요합니다. 이 설정은 root 홈의 `~/.ssh/config`가 아니라 `/etc/bngdrasil-backup/ssh/config`에 둡니다. service 유닛이 `ProtectHome=yes`로 실행되어 root 홈에 닿지 않기 때문이며, `ship.sh`가 `ssh -F`로 설정 파일을, `ssh -i`로 개인 키를 명시하므로 홈 디렉터리에 의존하지 않습니다. `install.sh`가 `/etc/bngdrasil-backup/ssh/` 디렉터리를 권한 700으로 만들고 주석 처리한 예시가 담긴 `config` 템플릿을 권한 600으로 만들어 둡니다. 개인 키는 `id_ed25519`라는 이름으로 같은 디렉터리에 두고 권한을 600으로 맞춥니다. `known_hosts`도 같은 디렉터리를 사용합니다. 접속할 호스트는 `SHIP_SSH_HOST`로 지정하며, 그 값은 설정 파일에 정의한 `Host` 별칭과 같아야 합니다. 원격 검증까지 통과한 백업 디렉터리에는 `SHIPPED` 표시 파일을 남기므로 다음 실행에서 같은 백업을 다시 보내지 않습니다. 전송에 실패하면 exit code가 0이 아닌 값이 되지만 로컬의 성공 백업은 그대로 남습니다. 전송 실패 때문에 유일한 정상본을 잃는 일은 없습니다.
 
 VM4를 쓰지 않고 OCI Object Storage를 보관 위치로 삼는 방법도 있습니다. 그 경우에는 전용 버킷과 수명주기 규칙을 먼저 만들고, 쓰기 전용 권한만 가진 계정을 별도로 발급한 다음, `ship.sh`의 rsync 호출 부분을 `oci os object put`으로 바꾸면 됩니다. 암호화는 전송 전에 그대로 수행하며 버킷 자체의 암호화에 의존하지 않습니다. 이 방법은 아직 구성하지 않았고 월 비용과 회수 절차를 확인해야 합니다.
 
@@ -142,7 +189,9 @@ systemctl list-timers 'bngdrasil-*'
 
 ## timer 구성
 
-timer는 세 가지를 설치합니다. `bngdrasil-backup.timer`는 6시간 간격으로 백업을 실행하고, `Persistent=true`를 지정했으므로 VM이 꺼져 있어 놓친 실행은 부팅 뒤에 따라잡습니다. `RandomizedDelaySec`으로 실행 시각을 흩어 놓아 다른 작업과 겹칠 가능성을 줄였습니다. `bngdrasil-backup-ship.timer`는 하루 두 번 전송하고, `bngdrasil-backup-verify.timer`는 주 1회 격리 복원 훈련을 수행합니다.
+timer는 세 가지를 설치합니다. `bngdrasil-backup.timer`는 6시간 간격으로 백업을 실행하고, `Persistent=true`를 지정했으므로 VM이 꺼져 있어 놓친 실행은 부팅 뒤에 따라잡습니다. `RandomizedDelaySec`으로 실행 시각을 흩어 놓아 다른 작업과 겹칠 가능성을 줄였습니다. `bngdrasil-backup-ship.timer`는 홀수 시 40분마다 전송을 재시도하고, `bngdrasil-backup-verify.timer`는 주 1회 격리 복원 훈련을 수행합니다.
+
+전송 timer의 시각을 홀수 시 40분으로 잡은 이유는 백업 timer가 도는 짝수 시 10분과 겹치지 않게 하려는 것입니다. 두 유닛이 같은 잠금을 쓰기 때문에, 겹치면 재시도 쪽이 잠금을 기다리다가 실패로 끝납니다.
 
 ## 최초 실행 뒤에 확인할 것
 
@@ -173,6 +222,10 @@ PostgreSQL 14는 2026년 11월 12일에 지원이 끝날 예정이며 10월 말 
 
 Ubuntu 22.04 컨테이너의 mawk 환경에서도 용량 계산 함수가 순수 정수를 반환하는지 확인했습니다. mawk는 큰 수의 산술 결과를 `4.88162e+10` 같은 과학적 표기법으로 출력하므로, awk에서는 값을 추출만 하고 곱셈은 bash 정수 연산으로 수행하도록 바꾸었습니다.
 
+R2 리뷰를 반영한 뒤에는 더미 데이터로 다음을 추가로 확인했습니다. 같은 날 00시 10분, 06시 10분, 12시 10분에 만든 미전송 성공본 세 개를 두었을 때 `--dry-run`과 실제 실행 모두 삭제를 한 건도 수행하지 않았고, 같은 세 개에 `SHIPPED` 표시를 붙이자 그날의 가장 최근 성공본만 남기고 두 개를 정리했습니다. 미전송 성공본을 아홉 개로 늘리자 `retention.sh`가 아무것도 지우지 않은 채 exit code 1로 끝나고 알림 대역 스크립트를 호출했습니다. rsync 대역이 실패를 돌려주는 상황에서는 `run.sh`의 전체 결과에 `ship` 단계 실패가 기록되었고 로컬 성공본과 `SUCCESS` 표시가 그대로 남았으며, 재시도 경로로 `ship.sh`를 단독 실행하자 미전송분만 전송하고 `SHIPPED` 표시를 남겼습니다. 원격 체크섬 검증이 실패하는 상황에서는 `SHIPPED` 표시를 만들지 않았습니다. 전송이 진행 중일 때 `retention.sh`를 동시에 실행하면 공용 잠금에 막혀 대기하다가 실패했습니다. 디스크 여유가 부족한 상황에서 `pg-backup.sh`가 덤프를 시작하지 않고 실패하는 기존 동작도 다시 확인했습니다.
+
+이 검사들은 `tests/test_review_regressions.py`에 담겨 있으며 `python3 -m unittest discover -s tests -v`로 실행합니다. macOS의 디렉터리 잠금 경로와 Ubuntu 22.04 컨테이너의 `flock` 경로에서 모두 통과하는 것을 확인했습니다.
+
 `age`와 `gpg`는 개발 장비에 없었으므로 `ship.sh`의 암호화 자체는 확인하지 못했습니다. 대신 스트림을 그대로 흘려보내는 대역 명령을 만들어 tar와 암호화와 rsync로 이어지는 배관과 `SHIPPED` 표시 동작을 확인했습니다. 실제 암호화와 VM4 전송은 설치 시점에 다시 확인해야 합니다. systemd 유닛은 개발 장비에서 `systemd-analyze verify`를 실행할 수 없으므로 문법을 눈으로 점검했습니다.
 
 ## 제한 사항
@@ -186,6 +239,7 @@ Ubuntu 22.04 컨테이너의 mawk 환경에서도 용량 계산 함수가 순수
 - 서로 다른 구성 요소의 수집 시각이 다르므로 전체 서비스의 트랜잭션 일관성은 보장하지 않습니다.
 - Redis의 `vm2-redis`와 VM2의 SQLite 파일은 VM3에서 닿지 않습니다. VM2에 같은 스크립트를 따로 설치하고 `RUN_POSTGRESQL=false`를 지정해야 합니다.
 - 복원 훈련은 덤프가 복원된다는 사실까지만 확인합니다. 애플리케이션 로그인과 프록시 동작까지 확인하는 훈련은 별도 절차가 필요합니다.
+- **실제 VM 설치와 독립 복원과 알림 수신은 아직 검증하지 않았습니다.** 여기에 적은 검증 결과는 모두 개발 장비의 더미 데이터와 대역 명령으로 얻은 것입니다. 표에 적은 복구 시점 목표도 설계 목표이며, 운영 환경에서 실제로 달성한 값이 아닙니다. VM3와 VM2에 설치한 뒤에 전송 성공, 격리 복원, 경보 통지 수신을 차례로 확인해야 합니다.
 
 ## 롤백
 

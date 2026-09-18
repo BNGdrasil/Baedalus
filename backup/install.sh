@@ -122,6 +122,9 @@ if [ "$DO_ENABLE" -eq 1 ]; then
         log "전송 timer 를 활성화했습니다."
     else
         log "SHIP_ENCRYPTION 설정이 없어 전송 timer 는 활성화하지 않았습니다. 키를 준비한 뒤 systemctl enable --now bngdrasil-backup-ship.timer 를 실행하십시오."
+        if ! grep -Eq '^[[:space:]]*SHIP_ENABLED=' "$CONFIG_DIR/env"; then
+            log "경고: run.sh 는 기본적으로 백업 직후에 전송을 수행합니다. 전송을 아직 쓰지 않는다면 $CONFIG_DIR/env 에 SHIP_ENABLED=false 를 지정하십시오. 그렇게 하지 않으면 매 실행이 전송 단계에서 실패합니다."
+        fi
     fi
     log "백업 timer 와 복원 훈련 timer 를 활성화했습니다."
 else

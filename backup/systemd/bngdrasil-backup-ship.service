@@ -1,9 +1,13 @@
 [Unit]
-Description=BNGdrasil 백업 독립 보관 전송
+Description=BNGdrasil 백업 독립 보관 전송 재시도
 Documentation=file:///opt/bngdrasil-backup/README.md
 After=network-online.target bngdrasil-backup.service
 Wants=network-online.target
 OnFailure=bngdrasil-backup-notify@%n.service
+
+# 정상 경로에서는 run.sh 가 백업 직후에 ship.sh 를 직접 실행한다. 이 유닛은 그때
+# 보내지 못한 백업을 다시 보내는 재시도 경로이다. run.sh 와 같은 공용 잠금을 쓰므로
+# 백업이 진행 중이면 잠금이 풀릴 때까지 기다린다.
 
 [Service]
 Type=oneshot

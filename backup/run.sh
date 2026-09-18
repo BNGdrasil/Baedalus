@@ -2,9 +2,17 @@
 #
 # 백업 전체 실행. systemd 의 bngdrasil-backup.service 가 이 파일을 실행한다.
 #
-# 순서는 PostgreSQL, Redis, SQLite, 보존 정책, 집계 metric 이다. 앞 단계가 실패해도
-# 뒤 단계를 계속 수행하되 실패 건수를 모아 마지막에 non-zero 로 끝낸다. 보존 정책은
-# 실패한 구성 요소를 스스로 건너뛰므로 여기에서 따로 막지 않는다.
+# 순서는 PostgreSQL, Redis, SQLite, 보존 정책, 독립 보관 전송, 집계 metric 이다. 앞
+# 단계가 실패해도 뒤 단계를 계속 수행하되 실패 건수를 모아 마지막에 non-zero 로 끝낸다.
+# 보존 정책은 실패한 구성 요소를 스스로 건너뛰므로 여기에서 따로 막지 않는다.
+#
+# 전송을 마지막 단계에 둔 이유는 오프사이트 RPO 를 로컬 RPO 와 같은 6시간으로 맞추기
+# 위해서이다. 전송이 실패하면 그 사실이 이 실행의 전체 결과에 그대로 반영된다.
+# 별도의 bngdrasil-backup-ship.timer 는 이 자리에서 보내지 못한 백업을 다시 보내는
+# 재시도 경로이다.
+#
+# run.sh 는 공용 잠금(BK_LOCK_FILE)을 잡고 retention.sh 와 ship.sh 를 순차로 실행한다.
+# 두 스크립트는 BK_LOCK_HELD 를 물려받으므로 잠금을 다시 얻으려고 하지 않는다.
 
 set -uo pipefail
 umask 077
@@ -28,6 +36,18 @@ SQLITE_TARGETS="${SQLITE_TARGETS-}"
 RUN_POSTGRESQL="${RUN_POSTGRESQL:-true}"
 RUN_RETENTION="${RUN_RETENTION:-1}"
 RUN_NOTIFY="${RUN_NOTIFY:-1}"
+# 독립 보관 전송을 백업 직후에 수행할지 정한다. 전송 설정이 없는 호스트에서는 false 로
+# 두어야 하며, 그때에는 retention.sh 도 SHIPPED 표시를 요구하지 않는다.
+SHIP_ENABLED="${SHIP_ENABLED:-true}"
+export SHIP_ENABLED
+
+on_exit() {
+    local rc=$?
+    bk_release_lock
+    return "$rc"
+}
+trap on_exit EXIT
+bk_acquire_pipeline_lock || exit 1
 
 STARTED_AT="$(bk_now_iso)"
 FAILURES=0
@@ -81,6 +101,14 @@ done
 if [ "$RUN_RETENTION" = "1" ]; then
     step "retention" "$BK_SCRIPT_DIR/retention.sh" || true
 fi
+
+# 마지막 단계에서 아직 보내지 않은 성공본을 독립 보관 위치로 전송한다. 앞 단계가
+# 일부 실패했더라도 성공한 백업은 보내야 하므로 실패 여부와 상관없이 실행한다.
+case "$SHIP_ENABLED" in
+    true|1|yes) step "ship" "$BK_SCRIPT_DIR/ship.sh" || true ;;
+    false|0|no) bk_log "SHIP_ENABLED 가 $SHIP_ENABLED 이므로 전송 단계를 건너뜁니다." ;;
+    *) bk_warn "SHIP_ENABLED 값을 해석하지 못했습니다($SHIP_ENABLED). 전송 단계를 건너뜁니다." ;;
+esac
 
 # --- 집계 상태 ----------------------------------------------------------------
 FINISHED_AT="$(bk_now_iso)"

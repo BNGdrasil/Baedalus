@@ -136,7 +136,7 @@ exporter를 다시 띄우기 전까지 down으로 남습니다.
 
 ## 알림 규칙
 
-`prometheus/rules/basic.yml`에 일곱 개의 규칙을 두었고 `prometheus.yml`의 `rule_files`가 이
+`prometheus/rules/basic.yml`에 열 개의 규칙을 두었고 `prometheus.yml`의 `rule_files`가 이
 디렉터리를 읽습니다.
 
 | 규칙 | 조건 | 지표 출처 |
@@ -145,7 +145,10 @@ exporter를 다시 띄우기 전까지 down으로 남습니다.
 | `GatewayHighServerErrorRate` | Bifrost 전체의 5xx 비율이 10분 동안 5%를 넘습니다. | Bifrost의 직접 계측(`bifrost/src/core/metrics.py`)이 내보내는 `http_requests_total{status_class="5xx"}`입니다. |
 | `GatewayUpstreamHighServerErrorRate` | 특정 upstream의 5xx 비율이 10분 동안 10%를 넘습니다. | 같은 지표를 `service` label로 나눕니다. 등록된 서비스 수만큼만 늘어나므로 카디널리티가 제한됩니다. |
 | `AuthServerHighServerErrorRate` | Bidar의 5xx 비율이 10분 동안 5%를 넘습니다. | prometheus-fastapi-instrumentator가 내보내는 `http_requests_total{status=~"5.."}`입니다. |
-| `BackupStale` | 마지막 백업 성공이 8시간을 넘겼습니다. | 백업 job이 textfile collector로 내보내는 `bngdrasil_backup_last_success_timestamp_seconds`입니다. |
+| `BackupStale` | `component`가 `ship`이 아닌 백업의 마지막 성공이 8시간을 넘겼습니다. | 백업 job이 textfile collector로 내보내는 `bngdrasil_backup_last_success_timestamp_seconds`입니다. |
+| `BackupShipStale` | `component="ship"`의 마지막 전송 성공이 14시간을 넘겼습니다. | 같은 지표를 `ship` component로 나눕니다. |
+| `BackupUnshippedPileup` | 한 구성 요소에서 전송하지 못한 성공본이 4개를 넘습니다. | `retention.sh`와 `ship.sh`가 내보내는 `bngdrasil_backup_unshipped_total`입니다. |
+| `BackupDiskLow` | 백업이 쌓이는 파티션의 여유 공간이 10GiB 미만인 상태가 30분 이어집니다. | node-exporter의 `node_filesystem_avail_bytes`를 `/var/backups`와 `/var`와 `/`로 좁혀서 봅니다. |
 | `DiskSpaceLow` | 파일시스템 여유 공간이 15% 미만인 상태가 15분 이어집니다. | node-exporter의 `node_filesystem_avail_bytes`와 `node_filesystem_size_bytes`입니다. |
 | `DiskSpaceCritical` | 파일시스템 여유 공간이 5% 미만인 상태가 5분 이어집니다. | 위와 같습니다. |
 
@@ -163,7 +166,7 @@ Gateway와 Auth Server의 규칙을 나눈 이유는 두 앱이 같은 이름의
 
 ### 백업 지표와 textfile collector
 
-`BackupStale`이 사용하는 지표는 백업 job이 `.prom` 파일로 남기는 값입니다. VM2의 node-exporter에는
+백업 규칙이 사용하는 지표는 백업 job이 `.prom` 파일로 남기는 값입니다. VM2의 node-exporter에는
 `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector`를 지정하고 호스트의
 같은 경로를 읽기 전용으로 mount했습니다. **백업이 VM3에서 동작한다면 VM3의 node-exporter에도 같은
 설정이 필요합니다.**
@@ -171,6 +174,20 @@ Gateway와 Auth Server의 규칙을 나눈 이유는 두 앱이 같은 이름의
 시계열이 한 번도 보고된 적이 없으면 이 규칙은 아예 평가되지 않습니다. 따라서 백업이 도는지를 이
 규칙 하나로 판단하면 안 되며, 첫 보고가 실제로 들어왔는지는 배포 후에 직접 확인해야 합니다.
 백업 스크립트가 내보내는 지표의 전체 목록은 [backup/README.md](../backup/README.md)에 있습니다.
+
+기준 시간이 규칙마다 다른 이유는 로컬 백업과 오프사이트 전송의 주기가 다르기 때문입니다. 로컬
+백업은 6시간 주기이므로 한 번 걸러도 바로 울리지 않도록 8시간을 기준으로 삼았습니다. 전송은
+`run.sh`가 백업 직후에 수행하여 같은 6시간 주기이지만, 실패했을 때 2시간 주기의 재시도가 몇 번
+동작할 여유를 더해 14시간을 기준으로 삼았습니다. 하나의 기준으로 두 경로를 함께 평가하면 정상
+전송 주기에도 경보가 울립니다.
+
+`bngdrasil_backup_unshipped_total`은 전송하지 못한 성공본의 개수입니다. `retention.sh`는 이
+백업들을 삭제 대상에서 제외하므로, 전송이 막히면 백업 파티션이 계속 찹니다. 그래서 개수 자체를
+지표로 내보내고 `BackupDiskLow`와 함께 보게 했습니다. 네 규칙 모두 첫 대응 절차를 `action`
+annotation에 적어 두었으므로, 경보를 받은 사람은 Grafana에서 그 값을 그대로 읽으면 됩니다.
+
+**아직 검증하지 않은 부분이 있습니다.** 이 규칙들은 `promtool check rules`로 문법만 확인했고,
+실제 지표가 들어온 상태에서 경보가 발생하고 통지가 도착하는 것까지는 확인하지 않았습니다.
 
 ### readiness 알림은 아직 없습니다
 

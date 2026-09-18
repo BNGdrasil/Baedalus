@@ -8,6 +8,12 @@
 # 전송 실패는 non-zero 로 끝나지만 로컬의 성공 백업은 그대로 둔다. 로컬에 정상본이
 # 하나뿐인 상황에서 전송 실패로 그 본을 잃지 않도록 이 스크립트는 아무것도 지우지 않는다.
 #
+# 전송한 뒤에는 원격에서 sha256 값을 다시 확인하고, 그 확인을 통과한 경우에만 SHIPPED
+# 표시를 남긴다. retention.sh 는 이 표시가 있는 성공본만 세대 계산에 넣으므로, 검증을
+# 건너뛴 채 표시를 남기면 오프사이트 사본이 없는 백업이 삭제될 수 있다.
+# run.sh 와 retention.sh 와 같은 공용 잠금(BK_LOCK_FILE)을 사용한다. run.sh 안에서
+# 순차로 실행될 때에는 BK_LOCK_HELD 를 물려받아 잠금을 다시 얻지 않는다.
+#
 # 암호화 키는 /etc/bngdrasil-backup/ 아래 0600 파일에서만 읽으며 스크립트에 값을 두지 않는다.
 #   age  : $BK_SECRET_DIR/age-recipients.txt (공개 수신자 목록. 복호화 키는 보관 측에 둔다)
 #   gpg  : $BK_SECRET_DIR/gpg-passphrase     (대칭 암호 passphrase)
@@ -44,6 +50,10 @@ SHIP_ENCRYPTION="${SHIP_ENCRYPTION:-age}"
 SHIP_OUTBOUND_DIR="${SHIP_OUTBOUND_DIR:-$BACKUP_ROOT/outbound}"
 AGE_RECIPIENTS_FILE="${AGE_RECIPIENTS_FILE:-$BK_SECRET_DIR/age-recipients.txt}"
 GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:-$BK_SECRET_DIR/gpg-passphrase}"
+# 원격 검증 설정. 0 으로 두면 검증을 건너뛰지만 그 경우에도 경고를 남긴다.
+SHIP_VERIFY="${SHIP_VERIFY:-1}"
+SHIP_VERIFY_SSH_HOST="${SHIP_VERIFY_SSH_HOST:-$SHIP_SSH_HOST}"
+SHIP_VERIFY_REMOTE_DIR="${SHIP_VERIFY_REMOTE_DIR:-$SHIP_REMOTE_DIR}"
 
 STATE_LAST_RUN="$STATE_DIR/ship-last-run.json"
 STATE_LAST_SUCCESS="$STATE_DIR/ship-last-success.json"
@@ -63,6 +73,8 @@ BK_ERROR=""
 STARTED_AT="$(bk_now_iso)"
 SENT=0
 FAILED=0
+# 전송 도중에 중단되더라도 SHIPPING 표시가 남지 않도록 현재 대상 디렉터리를 기억한다.
+CURRENT_SHIPPING=""
 
 write_state() {
     local status="$1"
@@ -86,6 +98,7 @@ write_state() {
 
 on_exit() {
     local rc=$?
+    [ -z "$CURRENT_SHIPPING" ] || rm -f "$CURRENT_SHIPPING/SHIPPING"
     if [ "$DRY_RUN" -eq 1 ]; then
         bk_release_lock
         return "$rc"
@@ -98,11 +111,12 @@ on_exit() {
         write_state "failed"
         bk_write_metrics "ship" 1 "$(bk_last_success_field "$STATE_LAST_SUCCESS" finished_epoch || true)"
     fi
+    bk_write_unshipped_metrics
     bk_release_lock
     return "$rc"
 }
 trap on_exit EXIT
-bk_acquire_lock "ship" || exit 1
+bk_acquire_pipeline_lock || exit 1
 
 require_secret_file() {
     local file="$1"
@@ -168,47 +182,94 @@ encrypt_stream() {
     esac
 }
 
+# 원격에 도착한 아카이브의 sha256 값을 원격에서 다시 계산하여 대조한다. 이 검사를
+# 통과하지 못하면 SHIPPED 표시를 남기지 않으므로 보존 정책이 원본을 지우지 않는다.
+verify_remote() {
+    # verify_remote <아카이브 파일 이름>
+    local name="$1"
+    if [ "$SHIP_VERIFY" = "0" ]; then
+        bk_warn "SHIP_VERIFY 가 0 이므로 원격 검증을 건너뛰고 전송 완료로 기록합니다: $name"
+        return 0
+    fi
+    local remote_cmd
+    remote_cmd="cd '$SHIP_VERIFY_REMOTE_DIR' && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c '$name.sha256'; else shasum -a 256 -c '$name.sha256'; fi"
+    # shellcheck disable=SC2086,SC2029
+    if ssh $SSH_ARGS "$SHIP_VERIFY_SSH_HOST" "$remote_cmd" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 ship_one() {
     # ship_one <백업 run 디렉터리> <아카이브 이름 접두사>
     local run_dir="$1" label="$2"
-    local run_id parent ext archive
+    local run_id parent ext archive name
     run_id="$(basename "$run_dir")"
     parent="$(dirname "$run_dir")"
     case "$SHIP_ENCRYPTION" in
         age) ext="tar.gz.age" ;;
         gpg) ext="tar.gz.gpg" ;;
     esac
-    archive="$SHIP_OUTBOUND_DIR/${label}-${run_id}.${ext}"
+    name="${label}-${run_id}.${ext}"
+    archive="$SHIP_OUTBOUND_DIR/$name"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        bk_log "전송 예정: $run_dir -> $destination/$(basename "$archive")"
+        bk_log "전송 예정: $run_dir -> $destination/$name"
         return 0
     fi
 
+    # 전송이 진행 중임을 표시한다. retention.sh 가 이 표시를 보고 정리에서 제외한다.
+    : > "$run_dir/SHIPPING"
+    CURRENT_SHIPPING="$run_dir"
+
     rm -f "$archive.partial"
     if ! tar -C "$parent" -czf - "$run_id" | encrypt_stream > "$archive.partial"; then
-        rm -f "$archive.partial"
+        rm -f "$archive.partial" "$run_dir/SHIPPING"
+        CURRENT_SHIPPING=""
         bk_err "암호화 아카이브 생성 실패: $run_dir"
         FAILED=$((FAILED + 1))
         return 1
     fi
-    [ -s "$archive.partial" ] || { rm -f "$archive.partial"; bk_err "암호화 결과가 비어 있습니다: $run_dir"; FAILED=$((FAILED + 1)); return 1; }
+    if [ ! -s "$archive.partial" ]; then
+        rm -f "$archive.partial" "$run_dir/SHIPPING"
+        CURRENT_SHIPPING=""
+        bk_err "암호화 결과가 비어 있습니다: $run_dir"
+        FAILED=$((FAILED + 1))
+        return 1
+    fi
     mv "$archive.partial" "$archive"
-    bk_sha256_file "$archive" > "$archive.sha256"
+    # 체크섬 파일에는 상대 이름만 적는다. 원격에서 sha256sum -c 로 그대로 대조하기 위해서이다.
+    ( cd "$SHIP_OUTBOUND_DIR" && bk_sha256_file "$name" ) > "$archive.sha256"
 
     # 파일 권한은 umask 077 로 이미 600 이고 rsync -a 가 그대로 보존한다.
     if ! rsync -a --partial -e "ssh $SSH_ARGS" \
             "$archive" "$archive.sha256" "$destination/"; then
         bk_err "rsync 전송 실패: $archive"
         # 전송하지 못한 암호화 사본은 디스크에 남기지 않는다. 원본 백업은 그대로 둔다.
-        rm -f "$archive" "$archive.sha256"
+        rm -f "$archive" "$archive.sha256" "$run_dir/SHIPPING"
+        CURRENT_SHIPPING=""
+        FAILED=$((FAILED + 1))
+        return 1
+    fi
+
+    if ! verify_remote "$name"; then
+        bk_err "원격 체크섬 검증에 실패했습니다. SHIPPED 표시를 남기지 않습니다: $name"
+        # 깨진 원격 사본이 정상본처럼 남지 않도록 지운다. 실패해도 진행에는 영향이 없다.
+        # shellcheck disable=SC2086,SC2029
+        ssh $SSH_ARGS "$SHIP_VERIFY_SSH_HOST" \
+            "rm -f '$SHIP_VERIFY_REMOTE_DIR/$name' '$SHIP_VERIFY_REMOTE_DIR/$name.sha256'" \
+            >/dev/null 2>&1 || bk_warn "원격의 불완전한 사본을 지우지 못했습니다: $name"
+        rm -f "$archive" "$archive.sha256" "$run_dir/SHIPPING"
+        CURRENT_SHIPPING=""
         FAILED=$((FAILED + 1))
         return 1
     fi
 
     : > "$run_dir/SHIPPED"
+    rm -f "$run_dir/SHIPPING"
+    CURRENT_SHIPPING=""
     SENT=$((SENT + 1))
-    bk_log "전송 완료: $(basename "$archive")"
+    bk_log "전송 완료: $name"
     # 전송한 암호화 사본은 로컬에서 지운다. 원본 백업 디렉터리는 그대로 둔다.
     rm -f "$archive" "$archive.sha256"
     return 0

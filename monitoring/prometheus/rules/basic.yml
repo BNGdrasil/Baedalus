@@ -86,20 +86,62 @@ groups:
     interval: 30s
     rules:
       # 백업 job이 node_exporter의 textfile collector로 내보내는 지표다.
-      # 마지막 성공 시각이 8시간을 넘기면 경보한다. 제안한 RPO가 6시간이므로
-      # 한 번 걸러도 바로 울리지 않을 만큼의 여유를 둔 값이다.
+      # component label로 로컬 백업과 오프사이트 전송을 구분해서 평가한다. 두 경로는
+      # 주기가 다르기 때문에, 하나의 기준으로 묶으면 정상 전송 주기에도 경보가 울린다.
       #
       # 이 시계열이 한 번도 보고된 적이 없으면 규칙 자체가 평가되지 않는다.
       # 따라서 "백업이 도는지"를 이 규칙만으로 판단하지 않는다. textfile collector
       # 경로 설정과 첫 보고 여부는 배포 후에 직접 확인한다.
+      #
+      # 로컬 백업 주기는 6시간이므로 한 번 걸러도 바로 울리지 않을 만큼의 여유를 두었다.
       - alert: BackupStale
-        expr: time() - bngdrasil_backup_last_success_timestamp_seconds > 8 * 3600
+        expr: time() - bngdrasil_backup_last_success_timestamp_seconds{component!="ship"} > 8 * 3600
         for: 15m
         labels:
           severity: critical
         annotations:
-          summary: '{{ $labels.instance }}의 백업이 8시간 넘게 성공하지 않았다'
-          description: '마지막 성공 이후 {{ $value | humanizeDuration }}이 지났다. 백업 job의 로그와 전송 대상 저장소를 확인한다.'
+          summary: '{{ $labels.instance }}의 {{ $labels.component }} 백업이 8시간 넘게 성공하지 않았다'
+          description: '마지막 성공 이후 {{ $value | humanizeDuration }}이 지났다. 로컬 백업 주기는 6시간이다.'
+          action: 'journalctl -u bngdrasil-backup.service -n 200 으로 실패 단계를 확인하고, /var/backups/bngdrasil/state/last-run.json의 failed_steps를 읽는다. 디스크 여유와 PostgreSQL 접속을 확인한 뒤 sudo /opt/bngdrasil-backup/run.sh 를 수동으로 실행한다.'
+
+      # 전송은 백업 직후에 run.sh가 수행하므로 정상 주기는 6시간이다. 여기에 2시간 주기
+      # 재시도가 몇 번 실패할 여유를 더해 14시간을 기준으로 삼는다.
+      - alert: BackupShipStale
+        expr: time() - bngdrasil_backup_last_success_timestamp_seconds{component="ship"} > 14 * 3600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.instance }}의 백업 오프사이트 전송이 14시간 넘게 성공하지 않았다'
+          description: '마지막 전송 성공 이후 {{ $value | humanizeDuration }}이 지났다. 로컬 백업이 정상이어도 호스트를 잃으면 복구할 사본이 없다.'
+          action: 'journalctl -u bngdrasil-backup-ship.service -n 200 으로 원인을 확인한다. VM2를 경유하는 SSH 연결, /etc/bngdrasil-backup/ssh/ 아래 키 권한, VM4의 보관 디렉터리 여유 공간을 차례로 점검한 뒤 sudo /opt/bngdrasil-backup/ship.sh 를 수동으로 실행한다.'
+
+      # 전송하지 못한 성공본이 쌓이면 보존 정책이 그 성공본을 지우지 않으므로 디스크가
+      # 계속 찬다. 6시간 주기에서 4개는 24시간분에 해당한다.
+      - alert: BackupUnshippedPileup
+        expr: bngdrasil_backup_unshipped_total > 4
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.instance }}의 {{ $labels.component }} 미전송 백업이 {{ $value }}개 쌓였다'
+          description: '전송에 성공하지 못한 백업은 보존 정책이 삭제하지 않는다. 그대로 두면 백업 파티션이 찬다.'
+          action: 'BackupShipStale과 같은 절차로 전송 경로를 복구한다. 전송이 다시 성공하면 다음 retention 실행에서 세대 정책대로 정리된다. RETENTION_MAX_UNSHIPPED(기본 8)를 넘으면 retention.sh가 exit 1로 끝나고 알림을 보낸다.'
+
+      # 백업이 쌓이는 파티션의 여유 공간을 절대 크기로 본다. /var/backups를 별도
+      # 파티션으로 분리하면 그 mountpoint가 자동으로 선택된다.
+      - alert: BackupDiskLow
+        expr: |
+          min by (instance) (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay",mountpoint=~"/|/var|/var/backups"}
+          ) < 10 * 1024 * 1024 * 1024
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.instance }}의 백업 파티션 여유 공간이 10GiB 미만이다'
+          description: '여유 공간이 {{ $value | humanize1024 }}B까지 줄었다. 백업 스크립트는 여유가 부족하면 덤프를 시작하지 않고 실패한다.'
+          action: 'du -sh /var/backups/bngdrasil/* 로 어느 구성 요소가 공간을 차지하는지 확인한다. 미전송 백업이 원인이면 전송 경로를 먼저 복구하고, 그렇지 않으면 RETENTION_DAILY 값을 조정한 뒤 sudo /opt/bngdrasil-backup/retention.sh --dry-run 으로 삭제 대상을 확인한다.'
 
   - name: basic-capacity
     interval: 30s

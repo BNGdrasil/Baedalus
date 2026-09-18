@@ -1,11 +1,11 @@
 [Unit]
-Description=BNGdrasil 백업 전송 주기 실행
+Description=BNGdrasil 백업 전송 재시도 (2시간 주기)
 Documentation=file:///opt/bngdrasil-backup/README.md
 
 [Timer]
-OnCalendar=*-*-* 01,13:30:00
+OnCalendar=*-*-* 01/2:40:00
 Persistent=true
-RandomizedDelaySec=900
+RandomizedDelaySec=600
 AccuracySec=1min
 Unit=bngdrasil-backup-ship.service
 

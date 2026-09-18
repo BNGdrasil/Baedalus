@@ -1,5 +1,5 @@
 [Unit]
-Description=BNGdrasil 백업 실행 (PostgreSQL, Redis, SQLite, 보존 정책)
+Description=BNGdrasil 백업 실행 (PostgreSQL, Redis, SQLite, 보존 정책, 독립 보관 전송)
 Documentation=file:///opt/bngdrasil-backup/README.md
 After=network-online.target postgresql.service docker.service
 Wants=network-online.target
@@ -11,7 +11,7 @@ User=root
 UMask=0077
 ExecStart=/opt/bngdrasil-backup/run.sh
 EnvironmentFile=-/etc/bngdrasil-backup/env
-TimeoutStartSec=3600
+TimeoutStartSec=10800
 Nice=10
 IOSchedulingClass=idle
 ProtectHome=yes
