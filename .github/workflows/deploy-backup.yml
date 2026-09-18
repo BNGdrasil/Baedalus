@@ -52,6 +52,16 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
           printf '%s\n' "$VM2_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+          # ProxyJump starts a separate ssh process; the destination's -i
+          # option does not select the jump host's key. Configure both hops.
+          cat > ~/.ssh/config <<'SSHCONFIG'
+          Host *
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+          SSHCONFIG
+          chmod 600 ~/.ssh/config
 
       - name: Resolve SSH target
         id: target
@@ -120,4 +130,4 @@ jobs:
 
       - name: Clean up SSH key
         if: always()
-        run: rm -f ~/.ssh/id_deploy
+        run: rm -f ~/.ssh/id_deploy ~/.ssh/config

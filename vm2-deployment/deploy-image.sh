@@ -325,6 +325,9 @@ if [ "$HEALTH_FAILED" -ne 0 ]; then
     log ".env를 이전 내용으로 되돌렸다."
 
     if [ -n "$ROLLBACK_TAG" ]; then
+        # A mutable tag may now point at the failed image after docker pull.
+        # Persist the tag made from the previous container's image ID.
+        update_env_var "$IMAGE_VAR" "$ROLLBACK_TAG"
         if compose up -d --no-deps --no-build "$SERVICE"; then
             log "이전 image로 다시 기동했다."
         else

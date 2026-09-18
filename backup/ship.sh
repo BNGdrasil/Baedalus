@@ -86,6 +86,10 @@ write_state() {
 
 on_exit() {
     local rc=$?
+    if [ "$DRY_RUN" -eq 1 ]; then
+        bk_release_lock
+        return "$rc"
+    fi
     if [ "$rc" -eq 0 ] && [ "$FAILED" -eq 0 ]; then
         write_state "success"
         bk_write_metrics "ship" 0 "$(bk_now_epoch)"
