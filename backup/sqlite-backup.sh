@@ -35,6 +35,10 @@ done
 [ -n "$NAME" ]   || { usage; exit 2; }
 [ -n "$SOURCE" ] || { usage; exit 2; }
 
+# bk_load_env 가 뒤에서 cd 를 하므로, 상대 경로로 받은 --source 는 그 전에 절대
+# 경로로 바꿔 둔다.
+SOURCE="$(bk_abspath "$SOURCE")"
+
 BK_COMPONENT="sqlite-$NAME"
 bk_load_env
 

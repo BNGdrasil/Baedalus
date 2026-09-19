@@ -42,6 +42,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# bk_load_env 가 이미 cd 를 한 뒤이므로, 상대 경로로 받은 --dump-dir/--output 은
+# 스크립트가 처음 실행된 디렉터리(BK_INVOKED_PWD) 기준 절대 경로로 바꿔 둔다.
+[ -z "$DUMP_DIR" ] || DUMP_DIR="$(bk_abspath "$DUMP_DIR")"
+[ -z "$OUTPUT" ]   || OUTPUT="$(bk_abspath "$OUTPUT")"
+
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 PG_BIN_DIR="${PG_BIN_DIR:-}"
 RUN_ID="$(bk_run_id)"

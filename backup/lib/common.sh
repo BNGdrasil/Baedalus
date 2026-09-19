@@ -8,6 +8,21 @@
 BK_ENV_FILE="${BK_ENV_FILE:-/etc/bngdrasil-backup/env}"
 BK_SECRET_DIR="${BK_SECRET_DIR:-/etc/bngdrasil-backup}"
 
+# 스크립트가 처음 실행된 디렉터리를 common.sh 를 불러오는 시점(=아직 아무 데도 cd
+# 하기 전)에 기억해 둔다. bk_load_env 가 나중에 cd 를 하더라도, 사용자가 상대 경로로
+# 준 인자(예: sqlite-backup.sh --source, verify-restore.sh --dump-dir/--output)를
+# 이 값 기준으로 절대 경로로 바꾸면 그 뜻이 그대로 유지된다.
+BK_INVOKED_PWD="${BK_INVOKED_PWD:-$PWD}"
+
+# bk_abspath <경로> : 이미 절대 경로이면 그대로, 아니면 BK_INVOKED_PWD 기준의 절대
+# 경로로 바꿔 돌려준다. 대상이 실제로 존재할 필요는 없다(출력 파일 경로에도 쓴다).
+bk_abspath() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *)  printf '%s/%s\n' "$BK_INVOKED_PWD" "$1" ;;
+    esac
+}
+
 bk_load_env() {
     if [ -r "$BK_ENV_FILE" ]; then
         # shellcheck disable=SC1090
@@ -25,6 +40,14 @@ bk_load_env() {
     # 공용 잠금을 기다릴 최대 시간(초). 0 이면 기다리지 않고 바로 실패한다.
     BK_LOCK_WAIT_SEC="${BK_LOCK_WAIT_SEC:-300}"
     mkdir -p "$BACKUP_ROOT" "$STATE_DIR" "$LOCK_DIR"
+    # sudo 로 홈 디렉터리(예: 소유자만 들어갈 수 있는 /home/ubuntu, 700)에서 이
+    # 스크립트를 실행하면, 이후 "sudo -u postgres ..." 로 다른 사용자로 전환하는
+    # 하위 프로세스(pg_dump/pg_dumpall/pg_restore 등)가 그 디렉터리에 들어가지
+    # 못해 "could not change directory to ..." 경고를 stderr 에 남긴다. 결과에는
+    # 영향이 없지만 실행할 때마다 잡음이 남으므로, 모든 사용자가 들어갈 수 있는
+    # 디렉터리로 미리 옮겨 둔다. BK_SCRIPT_DIR 등은 이미 이 함수를 부르기 전에
+    # BASH_SOURCE 기준 절대 경로로 계산해 두었으므로 cd 뒤에도 그대로 유효하다.
+    cd / 2>/dev/null || true
 }
 
 # --- logging -----------------------------------------------------------------
