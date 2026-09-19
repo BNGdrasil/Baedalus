@@ -85,22 +85,31 @@ Bidar는 `JWT_SECRET_KEY`와 `DATABASE_URL`과 `ALLOWED_HOSTS`와 `ALLOWED_ORIGI
 
 **앱을 배포하기 전에 먼저 수행합니다.** Bidar는 `role`을 단일 기준으로 삼고 `is_superuser`를
 파생값으로 다루므로, 스키마를 맞추지 않은 데이터베이스에 새 버전을 올리면 권한 판정이 어긋납니다.
-절차의 원문은 `bidar/migrations/README.md`에 있으며, 아래는 순서만 옮긴 것입니다. 모든 명령은
-VM3에서 실행합니다.
+절차의 원문은 `bidar/migrations/README.md`에 있으며, 아래는 순서만 옮긴 것입니다. 마이그레이션
+SQL 파일은 미리 워크스테이션에서 VM3의 `/tmp`로 `scp`해 둡니다. `postgres` 사용자는 저장소
+체크아웃 경로나 `ubuntu` 홈 디렉터리를 읽을 권한이 없는 경우가 많으므로 `/tmp`에 복사한
+파일을 대상으로 실행하며, 이후 명령은 모두 VM3에서 실행합니다.
 
 ```bash
-# 0) 적용 직전 논리 백업
-sudo -u postgres pg_dump -Fc -d bngdrasil -f /var/backups/bngdrasil-$(date +%F).dump
+cd /tmp
+
+# 0) 적용 직전 논리 백업. postgres 사용자는 root 소유인 /var/backups에 직접 쓸 권한이
+#    없으므로 덤프는 postgres 권한으로 생성하고 파일 쓰기만 sudo tee로 분리합니다
+sudo -u postgres pg_dump -Fc -d bngdrasil | sudo tee /var/backups/bngdrasil-pre-002-$(date +%F).dump > /dev/null
+sudo chmod 600 /var/backups/bngdrasil-pre-002-*.dump
 
 # 1) 001 적용. role 컬럼과 check 제약과 인덱스를 추가합니다
-sudo -u postgres psql -d bngdrasil -v ON_ERROR_STOP=1 -f migrations/001_add_role_to_users.sql
+sudo -u postgres psql -d bngdrasil -v ON_ERROR_STOP=1 -f /tmp/001_add_role_to_users.sql
 
 # 2) preflight 실행. 읽기 전용 감사이며 출력을 반드시 읽습니다
-sudo -u postgres psql -d bngdrasil -v ON_ERROR_STOP=1 -f migrations/002_preflight.sql
+sudo -u postgres psql -d bngdrasil -v ON_ERROR_STOP=1 -f /tmp/002_preflight.sql
 
 # 3) preflight 결과가 의도와 맞으면 002를 적용합니다
-sudo -u postgres psql -d bngdrasil -v ON_ERROR_STOP=1 -f migrations/002_align_role_and_superuser.sql
+sudo -u postgres psql -d bngdrasil -v ON_ERROR_STOP=1 -f /tmp/002_align_role_and_superuser.sql
 ```
+
+`pg_dump`와 `psql -f`는 모두 셸에서 직접 실행하는 명령이며, `psql` 프롬프트 안에서
+입력하는 것이 아닙니다.
 
 002에는 값을 되돌리는 자동 롤백이 없습니다. preflight 출력의 5번 항목에서 **적용 후 남을 활성
 `super_admin` 계정 수가 0이면, 002를 적용하기 전에** Bidar CLI로 관리자 계정을 먼저 만들어야
