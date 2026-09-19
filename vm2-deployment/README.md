@@ -56,6 +56,51 @@ cp env.template .env   # 기존 .env가 있으면 덮어쓰지 않도록 주의�
 아니라 `main` 태그가 올라갑니다. 두 앱 모두 읽지 않는 변수를 무시하므로, 설정했다고
 착각하기 쉬운 변수는 템플릿에서 아예 제외했습니다.
 
+### 필수 값과 선택 값
+
+`docker-compose.yml`이 참조하는 변수는 두 가지로 나뉩니다. 필수 값은 `${VAR:?...}` 형태로
+참조하므로 값이 없으면 컨테이너를 만들기 전에 compose가 중단되고, 선택 값은 `${VAR:-기본값}`
+형태로 참조하므로 `.env`에 줄이 없어도 기본값이 들어갑니다. 아래 표는 `docker-compose.yml`의
+모든 `${...}`를 대조하여 정리한 것이며, `env.template`의 목록과 같습니다.
+
+| 필수 변수 | 쓰는 곳 | 설명 |
+|---|---|---|
+| `SECRET_KEY` | Bifrost | 32자 이상이어야 하고 예시 값이면 거부됩니다. |
+| `JWT_SECRET_KEY` | Bidar | 32자 이상이어야 하고 예시 문구가 들어가면 거부됩니다. |
+| `DATABASE_URL` | Bifrost, Bidar | VM3 호스트 PostgreSQL 접속 문자열입니다. |
+| `GATEWAY_ALLOWED_HOSTS` | Bifrost | Host 헤더 허용 목록입니다. |
+| `AUTH_ALLOWED_HOSTS` | Bidar | Host 헤더 허용 목록입니다. |
+| `AUTH_ALLOWED_ORIGINS` | Bidar | CORS 허용 origin 목록입니다. |
+| `VM2_PRIVATE_IP` | compose | 8000번과 8001번 포트의 바인딩 주소입니다. |
+
+| 선택 변수 | 기본값 |
+|---|---|
+| `ENVIRONMENT` | `production` |
+| `DEBUG` | `false` |
+| `LOG_LEVEL` | `INFO` |
+| `JWT_ALGORITHM` | `HS256` |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` |
+| `REFRESH_TOKEN_EXPIRE_DAYS` | `7` |
+| `LOGIN_RATE_LIMIT_PER_MINUTE` | `10` |
+| `RATE_LIMIT_PER_MINUTE` | `60` |
+| `ENABLE_METRICS` | `true` |
+| `MAX_REQUEST_BODY_BYTES` | `10485760` |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` |
+| `CLIENT_ORIGIN` | `https://bnbong.com` |
+| `BACKEND_CORS_ORIGINS` | `https://bnbong.com,https://admin.bnbong.com` |
+| `AUTH_SERVER_IMAGE` | `ghcr.io/bngdrasil/bidar:main` |
+| `GATEWAY_IMAGE` | `ghcr.io/bngdrasil/bifrost:main` |
+
+선택 변수에 기본값을 둔 이유는 2026-09-19 장애에 있습니다. 그때 compose가 `${ENABLE_METRICS}`와
+`${MAX_REQUEST_BODY_BYTES}`를 기본값 없이 참조하고 있었고 운영 `.env`에는 두 줄이 없었으므로,
+compose가 빈 문자열을 컨테이너에 넘겼습니다. Bifrost는 빈 문자열을 bool이나 int로 해석하지 못해
+기동에 실패했습니다. 선택 변수라도 운영 `.env`에는 값을 적어 두는 편이 좋습니다. 기본값에 기대면
+지금 어떤 값으로 동작하고 있는지 파일만 보고 알 수 없기 때문입니다.
+
+`DOMAIN_NAME`과 `VM3_PRIVATE_IP`와 `POSTGRES_USER`와 `POSTGRES_PASSWORD`는 compose가 직접 읽지
+않으며, 사람이 참고하거나 `DATABASE_URL`을 만들 때 사용합니다. `GRAFANA_ADMIN_PASSWORD`는
+모니터링 compose가 읽습니다.
+
 ### 기동을 막는 값
 
 `ENVIRONMENT=production` 기준으로 Bifrost는 `SECRET_KEY`와 `DATABASE_URL`과 `ALLOWED_HOSTS`가,
@@ -144,11 +189,46 @@ sudo /opt/bnbong/deploy-image.sh gateway     ghcr.io/bngdrasil/bifrost:sha-1a2b3
 합니다. 형식이 맞지 않으면 스크립트가 종료 코드 2로 끝납니다.
 
 `/opt/bnbong/deploy-image.sh`는 이 디렉터리의 `deploy-image.sh`와 같은 파일입니다. 이 스크립트는
-인자와 이미지 참조 형식을 검증하고, `flock`으로 동시 실행을 막고, 이미지를 내려받고, 교체 직전 컨테이너의 이미지
-ID를 `rollback/<컨테이너>:<UTC 시각>` 태그로 남기고, `.env`의 해당 이미지 변수 줄만 갱신한 다음,
-`docker compose up -d --no-deps --no-build <서비스>`로 그 서비스만 교체합니다. health 확인에
-실패하면 `.env`를 이전 내용으로 되돌리고 이전 이미지로 다시 기동한 뒤에 0이 아닌 코드로
-종료합니다. 성공하면 `/opt/bnbong/releases.log`에 시각과 서비스와 이미지와 digest를 남깁니다.
+인자와 이미지 참조 형식을 검증하고, `flock`으로 동시 실행을 막고, 이미지를 내려받고, 아래에 적은
+사전 점검을 수행하고, 교체 직전 컨테이너의 이미지 ID를 `rollback/<컨테이너>:<UTC 시각>` 태그로
+남기고, `.env`의 해당 이미지 변수 줄만 갱신한 다음,
+`docker compose up -d --no-deps --no-build <서비스>`로 그 서비스만 교체합니다. 성공하면
+`/opt/bnbong/releases.log`에 시각과 서비스와 이미지와 digest를 남깁니다.
+
+#### 교체 전 사전 점검
+
+컨테이너를 교체하기 전에 `docker compose config <서비스>`로 해석한 environment를 읽고, 값이 빈
+문자열인 키가 하나라도 있으면 그 목록을 출력한 뒤에 종료 코드 1로 중단합니다. 이 경로에서는
+이미지를 내려받기만 했을 뿐 컨테이너와 `.env`를 건드리지 않았으므로 운영 상태가 그대로 남습니다.
+필수 변수가 비어 있어서 `docker compose config` 자체가 실패하는 경우도 같은 자리에서 잡습니다.
+점검을 통과하지 못하면 `/opt/bnbong/.env`에 값을 채우거나 `docker-compose.yml`에 기본값을 둔 다음
+다시 실행합니다.
+
+#### health 실패와 실패 기록
+
+health 확인에 실패하면 되돌리기 전에 실패한 컨테이너의 `docker logs --tail 80`과 `docker inspect`의
+`State`를 먼저 출력하고, 같은 내용을 `/opt/bnbong/deploy-failures/<UTC 시각>-<서비스>.log`에도
+남깁니다. 되돌리면 실패한 컨테이너가 사라져서 원인을 확인할 수 없으므로, 갈무리를 먼저 수행합니다.
+그다음 `.env`를 이전 내용으로 되돌리고 이전 이미지로 다시 기동한 뒤에, 같은 기준으로 health를 다시
+확인합니다. 롤백본이 확인을 통과하면 종료 코드 1로 끝나고, 롤백본까지 실패하면 서비스가 중단된
+상태이므로 큰 오류 문구와 함께 종료 코드 3으로 끝납니다. 종료 코드 3은 사람이 즉시 조치해야 하는
+상황을 뜻하며, 그때의 실패 기록도 같은 디렉터리에 남습니다.
+
+| 종료 코드 | 뜻 |
+|---|---|
+| 0 | 배포에 성공했습니다. |
+| 1 | 배포에 실패했으나 서비스는 이전 상태로 돌아갔거나 운영을 건드리지 않았습니다. |
+| 2 | 인자나 이미지 참조 형식이 올바르지 않습니다. |
+| 3 | 되돌린 뒤에도 health 확인을 통과하지 못했습니다. 서비스가 중단된 상태입니다. |
+
+#### 형식이 바뀐 직후의 첫 배포
+
+`docker-compose.yml`이나 `.env`의 형식이 바뀐 직후의 첫 배포는 이전 이미지로의 롤백이 성립하지
+않을 수 있습니다. 구 이미지가 새 `.env` 형식을 읽지 못해 롤백본까지 기동에 실패하기 때문입니다.
+2026-09-19 장애에서 실제로 이 경우가 발생했고, 구 이미지가 쉼표로 구분한 `ALLOWED_HOSTS`를
+해석하지 못해 재시작을 반복했습니다. 이런 전환 배포는 유지보수 창에서 수행하고, 위의 사전 점검을
+먼저 통과시킨 다음에 진행합니다. 되돌릴 자리가 없다는 점을 미리 알고 있어야, 실패했을 때 롤백을
+기다리지 않고 곧바로 새 형식에 맞춘 복구로 넘어갈 수 있습니다.
 
 운영자가 같은 명령을 손으로 실행해도 됩니다. GitHub Actions를 거치지 않고 특정 release로 되돌릴
 때 이 방법을 사용합니다.
@@ -255,9 +335,12 @@ layer를 되찾을 수 있습니다. 이 태그는 컨테이너마다 다섯 개
 
 ### 자동 롤백
 
-`deploy-image.sh`의 health 확인이 실패하면 스크립트가 스스로 `.env`를 이전 내용으로 되돌리고 이전
-이미지로 컨테이너를 다시 기동한 다음, 0이 아닌 코드로 종료합니다. 호출한 워크플로도 실패로
-기록됩니다. 운영자는 서비스가 이전 상태로 돌아왔는지만 확인하면 됩니다.
+`deploy-image.sh`의 health 확인이 실패하면 스크립트가 실패한 컨테이너의 로그와 `State`를 먼저
+갈무리하고, `.env`를 이전 내용으로 되돌리고 이전 이미지로 컨테이너를 다시 기동한 다음, 같은
+기준으로 health를 한 번 더 확인합니다. 롤백본이 확인을 통과하면 종료 코드 1로 끝나므로 호출한
+워크플로도 실패로 기록되고, 운영자는 서비스가 이전 상태로 돌아왔는지만 확인하면 됩니다. 롤백본까지
+실패하면 종료 코드 3으로 끝나며, 이때는 서비스가 중단된 상태이므로 즉시 조치해야 합니다. 갈무리한
+내용은 `/opt/bnbong/deploy-failures/`에 남으므로 원인을 나중에도 확인할 수 있습니다.
 
 ### 손으로 되돌리는 절차
 
@@ -340,3 +423,20 @@ GitHub Actions가 수행하는 배포의 전체 구조와 저장소별 secret �
 실제 배포 상태는 [../docs/deployment-inventory.md](../docs/deployment-inventory.md)에,
 관측 스택의 구성과 알림 규칙은 [../monitoring/README.md](../monitoring/README.md)에,
 반복 백업 체계는 [../backup/README.md](../backup/README.md)에 있습니다.
+
+---
+
+## 10. 운영 기록
+
+### 2026-09-19 게이트웨이 중단 (약 3분 30초)
+
+운영 `/opt/bnbong/.env`에 `ENABLE_METRICS`와 `MAX_REQUEST_BODY_BYTES` 두 줄이 없었고, 당시
+`docker-compose.yml`이 두 값을 기본값 없이 `${ENABLE_METRICS}` 형태로 참조하고 있었기 때문에
+compose가 빈 문자열을 컨테이너에 넘겼고, 새 Bifrost는 빈 문자열을 bool과 int로 해석하지 못해
+기동에 실패했습니다. `deploy-image.sh`가 이전 이미지로 되돌렸지만 compose 파일은 이미 새 판본이어서
+구 이미지가 쉼표로 구분한 `ALLOWED_HOSTS`를 해석하지 못했고, 스크립트가 롤백 후 health를 확인하지
+않은 탓에 재시작을 반복하는 상태를 정상으로 보고했습니다. 실패한 새 컨테이너의 로그도 롤백과 함께
+사라져서 원인을 찾는 데 시간이 더 걸렸으며, 게이트웨이는 약 3분 30초 동안 응답하지 못했습니다.
+조치로 compose의 모든 선택 변수에 기본값을 두고 필수 값은 `${VAR:?...}`로 바꾸었으며,
+`deploy-image.sh`에 교체 전 사전 점검과 실패 컨테이너 갈무리와 롤백 후 health 재확인을 추가하고,
+같은 상황을 `tests/test_review_regressions.py`의 회귀 검사로 고정했습니다.

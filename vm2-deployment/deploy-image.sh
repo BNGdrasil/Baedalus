@@ -15,8 +15,14 @@
 #     이전 layer를 되찾을 수 있다.
 #   - .env는 통째로 다시 쓰지 않는다. 해당 변수 줄만 바꾸고 나머지는 보존하며,
 #     임시 파일에 쓴 뒤 mv로 교체하여 중간 상태가 남지 않게 한다.
-#   - health check가 실패하면 .env를 이전 내용으로 되돌리고 이전 image로 다시
-#     기동한 뒤 0이 아닌 코드로 종료한다.
+#   - 컨테이너를 교체하기 전에 사전 점검을 수행한다. `docker compose config`가
+#     해석한 대상 서비스의 environment에 값이 빈 문자열인 키가 하나라도 있으면
+#     운영을 건드리지 않고 중단한다. 2026-09-19 장애의 직접 원인이 이 경우였다.
+#   - health check가 실패하면 실패한 컨테이너의 로그와 State를 먼저 갈무리한 다음
+#     .env를 이전 내용으로 되돌리고 이전 image로 다시 기동한다. 갈무리한 내용은
+#     $DEPLOY_DIR/deploy-failures/<UTC>-<service>.log에도 남긴다.
+#   - 되돌린 뒤에도 같은 health 확인을 수행한다. 롤백본까지 실패하면 서비스가
+#     중단된 상태이므로 종료 코드 3으로 알린다.
 #   - docker image prune은 실행하지 않는다. 다른 stack의 image까지 지울 수 있다.
 #     대신 rollback/* 태그만 세대 수 기준으로 정리한다.
 #
@@ -40,6 +46,7 @@
 #   HEALTH_RETRIES    기본 20
 #   HEALTH_INTERVAL   기본 3 (초)
 #   ROLLBACK_KEEP     기본 5. 컨테이너마다 남길 rollback 태그 수다.
+#   FAILURE_LOG_DIR   기본 $DEPLOY_DIR/deploy-failures. 실패 갈무리를 남길 자리다.
 #   IMAGE_PREFIX      기본 ghcr.io/bngdrasil/. 허용하는 registry와 조직 접두사다.
 #                     registry를 옮길 때에만 바꾼다.
 
@@ -58,6 +65,7 @@ HEALTH_RETRIES="${HEALTH_RETRIES:-20}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-3}"
 ROLLBACK_KEEP="${ROLLBACK_KEEP:-5}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-ghcr.io/bngdrasil/}"
+FAILURE_LOG_DIR="${FAILURE_LOG_DIR:-$DEPLOY_DIR/deploy-failures}"
 
 log()  { echo "[INFO]  $*"; }
 warn() { echo "[WARN]  $*" >&2; }
@@ -72,6 +80,13 @@ usage: deploy-image.sh <auth-server|gateway> <image_ref>
 
   auth-server : Bidar   (container vm2-auth,    port 8001, AUTH_SERVER_IMAGE)
   gateway     : Bifrost (container vm2-gateway, port 8000, GATEWAY_IMAGE)
+
+종료 코드
+  0 : 배포에 성공했다.
+  1 : 배포에 실패했으나 서비스는 이전 상태로 돌아갔거나 운영을 건드리지 않았다.
+  2 : 인자나 image 참조 형식이 올바르지 않다.
+  3 : 배포에 실패했고 되돌린 뒤에도 health 확인을 통과하지 못했다. 서비스가
+      중단된 상태이므로 사람이 즉시 조치해야 한다.
 USAGE
 }
 
@@ -180,7 +195,7 @@ log "deploy dir: $DEPLOY_DIR"
 # ----------------------------------------------------------------------------
 # 3. image 내려받기
 # ----------------------------------------------------------------------------
-log "[1/6] image를 내려받는다."
+log "[1/7] image를 내려받는다."
 if ! docker pull "$IMAGE_REF"; then
     err "docker pull에 실패했다: $IMAGE_REF"
     err "GHCR 패키지가 public인지, 태그가 실제로 존재하는지, 아키텍처가 arm64인지 확인한다."
@@ -205,9 +220,61 @@ fi
 log "digest: $IMAGE_DIGEST"
 
 # ----------------------------------------------------------------------------
-# 4. 롤백 지점 확보
+# 4. 사전 점검: 해석된 environment에 빈 값이 없어야 한다
 # ----------------------------------------------------------------------------
-log "[2/6] 롤백 지점을 만든다."
+# 2026-09-19 장애의 직접 원인은 .env에 없는 변수를 compose가 `${VAR}` 형태로
+# 참조하여 빈 문자열을 컨테이너에 넘긴 것이었다. 앱은 bool과 int 항목을 빈
+# 문자열로 해석하지 못해 기동에 실패했다. 컨테이너를 교체하기 전에 같은 상황을
+# 걸러 내야, 실패가 운영 컨테이너까지 내려가지 않는다.
+#
+# compose가 `${VAR:?...}`로 선언한 필수 값이 없으면 `docker compose config`
+# 자체가 실패한다. 그 실패도 여기에서 함께 잡는다.
+#
+# `compose config <service>`는 의존 서비스까지 함께 해석하여 출력하므로, 이 점검은
+# 대상 서비스와 그 의존 서비스의 environment를 모두 살펴본다.
+log "[2/7] 해석된 environment를 사전 점검한다."
+
+CONFIG_OUTPUT=""
+if ! CONFIG_OUTPUT="$(compose config "$SERVICE" 2>&1)"; then
+    err "docker compose config가 실패했다. 필수 변수가 비어 있을 수 있다."
+    printf '%s\n' "$CONFIG_OUTPUT" >&2
+    err "운영 컨테이너는 그대로 두고 중단한다. ${ENV_FILE}를 먼저 고친다."
+    exit 1
+fi
+
+# compose config는 environment를 6칸 들여쓴 매핑으로 정규화하여 출력하고,
+# 값이 빈 문자열인 항목은 `KEY: ""`로 적는다. 그 키만 모은다.
+EMPTY_KEYS="$(printf '%s\n' "$CONFIG_OUTPUT" | awk '
+    /^    environment:$/ { in_env = 1; next }
+    in_env && /^      [A-Za-z_][A-Za-z0-9_]*:/ {
+        key = $1
+        sub(/:$/, "", key)
+        sep = index($0, ": ")
+        value = (sep > 0) ? substr($0, sep + 2) : ""
+        if (value == "\"\"") { print key }
+        next
+    }
+    in_env && /^      / { next }
+    in_env { in_env = 0 }
+')"
+
+if [ -n "$EMPTY_KEYS" ]; then
+    err "${SERVICE}와 그 의존 서비스의 environment에 값이 빈 문자열인 항목이 있다."
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        err "  - $key"
+    done <<<"$EMPTY_KEYS"
+    err "빈 문자열은 bool이나 int로 해석되지 않아 컨테이너 기동을 실패시킨다."
+    err "${ENV_FILE}에 값을 채우거나 docker-compose.yml에 기본값을 두고 다시 실행한다."
+    err "운영 컨테이너는 그대로 두고 중단한다."
+    exit 1
+fi
+log "  빈 값 없음"
+
+# ----------------------------------------------------------------------------
+# 5. 롤백 지점 확보
+# ----------------------------------------------------------------------------
+log "[3/7] 롤백 지점을 만든다."
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ROLLBACK_TAG=""
 if docker inspect --type container "$CONTAINER" >/dev/null 2>&1; then
@@ -232,9 +299,9 @@ cleanup() {
 trap cleanup EXIT
 
 # ----------------------------------------------------------------------------
-# 5. .env의 image 변수 갱신
+# 6. .env의 image 변수 갱신
 # ----------------------------------------------------------------------------
-log "[3/6] .env의 $IMAGE_VAR 값을 갱신한다."
+log "[4/7] .env의 $IMAGE_VAR 값을 갱신한다."
 
 # 소유자와 권한을 그대로 유지해야 한다. 새로 만든 파일로 바꾸면 root 소유 0644가
 # 되어 운영 비밀이 다른 사용자에게 읽힐 수 있다.
@@ -276,9 +343,9 @@ update_env_var "$IMAGE_VAR" "$IMAGE_REF"
 log "$IMAGE_VAR=$IMAGE_REF"
 
 # ----------------------------------------------------------------------------
-# 6. 컨테이너 교체
+# 7. 컨테이너 교체
 # ----------------------------------------------------------------------------
-log "[4/6] 컨테이너를 교체한다."
+log "[5/7] 컨테이너를 교체한다."
 # --no-deps: redis와 auth-server 같은 의존 서비스를 함께 재시작하지 않는다.
 # --no-build: GHCR image만 사용한다. 이 자리에서 현장 build가 일어나면
 #             release가 가리키는 image와 실제로 뜬 image가 달라진다.
@@ -289,7 +356,7 @@ if ! compose up -d --no-deps --no-build "$SERVICE"; then
 fi
 
 # ----------------------------------------------------------------------------
-# 7. health 확인
+# 8. health 확인
 # ----------------------------------------------------------------------------
 check_http() {
     local label="$1" url="$2" i
@@ -304,23 +371,70 @@ check_http() {
     return 1
 }
 
+# 새 image를 올린 뒤에도, 되돌린 뒤에도 같은 기준으로 확인해야 한다. 그래야
+# 롤백본이 실제로 서비스하고 있는지를 같은 근거로 판단할 수 있다.
+run_health_check() {
+    local rc=0
+    check_http "$SERVICE $HEALTH_PATH" "http://${HEALTH_HOST}:${SERVICE_PORT}${HEALTH_PATH}" || rc=1
+    if [ "$CHECK_READY" -eq 1 ] && [ "$rc" -eq 0 ]; then
+        # /ready는 DB와 등록부가 준비되지 않으면 503을 돌려준다.
+        check_http "$SERVICE $READY_PATH" "http://${HEALTH_HOST}:${SERVICE_PORT}${READY_PATH}" || rc=1
+    fi
+    return "$rc"
+}
+
+# 실패한 컨테이너의 로그와 State를 갈무리한다. 되돌리면 그 컨테이너가 사라져서
+# 원인을 알 수 없게 되므로, 되돌리기 전에 반드시 먼저 호출해야 한다.
+capture_failure() {
+    local phase="$1" stamp file
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    file="$FAILURE_LOG_DIR/${stamp}-${SERVICE}.log"
+
+    if ! mkdir -p "$FAILURE_LOG_DIR" 2>/dev/null; then
+        warn "실패 기록 디렉터리를 만들지 못했다: $FAILURE_LOG_DIR"
+        file="/dev/null"
+    else
+        # 로그에 요청 헤더나 접속 문자열이 섞일 수 있으므로 소유자만 읽게 한다.
+        chmod 700 "$FAILURE_LOG_DIR" 2>/dev/null || true
+    fi
+
+    {
+        echo "=== deploy failure capture ==="
+        echo "time    : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "phase   : $phase"
+        echo "service : $SERVICE ($CONTAINER)"
+        echo "image   : $IMAGE_REF"
+        echo ""
+        echo "--- docker logs --tail 80 $CONTAINER ---"
+        docker logs --tail 80 "$CONTAINER" 2>&1 || echo "(로그를 읽지 못했다)"
+        echo ""
+        echo "--- docker inspect .State ---"
+        docker inspect --type container --format '{{json .State}}' "$CONTAINER" 2>&1 \
+            || echo "(State를 읽지 못했다)"
+    } | tee -a "$file"
+
+    if [ "$file" != "/dev/null" ]; then
+        chmod 600 "$file" 2>/dev/null || true
+        err "실패 기록을 남겼다: $file"
+    fi
+}
+
 HEALTH_FAILED=0
 if [ "$UP_FAILED" -eq 0 ]; then
-    log "[5/6] health를 확인한다. (최대 $((HEALTH_RETRIES * HEALTH_INTERVAL))초)"
-    check_http "$SERVICE $HEALTH_PATH" "http://${HEALTH_HOST}:${SERVICE_PORT}${HEALTH_PATH}" || HEALTH_FAILED=1
-    if [ "$CHECK_READY" -eq 1 ] && [ "$HEALTH_FAILED" -eq 0 ]; then
-        # /ready는 DB와 등록부가 준비되지 않으면 503을 돌려준다.
-        check_http "$SERVICE $READY_PATH" "http://${HEALTH_HOST}:${SERVICE_PORT}${READY_PATH}" || HEALTH_FAILED=1
-    fi
+    log "[6/7] health를 확인한다. (최대 $((HEALTH_RETRIES * HEALTH_INTERVAL))초)"
+    run_health_check || HEALTH_FAILED=1
 else
     HEALTH_FAILED=1
 fi
 
 # ----------------------------------------------------------------------------
-# 8. 실패하면 되돌린다
+# 9. 실패하면 되돌린다
 # ----------------------------------------------------------------------------
 if [ "$HEALTH_FAILED" -ne 0 ]; then
-    err "배포에 실패했다. 이전 상태로 되돌린다."
+    err "배포에 실패했다. 되돌리기 전에 실패한 컨테이너의 상태를 먼저 갈무리한다."
+    capture_failure "new-image"
+
+    err "이전 상태로 되돌린다."
     restore_env
     log ".env를 이전 내용으로 되돌렸다."
 
@@ -328,13 +442,36 @@ if [ "$HEALTH_FAILED" -ne 0 ]; then
         # A mutable tag may now point at the failed image after docker pull.
         # Persist the tag made from the previous container's image ID.
         update_env_var "$IMAGE_VAR" "$ROLLBACK_TAG"
+        ROLLBACK_FAILED=0
         if compose up -d --no-deps --no-build "$SERVICE"; then
-            log "이전 image로 다시 기동했다."
+            log "이전 image로 다시 기동했다. 같은 기준으로 health를 다시 확인한다."
+            run_health_check || ROLLBACK_FAILED=1
         else
-            err "이전 image로 다시 기동하는 데에도 실패했다. 수동 조치가 필요하다."
-            err "  docker image ls 'rollback/${CONTAINER}'"
-            err "  cd $DEPLOY_DIR && ${IMAGE_VAR}=$ROLLBACK_TAG docker compose up -d --no-deps $SERVICE"
+            err "이전 image로 다시 기동하는 데에도 실패했다."
+            ROLLBACK_FAILED=1
         fi
+
+        if [ "$ROLLBACK_FAILED" -ne 0 ]; then
+            # compose와 .env의 형식이 바뀐 직후의 첫 배포에서는 구 image가 새 형식을
+            # 읽지 못해 이 경로로 들어올 수 있다. 이 경우 서비스는 복구되지 않았다.
+            capture_failure "rollback"
+            echo "" >&2
+            err "############################################################"
+            err "# 서비스 중단 상태다. 롤백본도 health 확인을 통과하지 못했다."
+            err "# service   : $SERVICE ($CONTAINER)"
+            err "# 실패 image : $IMAGE_REF"
+            err "# 롤백 태그  : $ROLLBACK_TAG"
+            err "# 사람이 즉시 조치해야 한다."
+            err "############################################################"
+            err "확인 순서"
+            err "  1) 위의 실패 기록과 ${FAILURE_LOG_DIR}의 파일을 읽는다."
+            err "  2) compose나 .env의 형식이 이번에 바뀌었는지 확인한다."
+            err "     구 image는 새 형식을 읽지 못하므로 롤백이 성립하지 않는다."
+            err "  3) 필요하면 새 image를 다시 올리고 ${ENV_FILE}를 새 형식에 맞춘다."
+            err "     cd $DEPLOY_DIR && docker compose up -d --no-deps --no-build $SERVICE"
+            exit 3
+        fi
+        log "롤백본이 health 확인을 통과했다. 서비스는 이전 상태로 돌아갔다."
         echo ""
         echo "되돌릴 지점: $ROLLBACK_TAG"
     else
@@ -349,9 +486,9 @@ if [ "$HEALTH_FAILED" -ne 0 ]; then
 fi
 
 # ----------------------------------------------------------------------------
-# 9. 기록과 정리
+# 10. 기록과 정리
 # ----------------------------------------------------------------------------
-log "[6/6] release 기록을 남기고 rollback 태그를 정리한다."
+log "[7/7] release 기록을 남기고 rollback 태그를 정리한다."
 printf '%s\t%s\t%s\t%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SERVICE" "$IMAGE_REF" "$IMAGE_DIGEST" \
     >>"$RELEASES_LOG"

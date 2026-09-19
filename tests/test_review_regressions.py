@@ -18,14 +18,22 @@ class ReviewRegressions(unittest.TestCase):
             bin_dir.mkdir()
             (root / 'docker-compose.yml').write_text('services: {}\n')
             (root / '.env').write_text('AUTH_SERVER_IMAGE=ghcr.io/bngdrasil/bidar:main\nOTHER=keep\n')
+            # 사전 점검이 읽는 compose config 대역 출력이다. 빈 값이 없는 상태로 둔다.
+            (root / 'config-output').write_text(
+                'name: bnbong\nservices:\n  auth-server:\n    environment:\n'
+                '      ENVIRONMENT: production\n      LOG_LEVEL: INFO\n')
             commands = {
                 'flock': 'exit 0',
-                'curl': 'exit 1',
+                # 새 image는 응답하지 않고 롤백본만 응답하게 만든다.
+                'curl': 'grep -q "^AUTH_SERVER_IMAGE=rollback/" "$DEPLOY_DIR/.env" && exit 0\nexit 1',
                 'docker': '''case "$*" in
+  *" config "*) cat "$DEPLOY_DIR/config-output" ;;
   "inspect --type container --format {{.Image}} "*) echo old-image-id ;;
   "inspect --type container --format {{.Config.Image}} "*) echo ghcr.io/bngdrasil/bidar:main ;;
+  "inspect --type container --format {{json .State}} "*) echo '{"Status":"restarting"}' ;;
   "image inspect "*) echo ghcr.io/bngdrasil/bidar@sha256:fake ;;
-  "compose "*) grep '^AUTH_SERVER_IMAGE=' "$DEPLOY_DIR/.env" >> "$DEPLOY_DIR/observed" ;;
+  "logs "*) echo "container log line" ;;
+  *" up "*) grep '^AUTH_SERVER_IMAGE=' "$DEPLOY_DIR/.env" >> "$DEPLOY_DIR/observed" ;;
 esac
 exit 0''',
             }
@@ -76,6 +84,111 @@ exit 0''',
             self.assertFalse((state / 'ship-last-run.json').exists())
             self.assertFalse((root / 'metrics/bngdrasil-backup-ship.prom').exists())
             self.assertFalse((run / 'SHIPPED').exists())
+
+
+class DeployImageOutage20260919(unittest.TestCase):
+    """2026-09-19 게이트웨이 중단의 재발 방지 검사.
+
+    Docker와 curl을 대역으로 바꾸어 실행하므로 Docker 데몬과 운영 VM이 필요하지 않다.
+    """
+
+    SCRIPT = ROOT / 'vm2-deployment/deploy-image.sh'
+
+    DOCKER_STUB = r'''case "$*" in
+  *" config "*) cat "$DEPLOY_DIR/config-output" ;;
+  "inspect --type container --format {{.Image}} "*) echo old-image-id ;;
+  "inspect --type container --format {{.Config.Image}} "*) echo ghcr.io/bngdrasil/bifrost:main ;;
+  "inspect --type container --format {{json .State}} "*) echo '{"Status":"restarting","ExitCode":1}' ;;
+  "image inspect "*) echo ghcr.io/bngdrasil/bifrost@sha256:fake ;;
+  "logs "*) echo "ValidationError: bool_parsing, input_value=" ;;
+  *" up "*) echo "$*" >> "$DEPLOY_DIR/observed-up" ;;
+esac
+exit 0'''
+
+    # 롤백본만 응답하게 만드는 curl 대역이다. 새 image가 떠 있는 동안에는 실패한다.
+    CURL_ROLLBACK_ONLY = r'''grep -q "^GATEWAY_IMAGE=rollback/" "$DEPLOY_DIR/.env" && exit 0
+exit 1'''
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        (self.root / 'docker-compose.yml').write_text('services: {}\n')
+        (self.root / '.env').write_text(
+            'GATEWAY_IMAGE=ghcr.io/bngdrasil/bifrost:main\nOTHER=keep\n')
+        self.stub('flock', 'exit 0')
+        self.stub('docker', self.DOCKER_STUB)
+        self.addCleanup(self._tmp.cleanup)
+
+    def stub(self, name, body):
+        p = self.bin / name
+        p.write_text('#!/bin/sh\n' + body + '\n')
+        p.chmod(0o755)
+
+    def write_config(self, empty_keys=()):
+        """compose config 대역 출력을 만든다. empty_keys에 적은 항목만 빈 문자열이 된다."""
+        lines = ['name: bnbong', 'services:', '  gateway:', '    environment:',
+                 '      ENVIRONMENT: production', '      LOG_LEVEL: INFO']
+        for key in empty_keys:
+            lines.append('      %s: ""' % key)
+        lines += ['    image: ghcr.io/bngdrasil/bifrost:main', 'networks:',
+                  '  api-network:', '    name: api-network']
+        (self.root / 'config-output').write_text('\n'.join(lines) + '\n')
+
+    def run_deploy(self):
+        env = dict(os.environ,
+                   PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
+                   DEPLOY_DIR=str(self.root), HEALTH_RETRIES='1', HEALTH_INTERVAL='0')
+        return subprocess.run(
+            ['bash', str(self.SCRIPT), 'gateway', 'ghcr.io/bngdrasil/bifrost:sha-1a2b3c4'],
+            env=env, capture_output=True, text=True, timeout=30)
+
+    def failure_logs(self):
+        d = self.root / 'deploy-failures'
+        return sorted(d.glob('*-gateway.log')) if d.exists() else []
+
+    # --- (a) 빈 env 값이 있으면 컨테이너를 교체하지 않고 중단한다 --------------------
+    def test_empty_environment_value_aborts_before_replacing_container(self):
+        self.write_config(empty_keys=['ENABLE_METRICS', 'MAX_REQUEST_BODY_BYTES'])
+        self.stub('curl', 'exit 0')
+
+        result = self.run_deploy()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('ENABLE_METRICS', result.stderr)
+        self.assertIn('MAX_REQUEST_BODY_BYTES', result.stderr)
+        # 컨테이너 교체가 일어나지 않아야 하고 .env도 그대로 남아 있어야 한다.
+        self.assertFalse((self.root / 'observed-up').exists(), result.stdout)
+        self.assertIn('GATEWAY_IMAGE=ghcr.io/bngdrasil/bifrost:main',
+                      (self.root / '.env').read_text())
+
+    # --- (b) health 실패는 되돌리기 전에 실패 기록을 남긴다 -------------------------
+    def test_health_failure_writes_failure_log_before_rollback(self):
+        self.write_config()
+        self.stub('curl', self.CURL_ROLLBACK_ONLY)
+
+        result = self.run_deploy()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        logs = self.failure_logs()
+        self.assertEqual(len(logs), 1, result.stdout + result.stderr)
+        body = logs[0].read_text()
+        self.assertIn('phase   : new-image', body)
+        self.assertIn('bool_parsing', body)
+        self.assertIn('"Status":"restarting"', body)
+        # 롤백본이 health 확인을 통과했으므로 중단 경고는 나오지 않는다.
+        self.assertNotIn('서비스 중단 상태다', result.stderr)
+
+    # --- (c) 롤백본까지 health에 실패하면 종료 코드 3으로 알린다 ---------------------
+    def test_failed_rollback_reports_outage_with_exit_code_three(self):
+        self.write_config()
+        self.stub('curl', 'exit 1')
+
+        result = self.run_deploy()
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn('서비스 중단 상태다', result.stderr)
+        body = ''.join(f.read_text() for f in self.failure_logs())
+        self.assertIn('phase   : new-image', body)
+        self.assertIn('phase   : rollback', body)
 
 
 class BackupRetentionAndShip(unittest.TestCase):
