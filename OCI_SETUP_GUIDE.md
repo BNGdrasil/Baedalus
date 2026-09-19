@@ -143,7 +143,6 @@ openssl rsa -pubout -outform DER -in ~/.oci/chuncheon_api_key.pem \
 
 계정 준비가 끝난 뒤의 작업은 다음 문서로 이어집니다.
 
-- 실제 배포 상태를 먼저 파악하려면 [배포 기준선](docs/deployment-inventory.md)을 읽습니다.
 - VM2의 애플리케이션을 배포하려면 [vm2-deployment/README.md](vm2-deployment/README.md)를 따릅니다.
 - 관측 스택을 다루려면 [monitoring/README.md](monitoring/README.md)를 읽습니다.
 - 백업 체계를 설치하려면 [backup/README.md](backup/README.md)를 따릅니다.

@@ -419,8 +419,7 @@ ssh ubuntu@<VM2_PUBLIC_IP> 'rm -rf /opt/bnbong/bifrost/config'   # 확인한 뒤
 GitHub Actions가 수행하는 배포의 전체 구조와 저장소별 secret 구성, 최초 준비 절차는
 [../docs/github-actions-setup.md](../docs/github-actions-setup.md)에 있습니다.
 
-저장소 전체 구조와 Terraform 사용 절차는 [../README.md](../README.md)에 있습니다. 2026-09-18 기준의
-실제 배포 상태는 [../docs/deployment-inventory.md](../docs/deployment-inventory.md)에,
+저장소 전체 구조와 Terraform 사용 절차는 [../README.md](../README.md)에 있습니다.
 관측 스택의 구성과 알림 규칙은 [../monitoring/README.md](../monitoring/README.md)에,
 반복 백업 체계는 [../backup/README.md](../backup/README.md)에 있습니다.
 

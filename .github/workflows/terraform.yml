@@ -6,7 +6,7 @@ name: Terraform Validation
 # 새로 만들겠다는 계획이 나오고, apply는 실제 인프라를 훼손할 수 있다.
 # 원격 backend(OCI Object Storage의 S3 호환 endpoint)로 state를 옮기고 잠금과
 # 버전 관리를 확인한 뒤에 plan 도입을 다시 검토한다.
-# 근거와 이전 절차는 README.md의 "CI에서 plan과 apply를 하지 않는 이유"에 있다.
+# 근거와 이전 절차는 docs/terraform.md의 "CI에서 plan과 apply를 하지 않는 이유"에 있다.
 
 on:
   pull_request:

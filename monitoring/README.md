@@ -261,7 +261,6 @@ sudo docker exec vm2-prometheus wget -O- http://<서비스>:<포트>/metrics
 | 문서 | 다루는 내용 |
 |---|---|
 | [../README.md](../README.md) | 저장소 전체 구조와 Terraform 사용 절차를 설명합니다. |
-| [../docs/deployment-inventory.md](../docs/deployment-inventory.md) | 2026-09-18 기준의 실제 배포 상태를 기록했습니다. |
 | [../vm2-deployment/README.md](../vm2-deployment/README.md) | core compose와 애플리케이션 배포 절차를 설명합니다. |
 | [../backup/README.md](../backup/README.md) | 백업 체계와 백업 지표의 출력 형식을 설명합니다. |
 | [../docs/github-actions-setup.md](../docs/github-actions-setup.md) | 배포 워크플로의 전체 구조와 secret 구성, 최초 준비 절차를 설명합니다. |

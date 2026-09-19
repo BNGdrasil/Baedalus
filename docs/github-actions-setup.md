@@ -5,7 +5,7 @@
 실패했을 때 되돌리는 절차와 이 구조에서 남는 보안 위험도 함께 적었습니다.
 
 이 문서에 적힌 값은 2026-09-18에 관측한 운영 상태를 기준으로 삼습니다. 실제 컨테이너와 이미지의
-기준선은 [배포 기준선](deployment-inventory.md)에 있습니다.
+배포 기준선 문서는 저장소에 포함하지 않습니다.
 
 ---
 
@@ -390,4 +390,3 @@ Dockerfile을 바꿀 때마다 확인해야 합니다.
 | [vm2-deployment/README.md](../vm2-deployment/README.md) | VM2 애플리케이션의 배포와 확인과 롤백 절차를 설명합니다 |
 | [monitoring/README.md](../monitoring/README.md) | 관측 스택의 구성과 알림 규칙을 설명합니다 |
 | [backup/README.md](../backup/README.md) | 반복 백업 체계와 복원 훈련 절차를 설명합니다 |
-| [docs/deployment-inventory.md](deployment-inventory.md) | 2026-09-18 기준의 실제 배포 상태를 기록했습니다 |
