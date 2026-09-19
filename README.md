@@ -46,7 +46,7 @@ terraform init -backend=false -input=false
 terraform validate
 ```
 
-`terraform apply`는 state와 실제 OCI 자원을 대조하기 전까지 실행하지 않습니다. 대조 절차는 [Terraform 운용](docs/terraform.md)에 적었습니다.
+`terraform apply`는 state와 실제 OCI 자원을 대조하기 전까지 실행하지 않습니다. 대조 절차는 [Terraform 운용](docs/terraform.md)에 적었습니다. apply를 실행할 단계가 되면, plan 출력에 `must be replaced`나 `forces replacement`가 있는지 먼저 확인하고 하나라도 걸리면 중단합니다. 운영 인스턴스가 교체되면 서비스가 중단되고 boot volume 위의 데이터도 사라지기 때문입니다.
 
 ## 문서
 

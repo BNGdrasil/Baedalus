@@ -25,6 +25,42 @@ make plan       # terraform plan
 3. state를 실제 자원과 맞춥니다.
 4. `terraform plan`에 의도하지 않은 생성과 삭제와 교체가 없는지 확인합니다.
 
+### 교체 계획이 보이면 즉시 중단합니다
+
+plan 출력을 apply하기 전에 아래 두 문구를 반드시 검색해야 합니다.
+
+```bash
+terraform plan -no-color -out=tfplan | tee plan.txt
+grep -nE 'must be replaced|forces replacement' plan.txt
+```
+
+두 문구 중 하나라도 걸리면 그 자리에서 작업을 멈추고, 어떤 속성이 교체를 유발했는지 원인을 먼저 규명해야 합니다. `oci_core_instance`의 교체는 기존 인스턴스를 종료한 뒤에 새 인스턴스를 만드는 절차이므로, 운영 중인 VM1과 VM2와 VM3에 이 계획이 나오면 서비스가 중단되고 데이터도 사라집니다. 교체가 정말로 필요하다고 판단한 경우에는 먼저 boot volume 백업과 데이터베이스 덤프를 확보하고, 그다음에 별도의 작업으로 분리해서 진행합니다.
+
+VM1과 VM2와 VM3에는 `lifecycle` 블록에 `prevent_destroy = true`를 넣어 두었습니다. 따라서 교체나 삭제 계획이 잡히면 apply 이전 단계에서 plan 자체가 오류를 내고 멈춥니다. 이 오류는 방어 장치가 정상적으로 동작한 결과이므로, `prevent_destroy`를 지워서 통과시키는 방식으로 대응하면 안 됩니다.
+
+### 2026-09-19에 확인한 교체 위험과 대응
+
+2026-09-19 보수 작업에서 `scripts/user_data_vm2.sh`와 `user_data_vm3.sh`와 `user_data_vm4.sh`를 수정했습니다. 이 세 파일은 각 인스턴스의 `metadata.user_data`로 들어가는 cloud-init 스크립트이며, OCI provider는 `metadata`가 바뀌면 인스턴스를 교체합니다. 당시 모든 인스턴스가 `preserve_boot_volume = false`였고 VM3는 호스트 PostgreSQL 데이터를 boot volume 위에 두고 있었으므로, 그대로 apply했다면 운영 중인 VM2와 VM3가 파괴되고 데이터베이스도 함께 사라졌을 것입니다.
+
+같은 날 아래 세 가지를 적용해서 이 위험을 막았습니다.
+
+- VM1부터 VM6까지 모든 `oci_core_instance`의 `lifecycle.ignore_changes`에 `metadata`를 추가했습니다. `metadata["user_data"]`만 지정하지 않고 `metadata` 전체를 지정한 이유는, `ssh_authorized_keys`가 바뀌어도 똑같이 교체가 일어나기 때문입니다. cloud-init은 최초 부팅에서 한 번만 실행되므로 실행 중인 인스턴스의 구성에는 영향을 주지 않으며, 구성 변경은 `scripts/` 아래의 배포 스크립트가 담당합니다.
+- VM1과 VM2와 VM3에 `prevent_destroy = true`를 넣었습니다. `count`를 사용하는 VM5와 VM6에는 넣지 않았습니다. 그 두 리소스는 오히려 state에서 제거해야 하는 대상이기 때문입니다.
+- VM1과 VM2와 VM3의 `preserve_boot_volume`을 `true`로 바꿨습니다. `oracle/oci` provider 5.47.0에서 이 속성은 ForceNew로 선언되어 있지 않고 terminate 요청에서만 사용되므로, 값 변경은 in-place update로 처리됩니다. 다만 provider 버전이 올라가면 동작이 달라질 수 있으므로, apply하기 전에 plan 출력에서 이 속성의 변경이 교체가 아니라 update로 표시되는지 반드시 눈으로 확인해야 합니다.
+
+`ignore_changes = [metadata]`를 넣은 뒤에도 cloud-init 스크립트를 고치는 작업 자체는 계속 의미가 있습니다. 새 인스턴스를 만들 때 그 스크립트가 그대로 사용되기 때문입니다. 반대로 실행 중인 인스턴스에 스크립트 수정 내용을 반영하려면 해당 VM에 접속해서 직접 적용해야 합니다.
+
+### state 정리 후에 기대되는 plan
+
+VM5와 VM6를 state에서 제거한 뒤에도 plan이 `No changes.`를 보고하지 않을 수 있습니다. security list의 8000번과 8001번 포트 규칙을 `api_client_cidr`로 좁힌 변경이 아직 실제 자원에 반영되어 있지 않다면, 그 규칙이 in-place update로 남아 있게 됩니다. `preserve_boot_volume`을 `true`로 바꾼 변경도 같은 방식으로 세 건의 update로 표시됩니다.
+
+따라서 정리가 끝난 시점에 확인해야 할 기준은 `No changes.`가 아니라 다음 두 가지입니다.
+
+- plan 출력에 `must be replaced`와 `forces replacement`가 하나도 없습니다.
+- 남아 있는 변경이 전부 내용을 설명할 수 있는 in-place update입니다.
+
+설명할 수 없는 변경이 하나라도 섞여 있으면 apply하지 말고 원인을 먼저 확인합니다.
+
 ## state 백업
 
 state에는 OCI 자원 주소와 민감한 변수 값이 들어 있습니다. apply 전후에 사본을 남깁니다.
@@ -57,11 +93,12 @@ oci bv boot-volume list \
 make backup-state
 terraform state rm oci_core_instance.vm5_backup oci_core_instance.vm6_playground
 
-# 4) plan이 No changes.를 보고하는지 확인합니다
-terraform plan
+# 4) plan에 교체 계획이 없는지 확인합니다
+terraform plan -no-color | tee plan.txt
+grep -nE 'must be replaced|forces replacement' plan.txt
 ```
 
-자원이 남아 있다면 3번에서 멈추고 삭제 여부를 먼저 결정합니다. 다른 변경이 보이면 apply하지 말고 원인을 먼저 확인합니다. 이 저장소의 작업에서는 위 절차를 아직 실행하지 않았습니다.
+자원이 남아 있다면 3번에서 멈추고 삭제 여부를 먼저 결정합니다. 4번에서 `No changes.`가 나오지 않더라도 곧바로 문제라고 판단하지는 않습니다. 위의 "state 정리 후에 기대되는 plan"에 적은 대로, security list 규칙과 `preserve_boot_volume` 변경이 in-place update로 남아 있을 수 있기 때문입니다. 설명할 수 없는 변경이 보이면 apply하지 말고 원인을 먼저 확인합니다. 이 저장소의 작업에서는 위 절차를 아직 실행하지 않았습니다.
 
 ## CI에서 plan과 apply를 하지 않는 이유
 

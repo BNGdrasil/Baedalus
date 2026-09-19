@@ -21,6 +21,18 @@ VM4는 replica나 재해 복구 자원으로 계산하지 않습니다. 빈 자�
 
 VM5와 VM6는 운영자 설명상 삭제한 인스턴스이며, OCPU를 다른 인스턴스로 합쳤다고 합니다. 다만 로컬 `terraform.tfstate`에는 두 인스턴스가 여전히 `RUNNING` 상태로 남아 있습니다. state와 실제 OCI 자원이 어긋나 있으므로, 실제 자원을 조회해 state와 맞추기 전에는 apply하지 않습니다. 정리 절차는 [Terraform 운용](terraform.md)에 적었습니다.
 
+### 인스턴스 교체 방지 설정
+
+`oci_core_instance`는 `metadata`가 바뀌면 교체됩니다. 교체는 기존 인스턴스를 종료한 뒤에 새 인스턴스를 만드는 절차이므로, 운영 중인 VM에 적용되면 서비스가 중단되고 boot volume 위의 데이터도 사라집니다. 이 사고를 막기 위해 2026-09-19에 아래 설정을 넣었습니다.
+
+| 설정 | 적용 대상 | 목적 |
+|---|---|---|
+| `lifecycle.ignore_changes`에 `metadata` 추가 | VM1부터 VM6까지 전부 | cloud-init 스크립트나 SSH 공개 키를 고쳐도 교체 계획이 생기지 않게 합니다. |
+| `prevent_destroy = true` | VM1, VM2, VM3 | 교체나 삭제 계획이 잡히면 apply 이전에 plan이 오류를 내고 멈춥니다. |
+| `preserve_boot_volume = true` | VM1, VM2, VM3 | 인스턴스를 종료해야 하는 상황에서도 boot volume과 그 안의 데이터를 남깁니다. |
+
+`count`를 사용하는 VM5와 VM6에는 `prevent_destroy`를 넣지 않았습니다. 그 두 리소스는 state에서 제거해야 하는 대상이므로, 삭제를 막으면 정리 작업이 오히려 진행되지 않기 때문입니다. cloud-init은 최초 부팅에서 한 번만 실행되므로, 실행 중인 인스턴스의 구성은 `scripts/` 아래의 배포 스크립트가 담당합니다. 자세한 경위와 apply 전 점검 절차는 [Terraform 운용](terraform.md)에 적었습니다.
+
 ## 네트워크
 
 `network.tf`가 두 리전의 VCN과 subnet과 라우팅을 정의합니다.

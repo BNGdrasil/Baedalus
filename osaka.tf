@@ -60,8 +60,14 @@ resource "oci_core_instance" "vm4_monitoring" {
   preserve_boot_volume = false
 
   lifecycle {
+    # cloud-init(user_data)은 최초 부팅에만 실행되므로, 실행 중인 인스턴스의 구성은
+    # scripts/ 아래 배포 스크립트가 담당한다. 반면 OCI provider는 metadata가 바뀌면
+    # 인스턴스를 replace한다. user_data뿐 아니라 ssh_authorized_keys 변경도 같은
+    # 교체를 유발하므로, metadata 전체를 무시한다. 키 교체나 재부트스트랩이 필요하면
+    # 배포 스크립트나 OCI 콘솔로 처리한다.
     ignore_changes = [
       source_details[0].source_id,
+      metadata,
     ]
   }
 
@@ -113,8 +119,14 @@ resource "oci_core_instance" "vm5_backup" {
   preserve_boot_volume = false
 
   lifecycle {
+    # cloud-init(user_data)은 최초 부팅에만 실행되므로, 실행 중인 인스턴스의 구성은
+    # scripts/ 아래 배포 스크립트가 담당한다. 반면 OCI provider는 metadata가 바뀌면
+    # 인스턴스를 replace한다. user_data뿐 아니라 ssh_authorized_keys 변경도 같은
+    # 교체를 유발하므로, metadata 전체를 무시한다. 키 교체나 재부트스트랩이 필요하면
+    # 배포 스크립트나 OCI 콘솔로 처리한다.
     ignore_changes = [
       source_details[0].source_id,
+      metadata,
     ]
   }
 
@@ -158,8 +170,14 @@ resource "oci_core_instance" "vm6_playground" {
   preserve_boot_volume = false
 
   lifecycle {
+    # cloud-init(user_data)은 최초 부팅에만 실행되므로, 실행 중인 인스턴스의 구성은
+    # scripts/ 아래 배포 스크립트가 담당한다. 반면 OCI provider는 metadata가 바뀌면
+    # 인스턴스를 replace한다. user_data뿐 아니라 ssh_authorized_keys 변경도 같은
+    # 교체를 유발하므로, metadata 전체를 무시한다. 키 교체나 재부트스트랩이 필요하면
+    # 배포 스크립트나 OCI 콘솔로 처리한다.
     ignore_changes = [
       source_details[0].source_id,
+      metadata,
     ]
   }
 }
