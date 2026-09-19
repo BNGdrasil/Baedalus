@@ -40,6 +40,19 @@ resource "oci_core_route_table" "chuncheon_public_rt" {
     destination_type  = "CIDR_BLOCK"
     network_entity_id = oci_core_internet_gateway.chuncheon_igw.id
   }
+
+  # 리전 간 경로 (NET-01)
+  #
+  # DRG와 RPC는 콘솔에서 수동 생성했으며 Terraform이 관리하지 않는다.
+  # 이 rule이 없으면 plan이 운영 중인 리전 간 경로를 지운다(2026-09-19 확인).
+  dynamic "route_rules" {
+    for_each = var.chuncheon_drg_id != "" ? [var.chuncheon_drg_id] : []
+    content {
+      destination       = oci_core_vcn.osaka_vcn.cidr_blocks[0]
+      destination_type  = "CIDR_BLOCK"
+      network_entity_id = route_rules.value
+    }
+  }
 }
 
 # Route Table for Private Subnet - Chuncheon
@@ -53,6 +66,19 @@ resource "oci_core_route_table" "chuncheon_private_rt" {
     destination       = "0.0.0.0/0"
     destination_type  = "CIDR_BLOCK"
     network_entity_id = oci_core_nat_gateway.chuncheon_nat.id
+  }
+
+  # 리전 간 경로 (NET-01)
+  #
+  # DRG와 RPC는 콘솔에서 수동 생성했으며 Terraform이 관리하지 않는다.
+  # 이 rule이 없으면 plan이 운영 중인 리전 간 경로를 지운다(2026-09-19 확인).
+  dynamic "route_rules" {
+    for_each = var.chuncheon_drg_id != "" ? [var.chuncheon_drg_id] : []
+    content {
+      destination       = oci_core_vcn.osaka_vcn.cidr_blocks[0]
+      destination_type  = "CIDR_BLOCK"
+      network_entity_id = route_rules.value
+    }
   }
 }
 
@@ -238,6 +264,19 @@ resource "oci_core_route_table" "osaka_private_rt" {
     destination       = "0.0.0.0/0"
     destination_type  = "CIDR_BLOCK"
     network_entity_id = oci_core_nat_gateway.osaka_nat.id
+  }
+
+  # 리전 간 경로 (NET-01)
+  #
+  # DRG와 RPC는 콘솔에서 수동 생성했으며 Terraform이 관리하지 않는다.
+  # 이 rule이 없으면 plan이 운영 중인 리전 간 경로를 지운다(2026-09-19 확인).
+  dynamic "route_rules" {
+    for_each = var.osaka_drg_id != "" ? [var.osaka_drg_id] : []
+    content {
+      destination       = oci_core_vcn.chuncheon_vcn.cidr_blocks[0]
+      destination_type  = "CIDR_BLOCK"
+      network_entity_id = route_rules.value
+    }
   }
 }
 

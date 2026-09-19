@@ -38,3 +38,12 @@ jwt_secret_key    = "your-super-secret-jwt-key-at-least-32-characters-long"
 
 # Optional: Cloudflare API token for DNS automation
 # cloudflare_api_token = "your_cloudflare_api_token"
+
+# ========================================
+# Cross-Region DRG Configuration
+# ========================================
+# 콘솔에서 수동 생성한 DRG의 OCID를 넣습니다. 비워 두면 리전 간 route rule을
+# 만들지 않으므로, plan이 운영 중인 리전 간 경로를 제거합니다.
+
+chuncheon_drg_id = "ocid1.drg.oc1.ap-chuncheon-1.aaaaaaaa_your_chuncheon_drg_ocid"
+osaka_drg_id     = "ocid1.drg.oc1.ap-osaka-1.aaaaaaaa_your_osaka_drg_ocid"

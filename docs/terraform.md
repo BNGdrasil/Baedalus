@@ -50,6 +50,24 @@ VM1과 VM2와 VM3에는 `lifecycle` 블록에 `prevent_destroy = true`를 넣어
 
 `ignore_changes = [metadata]`를 넣은 뒤에도 cloud-init 스크립트를 고치는 작업 자체는 계속 의미가 있습니다. 새 인스턴스를 만들 때 그 스크립트가 그대로 사용되기 때문입니다. 반대로 실행 중인 인스턴스에 스크립트 수정 내용을 반영하려면 해당 VM에 접속해서 직접 적용해야 합니다.
 
+### 2026-09-19: Terraform 밖에서 관리되는 리전 간 DRG 경로
+
+같은 날 `terraform apply -refresh-only`로 state를 실제 자원에 맞춘 뒤, 이어서 실행한 `terraform plan`이 route table 세 개에서 리전 간 경로를 제거하겠다고 보고했습니다. 대상은 `chuncheon_private_rt`와 `chuncheon_public_rt`의 `10.1.0.0/16` 경로, 그리고 `osaka_private_rt`의 `10.0.0.0/16` 경로였습니다. 세 경로 모두 콘솔에서 수동으로 만든 DRG를 가리킵니다.
+
+이 경로들은 VM2와 VM4 사이의 통신과 오프사이트 백업 경로를 실제로 담당하고 있으므로, 제거되면 리전 간 연결이 끊어집니다. 원인은 DRG와 RPC가 Terraform 관리 대상이 아니어서 route table 정의에 해당 rule이 빠져 있었다는 점입니다. Terraform은 route table 자체를 관리하므로, 정의에 없는 rule을 잉여 상태로 판단하고 삭제하려고 시도합니다.
+
+대응으로 `network.tf`의 route table 세 곳에 `dynamic "route_rules"` 블록을 넣고, `chuncheon_drg_id`와 `osaka_drg_id` 변수가 비어 있지 않을 때에만 DRG 경로를 생성하도록 했습니다. 두 변수의 기본값은 빈 문자열입니다. 따라서 `chuncheon_drg_id`와 `osaka_drg_id`를 `terraform.tfvars`에 넣지 않으면 plan이 이 경로를 제거합니다.
+
+```hcl
+# terraform.tfvars
+chuncheon_drg_id = "ocid1.drg.oc1.ap-chuncheon-1...."
+osaka_drg_id     = "ocid1.drg.oc1.ap-osaka-1...."
+```
+
+두 OCID는 OCI 콘솔의 Dynamic Routing Gateway 화면에서 조회하거나, `terraform plan` 및 `terraform apply -refresh-only` 출력에 표시된 `network_entity_id` 값에서 그대로 옮겨 적으면 됩니다. 값을 채운 뒤에 plan을 다시 실행하면 route table 세 개가 변경 목록에서 사라집니다.
+
+DRG와 RPC 자원 자체는 이번 작업에서 import하지 않았습니다. 두 자원은 계속 콘솔에서 수동으로 관리합니다. 따라서 콘솔에서 DRG를 다시 만들면 OCID가 바뀌고, 그때는 `terraform.tfvars`의 값도 함께 갱신해야 합니다.
+
 ### state 정리 후에 기대되는 plan
 
 VM5와 VM6를 state에서 제거한 뒤에도 plan이 `No changes.`를 보고하지 않을 수 있습니다. security list의 8000번과 8001번 포트 규칙을 `api_client_cidr`로 좁힌 변경이 아직 실제 자원에 반영되어 있지 않다면, 그 규칙이 in-place update로 남아 있게 됩니다. `preserve_boot_volume`을 `true`로 바꾼 변경도 같은 방식으로 세 건의 update로 표시됩니다.

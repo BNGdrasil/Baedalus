@@ -222,3 +222,22 @@ variable "api_client_cidr" {
   type        = string
   default     = "10.0.1.0/24"
 }
+
+# ========================================
+# 리전 간 DRG 연결 (NET-01)
+# ========================================
+# DRG와 RPC는 콘솔에서 수동 생성했으며 Terraform이 관리하지 않는다. 아래 두
+# 변수는 route table에 리전 간 경로를 유지하기 위한 참조값이다. 값을 비워 두면
+# plan이 운영 중인 리전 간 경로를 지운다(2026-09-19 확인).
+
+variable "chuncheon_drg_id" {
+  description = "수동 생성한 DRG의 OCID. 비우면 리전 간 route rule을 만들지 않는다"
+  type        = string
+  default     = ""
+}
+
+variable "osaka_drg_id" {
+  description = "수동 생성한 DRG의 OCID. 비우면 리전 간 route rule을 만들지 않는다"
+  type        = string
+  default     = ""
+}

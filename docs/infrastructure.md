@@ -45,6 +45,22 @@ VM5와 VM6는 운영자 설명상 삭제한 인스턴스이며, OCPU를 다른 �
 | 오사카 VCN | `10.1.0.0/16` | NAT Gateway만 둡니다. |
 | 오사카 private subnet | `10.1.2.0/24` | VM4와 퇴역한 VM5, VM6가 속합니다. |
 
+### 리전 간 연결
+
+춘천 VCN과 오사카 VCN은 DRG(Dynamic Routing Gateway)와 RPC(Remote Peering Connection)로 연결되어 있습니다. 두 자원은 OCI 콘솔에서 수동으로 만들었으며 Terraform이 관리하지 않습니다. 이 연결을 통해 VM2와 VM4가 통신하고 오프사이트 백업 경로가 동작합니다.
+
+route table에 들어가는 경로는 Terraform이 관리합니다. 다음 세 rule이 리전 간 통신을 담당합니다.
+
+| route table | 목적지 CIDR | next hop |
+|---|---|---|
+| `chuncheon_public_rt` | `10.1.0.0/16` (오사카 VCN) | 춘천 DRG |
+| `chuncheon_private_rt` | `10.1.0.0/16` (오사카 VCN) | 춘천 DRG |
+| `osaka_private_rt` | `10.0.0.0/16` (춘천 VCN) | 오사카 DRG |
+
+세 rule은 `chuncheon_drg_id`와 `osaka_drg_id` 변수 값을 next hop으로 사용하며, 변수가 비어 있으면 생성되지 않습니다. 두 변수를 `terraform.tfvars`에 채우지 않은 상태로 apply하면 실제로 동작하고 있는 리전 간 경로가 제거됩니다. 2026-09-19의 refresh 작업에서 이 위험을 확인했으며, 자세한 경위는 [Terraform 운용](terraform.md)에 적었습니다.
+
+DRG와 RPC 자체는 아직 import하지 않았습니다. 따라서 콘솔에서 DRG를 다시 만들면 OCID가 바뀌고, 그때는 두 변수 값도 함께 갱신해야 합니다.
+
 ## 보안 규칙 변수
 
 security list의 접근 범위를 두 변수로 조정합니다.
