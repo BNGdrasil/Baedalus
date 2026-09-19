@@ -14,12 +14,12 @@ Terraform 정의에는 VM1부터 VM6까지 여섯 대가 들어 있습니다. �
 | VM2 | 춘천 public | 10.0.1.60 | 운영 중입니다. Bidar, Bifrost, Wegis, Overlock, Redis, 관측 스택이 동작합니다. |
 | VM3 | 춘천 private | 10.0.2.134 | 운영 중입니다. 호스트 PostgreSQL 14와 호스트 mongod와 Redis 컨테이너가 있습니다. |
 | VM4 | 오사카 private | 10.1.2.111 | 미구성 예비 자원입니다. SSH로 접속은 되지만 Docker와 `/opt/bnbong`이 없습니다. |
-| VM5 | 오사카 private | state상 10.1.2.3 | 퇴역 이력이 있습니다. `enable_vm5` 기본값이 false입니다. |
-| VM6 | 오사카 private | state상 10.1.2.229 | 퇴역 이력이 있습니다. `enable_vm6` 기본값이 false입니다. |
+| VM5 | 오사카 private | 정리 전 state상 10.1.2.3 | 퇴역했습니다. `enable_vm5` 기본값이 false이며, 2026-09-19에 state에서도 정리했습니다. |
+| VM6 | 오사카 private | 정리 전 state상 10.1.2.229 | 퇴역했습니다. `enable_vm6` 기본값이 false이며, 2026-09-19에 state에서도 정리했습니다. |
 
 VM4는 replica나 재해 복구 자원으로 계산하지 않습니다. 빈 자원을 유지하는 비용과 복구 이점을 비교한 뒤에 유지 여부를 결정해야 합니다. `variables.tf`의 `vm_configs`에는 VM4의 display name이 `vm4-monitoring`으로 적혀 있지만, 실제 관측 스택은 VM2에서 동작합니다.
 
-VM5와 VM6는 운영자 설명상 삭제한 인스턴스이며, OCPU를 다른 인스턴스로 합쳤다고 합니다. 다만 로컬 `terraform.tfstate`에는 두 인스턴스가 여전히 `RUNNING` 상태로 남아 있습니다. state와 실제 OCI 자원이 어긋나 있으므로, 실제 자원을 조회해 state와 맞추기 전에는 apply하지 않습니다. 정리 절차는 [Terraform 운용](terraform.md)에 적었습니다.
+VM5와 VM6는 운영자 설명상 삭제한 인스턴스이며, OCPU를 다른 인스턴스로 합쳤다고 합니다. 로컬 `terraform.tfstate`에는 한동안 두 인스턴스가 `RUNNING` 상태로 남아 있어서 state와 실제 OCI 자원이 어긋나 있었습니다. 2026-09-19에 `terraform plan -refresh-only`로 두 인스턴스가 OCI에 실제로 존재하지 않음(`has been deleted`)을 확인했고, 이어서 `terraform apply -refresh-only`로 state를 갱신해 두 인스턴스를 state에서도 제거했습니다. 이제 `terraform state list`에는 VM1부터 VM4까지 네 개의 인스턴스만 남아 있습니다. 정리 절차는 [Terraform 운용](terraform.md)에 적었습니다.
 
 ### 인스턴스 교체 방지 설정
 
@@ -57,7 +57,7 @@ route table에 들어가는 경로는 Terraform이 관리합니다. 다음 세 r
 | `chuncheon_private_rt` | `10.1.0.0/16` (오사카 VCN) | 춘천 DRG |
 | `osaka_private_rt` | `10.0.0.0/16` (춘천 VCN) | 오사카 DRG |
 
-세 rule은 `chuncheon_drg_id`와 `osaka_drg_id` 변수 값을 next hop으로 사용하며, 변수가 비어 있으면 생성되지 않습니다. 두 변수를 `terraform.tfvars`에 채우지 않은 상태로 apply하면 실제로 동작하고 있는 리전 간 경로가 제거됩니다. 2026-09-19의 refresh 작업에서 이 위험을 확인했으며, 자세한 경위는 [Terraform 운용](terraform.md)에 적었습니다.
+세 rule은 `chuncheon_drg_id`와 `osaka_drg_id` 변수 값을 next hop으로 사용하며, 변수가 비어 있으면 생성되지 않습니다. 두 변수를 `terraform.tfvars`에 채우지 않은 상태로 apply하면 실제로 동작하고 있는 리전 간 경로가 제거됩니다. 2026-09-19의 refresh 작업에서 이 위험을 확인했고, 같은 날 두 변수에 실제 DRG OCID를 채운 뒤 apply해서 해소했습니다. 자세한 경위는 [Terraform 운용](terraform.md)에 적었습니다.
 
 DRG와 RPC 자체는 아직 import하지 않았습니다. 따라서 콘솔에서 DRG를 다시 만들면 OCID가 바뀌고, 그때는 두 변수 값도 함께 갱신해야 합니다.
 
