@@ -1,8 +1,15 @@
 # 최소 alert rule 모음
 #
-# 통지 경로는 Grafana alerting이다. Alertmanager는 이번 범위에서 도입하지 않았으며,
-# receiver가 비어 있는 상태로 두면 경보가 아무 곳에도 도달하지 않기 때문이다.
-# Grafana에서 이 규칙들의 상태를 조회해 통지 규칙을 연결한다.
+# 규칙의 단일 출처는 이 파일이다. Grafana의 contact point는 Grafana가 직접
+# 관리하는 규칙만 통지하고 Prometheus의 rule_files 규칙은 통지하지 못하므로,
+# 규칙을 이 파일 하나에 모아 두려면 통지는 Alertmanager가 맡아야 한다.
+#
+# 그래서 Alertmanager 설정(monitoring/alertmanager/alertmanager.yml)과 compose
+# 서비스를 미리 준비해 두되, Discord webhook URL을 아직 발급받지 않았으므로
+# `profiles: ["alerting"]`으로 기본 기동에서 제외했다. "receiver가 비어 있는
+# Alertmanager를 두지 않는다"는 기존 결정은 그대로 유지된다. 도달하지 못하는
+# 통지 경로가 켜져 있는 시점이 없기 때문이다.
+# 활성화 절차는 monitoring/README.md의 "통지 경로" 항목에 있다.
 #
 # job label의 출처
 #   prometheus.yml의 msa-services job이 file_sd의 service label을 `msa-<service>`
@@ -142,6 +149,255 @@ groups:
           summary: '{{ $labels.instance }}의 백업 파티션 여유 공간이 10GiB 미만이다'
           description: '여유 공간이 {{ $value | humanize1024 }}B까지 줄었다. 백업 스크립트는 여유가 부족하면 덤프를 시작하지 않고 실패한다.'
           action: 'du -sh /var/backups/bngdrasil/* 로 어느 구성 요소가 공간을 차지하는지 확인한다. 미전송 백업이 원인이면 전송 경로를 먼저 복구하고, 그렇지 않으면 RETENTION_DAILY 값을 조정한 뒤 sudo /opt/bngdrasil-backup/retention.sh --dry-run 으로 삭제 대상을 확인한다.'
+
+  - name: basic-blackbox
+    interval: 30s
+    rules:
+      # blackbox exporter의 HTTP probe 결과다. probe_success는 up과 다른
+      # 지표이므로 TargetDown 규칙으로는 probe 실패를 잡을 수 없다.
+      #
+      # 이 그룹은 두 job을 본다. OriginEndpointDown과 두 인증서 규칙은
+      # job="blackbox-http-origin"을, GatewayNotReady와 InternalEndpointDown은
+      # job="blackbox-http-internal"을 본다. 앞의 job은 VM2에서 VM1(10.0.1.133)에
+      # 직접 붙고 Host 헤더와 SNI만 공개 도메인으로 맞춘 probe이고, 뒤의 job은
+      # api-network 안의 컨테이너에 곧바로 붙는 probe다.
+      #
+      # Cloudflare를 거치는 job="blackbox-http-external"에는 어떤 경보도 붙이지
+      # 않는다. Cloudflare가 요청을 봇으로 판단하면 챌린지 403을 돌려주고, 그것은
+      # 오리진이 멀쩡한데도 probe_success가 0이 된다는 뜻이다. 2026-09-19에 GitHub
+      # 러너가 실제로 그 403을 받았다. 그 job의 시계열은 대시보드에서 두 경로의
+      # 결과를 비교하는 용도로만 쓰며, 경보 연결 여부는 VM2에서 실제 결과를 얼마간
+      # 모아 본 뒤에 다시 판단한다.
+      #
+      # 이 probe는 VM2 안에서 실행된다. 따라서 VM2 자체가 죽으면 probe도 함께
+      # 멈추고 이 규칙은 울리지 않는다. VM2 장애는 VM2 밖의 독립된 probe로만
+      # 감지할 수 있으며, 그 구성은 아직 남은 과제다.
+      - alert: OriginEndpointDown
+        expr: probe_success{job="blackbox-http-origin"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: '오리진 endpoint {{ $labels.instance }}가 5분 넘게 2xx를 돌려주지 않는다'
+          description: 'VM1 Nginx와 그 뒤의 VM2 애플리케이션 가운데 어디에서 끊겼는지 확인한다. instance는 표시용 공개 URL이며 probe는 Cloudflare를 거치지 않고 10.0.1.133에 직접 붙는다.'
+          action: 'VM2에서 sudo docker compose -f docker-compose.monitoring.yml exec blackbox-exporter wget -qO- "http://localhost:9115/probe?module=http_2xx_origin&target=https://10.0.1.133<경로>&hostname=<도메인>&debug=true" 를 실행해 실패 단계를 읽는다. 경로와 도메인은 instance의 것을 그대로 쓴다. 내부 probe가 정상이면 VM1 Nginx를 확인한다.'
+
+      # Bifrost의 /ready는 DB 연결과 서비스 등록부를 함께 확인하고, 준비되지
+      # 않으면 503을 돌려준다. 컨테이너가 살아 있어도 프록시가 동작하지 못하는
+      # 상태를 이 규칙이 잡는다.
+      - alert: GatewayNotReady
+        expr: probe_success{job="blackbox-http-internal",instance="http://gateway:8000/ready"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          service: gateway
+        annotations:
+          summary: 'Bifrost 게이트웨이의 /ready가 3분 넘게 준비 상태를 보고하지 않는다'
+          description: '컨테이너가 실행 중이어도 DB 연결이나 서비스 등록부가 준비되지 않으면 프록시가 동작하지 못한다.'
+          action: 'sudo docker logs vm2-gateway --tail 200 으로 원인을 확인하고, VM3 PostgreSQL 접속과 services 테이블을 점검한다.'
+
+      # 내부 probe 가운데 gateway readiness 말고 나머지를 한 규칙으로 묶는다.
+      # 두 규칙의 조건이 겹치면 같은 장애로 경보가 두 번 오므로 instance로 나눈다.
+      - alert: InternalEndpointDown
+        expr: probe_success{job="blackbox-http-internal",instance!="http://gateway:8000/ready"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: '내부 endpoint {{ $labels.instance }}가 5분 넘게 2xx를 돌려주지 않는다'
+          description: '해당 컨테이너의 상태와 api-network 연결을 확인한다.'
+
+      # 인증서 만료는 갱신할 시간이 필요하므로 두 단계로 나눈다. 21일은 갱신
+      # 일정을 잡을 여유이고, 7일은 즉시 대응해야 하는 시점이다. warning 쪽의
+      # 조건에 하한을 붙여서 두 단계가 동시에 울리지 않게 했다.
+      #
+      # 두 규칙 모두 job="blackbox-http-origin"으로 대상을 한정한다.
+      #
+      # 이 지표는 이제 VM1이 들고 있는 origin 인증서(/etc/ssl/cloudflare/cert.pem)의
+      # 만료 시각이다. probe가 Cloudflare를 거치지 않고 VM1에 직접 붙기 때문이다.
+      # 갱신 주체도 Cloudflare 자동 갱신이 아니라 사람이며, Origin CA 인증서는
+      # 발급할 때 정한 기간(기본 15년)이 지나면 새로 발급해 VM1에 올려야 한다.
+      #
+      # job selector가 없으면 Cloudflare 경유 job의 edge 인증서 만료까지 함께
+      # 걸린다. edge 인증서는 Cloudflare가 자동으로 갱신하므로 우리가 대응할 일이
+      # 없고, 갱신 직전 구간마다 손댈 수 없는 경보가 울린다.
+      - alert: TLSCertExpiringSoon
+        expr: |
+          (probe_ssl_earliest_cert_expiry{job="blackbox-http-origin"} - time()) < 21 * 24 * 3600
+          and
+          (probe_ssl_earliest_cert_expiry{job="blackbox-http-origin"} - time()) >= 7 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.instance }}의 origin TLS 인증서가 21일 안에 만료된다'
+          description: '남은 기간은 {{ $value | humanizeDuration }}이다. VM1이 들고 있는 Cloudflare Origin CA 인증서의 만료 시각이다.'
+          action: 'Cloudflare 대시보드의 SSL/TLS > Origin Server에서 origin 인증서를 다시 발급하고, VM1의 /etc/ssl/cloudflare/cert.pem과 key.pem을 교체한 뒤 nginx -s reload 한다.'
+
+      - alert: TLSCertExpiringCritical
+        expr: (probe_ssl_earliest_cert_expiry{job="blackbox-http-origin"} - time()) < 7 * 24 * 3600
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.instance }}의 origin TLS 인증서가 7일 안에 만료된다'
+          description: '남은 기간은 {{ $value | humanizeDuration }}이다. 만료되면 Cloudflare가 오리진에 접속하지 못해 해당 도메인이 전부 실패한다.'
+          action: 'TLSCertExpiringSoon과 같은 절차를 즉시 수행한다.'
+
+  - name: basic-containers
+    interval: 30s
+    rules:
+      # cAdvisor에는 재시작 횟수를 직접 세는 지표가 없다.
+      #
+      # 이전 판은 container_start_time_seconds 값이 재시작마다 바뀐다고 보고
+      # changes()로 세었으나, 실제로 측정해 보니 그 값은 바뀌지 않는다.
+      # gcr.io/cadvisor/cadvisor:v0.52.1로 더미 컨테이너를 다섯 번 restart하는
+      # 동안 docker inspect의 StartedAt은 매번 앞으로 갔지만 이 지표는 최초
+      # 생성 시각에 고정되어 있었고, changes(...[15m])은 0이었다.
+      #
+      # 대신 컨테이너를 다시 시작하면 cgroup이 새로 만들어지면서 누적 카운터가
+      # 0으로 돌아간다. 같은 시험에서 resets(container_cpu_usage_seconds_total[15m])은
+      # 실제 재시작 횟수와 같은 5를 돌려주었다. 그래서 이 카운터의 reset 횟수로
+      # 재시작 반복을 판단한다. 15분 동안 3번을 넘으면 restart 정책이 계속 실패를
+      # 되돌리고 있다는 뜻이다.
+      #
+      # 한계: 기동하자마자 죽는 컨테이너는 cAdvisor의 housekeeping 주기(운영 설정은
+      # 30s) 안에 한 번도 표본이 잡히지 않아 시계열 자체가 만들어지지 않는다. 같은
+      # 시험에서 즉시 종료하는 crash loop 컨테이너는 어떤 cAdvisor 시계열도 남기지
+      # 않았다. 그 구간은 이 규칙으로 볼 수 없고, scrape 대상인 서비스라면
+      # TargetDown이 대신 잡는다.
+      - alert: ContainerRestartLoop
+        expr: resets(container_cpu_usage_seconds_total{name!=""}[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: '컨테이너 {{ $labels.name }}이 15분 동안 세 번 넘게 다시 시작되었다'
+          description: 'restart 정책이 실패를 계속 되돌리고 있으므로, 컨테이너 목록만 보아서는 정상으로 보인다.'
+          action: 'sudo docker logs {{ $labels.name }} --tail 200 으로 기동 실패 원인을 확인한다. 환경 변수 누락과 의존 서비스 연결을 먼저 본다.'
+
+      # 메모리 한도를 지정하지 않은 컨테이너는 container_spec_memory_limit_bytes가
+      # 0으로 나오므로 분모 조건으로 걸러 낸다. 현재 VM2의 컨테이너에는 한도가
+      # 지정되어 있지 않아서, 한도를 붙이기 전까지 이 규칙은 평가 결과가 비어 있다.
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          container_memory_working_set_bytes{name!=""}
+            /
+          container_spec_memory_limit_bytes{name!=""}
+            > 0.90
+          and container_spec_memory_limit_bytes{name!=""} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '컨테이너 {{ $labels.name }}의 메모리 사용량이 한도의 90%를 넘었다'
+          description: '이 상태가 이어지면 커널이 컨테이너를 OOM으로 종료한다.'
+          action: 'sudo docker stats --no-stream 으로 현재 사용량을 확인하고, 누수인지 정상적인 증가인지 판단한 뒤 한도를 조정하거나 애플리케이션을 고친다.'
+
+  - name: basic-remote-exporters
+    interval: 30s
+    rules:
+      # VM1과 VM3의 원격 exporter가 대상에 접속하지 못하는 상태를 잡는다.
+      #
+      # up과 무엇이 다른가
+      #   up은 Prometheus가 exporter의 /metrics를 긁는 데 성공했는지만 말해 준다.
+      #   exporter는 떠 있는데 그 뒤의 PostgreSQL이나 nginx stub_status에 접속하지
+      #   못하는 상황에서는 up이 1이고 pg_up 또는 nginx_up이 0이 된다. 그 구간을
+      #   TargetDown으로는 볼 수 없으므로 규칙을 따로 둔다.
+      #
+      # 지표 이름은 고정한 exporter 버전에서 실제로 노출하는 것만 사용한다.
+      # postgres_exporter 0.20.1은 pg_up을, nginx-prometheus-exporter 1.5.3은
+      # nginx_up을 내보낸다.
+      #
+      # exporter를 설치하기 전에는 두 시계열이 아예 없으므로 이 규칙은 평가
+      # 결과가 비어 있고 발화하지 않는다. 따라서 수집이 끊긴 것과 아직 설치하지
+      # 않은 것을 이 규칙으로 구분할 수 없으며, 수집 여부 자체는 target 상태로
+      # 확인한다.
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: postgres
+        annotations:
+          summary: 'VM3 PostgreSQL exporter가 5분 넘게 데이터베이스에 접속하지 못한다'
+          description: 'exporter 프로세스는 살아 있으나 접속에 실패하고 있다. 데이터베이스 중단이거나 인증 정보가 어긋난 상태다. 이 경보는 5432번 포트의 17 클러스터만 대상으로 한다.'
+          action: 'VM3에서 journalctl -u bngdrasil-postgres-exporter -n 50 으로 접속 오류를 확인하고, systemctl status postgresql 과 /etc/bngdrasil-exporters/postgres-exporter.env 의 접속 문자열을 점검한다.'
+
+      - alert: NginxDown
+        expr: nginx_up == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: nginx
+        annotations:
+          summary: 'VM1 nginx exporter가 5분 넘게 stub_status를 읽지 못한다'
+          description: 'nginx가 중단되었거나 stub_status endpoint가 닫힌 상태다. 앞의 경우라면 공개 도메인 접속이 전부 실패한다.'
+          action: 'VM1에서 curl -s http://127.0.0.1:8080/stub_status 로 endpoint를 확인하고, journalctl -u bngdrasil-nginx-exporter -n 50 으로 exporter 쪽 오류를 읽는다.'
+
+  - name: basic-logging
+    interval: 30s
+    rules:
+      # 로그 수집기(Grafana Alloy)가 Loki로 로그를 밀어 넣지 못하는 상태를 잡는다.
+      #
+      # Alloy 프로세스 자체가 죽거나 컨테이너가 사라진 경우는 여기에 규칙을 따로
+      # 두지 않는다. prometheus.yml에 alloy job을 추가했으므로 basic-availability의
+      # TargetDown이 up{job="alloy"} == 0으로 그 상태를 이미 잡는다. 같은 장애로
+      # 두 경보가 함께 울리면 통지가 중복되므로 규칙을 겹쳐 두지 않는다.
+      #
+      # 아래 두 규칙이 보는 구간은 TargetDown과 다르다. Alloy는 살아 있고
+      # /metrics도 정상으로 돌려주지만 Loki 쪽 밀어넣기만 실패하는 상태이며,
+      # 그 구간에서는 up이 계속 1이다.
+      #
+      # 지표 이름은 grafana/alloy:v1.19.2를 실제로 띄워서 /metrics에 나오는 것만
+      # 사용했다. Promtail의 promtail_* 지표와는 이름이 전혀 다르므로 옛 이름을
+      # 그대로 옮겨 적으면 조용히 빈 결과가 나온다.
+      #   loki_write_dropped_entries_total{component_id, host, reason, tenant}
+      #   loki_write_request_duration_seconds_count{component_id, host, status_code, tenant}
+      - alert: LogShippingDropping
+        # 재시도를 모두 소진하고 버린 로그 줄이다. 이 값이 늘어나는 동안의 로그는
+        # 영구히 사라지므로 warning이 아니라 critical로 둔다.
+        #
+        # reason label을 남기는 이유는 첫 대응이 갈리기 때문이다.
+        # rate_limited와 stream_limited는 Loki의 limits_config를 올려야 하고,
+        # ingester_error는 Loki가 요청을 거절한 경우다. loki-config.yml이
+        # reject_old_samples를 켜 두었으므로, 수집기를 바꾸면서 오래된 로그를
+        # 다시 읽어 보내면 그 거절이 ingester_error로 여기에 나타난다.
+        #
+        # rate와 for를 함께 쓰지 않는다. 이전 판은 rate(...[10m]) > 0에 for: 15m을
+        # 붙였는데, 그러면 한 번에 크게 버리고 멈추는 유실은 영영 발화하지 않는다.
+        # rate의 10분 창이 지나가면 식이 0으로 돌아가서 for의 15분을 채울 수 없기
+        # 때문이다. 유실은 한 번이라도 잡아야 하므로 increase로 바꾸고 for를 없앤다.
+        # 이 형태는 한 번 늘어난 뒤 멈추어도 창이 지나갈 때까지 10분 동안 발화한다.
+        expr: sum by (reason) (increase(loki_write_dropped_entries_total{job="alloy"}[10m])) > 0
+        labels:
+          severity: critical
+          service: alloy
+        annotations:
+          summary: 'Alloy가 Loki로 보내지 못한 로그를 버리고 있다 (reason={{ $labels.reason }})'
+          description: '최근 10분 안에 재시도를 모두 소진한 뒤 버린 로그 줄이 있다. 이 구간의 로그는 Loki에 남지 않는다.'
+          action: 'sudo docker logs vm2-alloy --tail 100 으로 오류를 읽고, reason이 rate_limited나 stream_limited이면 monitoring/loki/loki-config.yml의 limits_config를, ingester_error이면 Loki 쪽 로그를 확인한다.'
+
+      - alert: LogShippingWriteFailing
+        # 버리기 전 단계다. Loki가 2xx가 아닌 응답을 돌려주는 동안에는 Alloy가
+        # 재시도하므로 아직 유실은 없지만, 그대로 두면 위의 규칙으로 넘어간다.
+        # 정상 구간에서는 status_code가 204뿐이므로 이 식은 0이다.
+        #
+        # 위의 규칙과 같은 이유로 rate 대신 increase를 쓴다. 이전 판의
+        # rate(...[10m]) > 0 에 for: 15m 조합은 15분보다 짧은 실패 구간을 통째로
+        # 놓쳤다. 다만 이쪽은 아직 유실이 없는 앞 단계이므로 for를 완전히 없애지는
+        # 않고 5분을 둔다. increase의 창이 10분이라 한 번의 실패 묶음도 5분 뒤에는
+        # 반드시 드러나며, 그만큼 첫 통지가 늦어지는 대신 짧은 흔들림이 곧바로
+        # 통지로 이어지지는 않는다.
+        expr: sum by (status_code) (increase(loki_write_request_duration_seconds_count{job="alloy",status_code!~"2.."}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: alloy
+        annotations:
+          summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code={{ $labels.status_code }})'
+          description: '최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 아직 재시도 중이라 유실은 없지만, 재시도가 소진되면 LogShippingDropping으로 이어진다.'
+          action: 'curl -s http://127.0.0.1:3100/ready 로 Loki 상태를 먼저 보고, sudo docker logs vm2-loki --tail 100 으로 거절 사유를 확인한다.'
 
   - name: basic-capacity
     interval: 30s

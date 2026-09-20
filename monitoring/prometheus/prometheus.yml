@@ -5,14 +5,41 @@ global:
     cluster: 'chuncheon-main'
     environment: 'production'
 
-# OBS-02: alert rule 파일을 연결한다. 통지는 Alertmanager 대신 Grafana alerting을
-# 사용하므로 이 규칙은 Grafana가 조회하는 Prometheus 경보 상태로만 노출된다.
+# OBS-02: alert rule 파일을 연결한다. 규칙의 단일 출처는 이 디렉터리다.
 rule_files:
   - '/etc/prometheus/rules/*.yml'
 
+# 통지 경로. 아래 블록은 의도적으로 주석 처리한 상태로 둔다.
+#
+# Grafana의 contact point는 Grafana가 직접 관리하는 규칙만 통지하며,
+# Prometheus가 rule_files에서 평가하는 규칙은 통지하지 못한다. 규칙을
+# basic.yml 한 곳에서만 관리하려면 통지도 Alertmanager가 맡아야 한다.
+#
+# 다만 Discord webhook URL을 아직 발급받지 않았으므로, 실제로 도달하지 못하는
+# 통지 경로를 켜 두지 않는다. 아래 세 가지를 순서대로 수행해야 통지가 살아난다.
+#   1. /opt/bnbong/secrets/discord-webhook-url 파일에 webhook URL을 적고
+#      소유자를 65534:65534, 권한을 600으로 둔다. Alertmanager 컨테이너가
+#      uid 65534로 실행되므로 root 소유로 두면 통지 시점에 읽지 못한다.
+#   2. docker compose --profile alerting up -d alertmanager 로 Alertmanager를 띄운다.
+#   3. 아래 alerting 블록의 주석을 풀고 Prometheus를 다시 읽힌다.
+# 자세한 절차와 확인 방법은 monitoring/README.md의 "통지 경로" 항목에 있다.
+#
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
 scrape_configs:
-  # VM1 (Frontend). 2026-09-18 기준 VM1의 node-exporter 컨테이너는 exited 상태다.
-  # 이 target은 exporter를 다시 띄우기 전까지 down으로 남는다.
+  # VM1 (Frontend). 2026-09-20 실사 기준으로 VM1의 node-exporter는 docker run으로
+  # 띄운 prom/node-exporter:v1.9.1 컨테이너이며, host network로 *:9100에 붙어
+  # 정상 수집된다. 2026-09-18에 exited였던 상태는 그 뒤에 해소되었다.
+  #
+  # compose로 관리하지 않는 수동 컨테이너이므로 호스트를 다시 부팅하거나 사람이
+  # 손으로 지우면 그대로 사라진다. systemd 유닛으로 옮기는 일은 남은 과제이며
+  # 절차는 monitoring/remote-exporters/README.md에 있다.
+  #
+  # 이 job은 배포 워크플로의 REQUIRED_JOBS에 넣지 않는다. 판단 근거는
+  # .github/workflows/deploy-monitoring.yml의 그 변수 주석에 적어 두었다.
   - job_name: 'vm1-node'
     static_configs:
       - targets: ['10.0.1.133:9100']
@@ -37,12 +64,33 @@ scrape_configs:
         refresh_interval: 30s
     metrics_path: '/metrics'
     relabel_configs:
-      # service 라벨 유지
+      # file_sd 파일의 service label을 job label로 옮긴다.
       - source_labels: [service]
         target_label: job
         replacement: 'msa-${1}'
 
-  # VM3 (Database). VM3의 node-exporter 컨테이너도 현재 exited 상태다.
+      # 옮긴 뒤에 target label 쪽 service를 지운다.
+      #
+      # 지우지 않으면 Bifrost가 내보내는 http_requests_total의 service label과
+      # 충돌한다. honor_labels가 기본 false이므로 충돌이 나면 Prometheus는 target
+      # label을 남기고 metric 쪽 label을 exported_service로 밀어낸다. 그 결과 모든
+      # 시계열의 service가 파일 이름에서 온 값(gateway) 하나로 뭉개지고,
+      # rules/basic.yml의 GatewayUpstreamHighServerErrorRate처럼 by (service)로
+      # 나누는 규칙과 gateway.json, overview.json의 service 변수가 upstream을
+      # 구분하지 못한다. 실제로 재현해서 확인한 내용이다.
+      #
+      # honor_labels: true를 쓰지 않는 이유는 그 설정이 service만이 아니라 job과
+      # instance까지 metric 쪽 값으로 덮게 만들어 다른 충돌을 새로 만들기 때문이다.
+      #
+      # regex를 service로 정확히 지정한다. labeldrop은 target relabel 단계에서도
+      # __address__ 같은 내부 label을 대상으로 삼으므로, 넓은 정규식을 쓰면
+      # 수집 주소 자체가 사라진다.
+      - regex: service
+        action: labeldrop
+
+  # VM3 (Database). VM3의 node-exporter도 vm1-node와 같은 방식으로 돌고 있으며,
+  # 2026-09-20 실사에서 두 target 모두 정상 수집되는 것을 확인했다. 위의
+  # vm1-node 주석에 적은 내용이 그대로 적용된다.
   - job_name: 'vm3-node'
     static_configs:
       - targets: ['10.0.2.134:9100']
@@ -59,3 +107,201 @@ scrape_configs:
   - job_name: 'grafana'
     static_configs:
       - targets: ['grafana:3000']
+
+  # cAdvisor (컨테이너 단위 자원 사용량)
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+        labels:
+          instance: 'vm2'
+
+  # Grafana Alloy (로그 수집기) 자신의 지표.
+  # Promtail에는 지표를 긁는 job이 없어서 로그 전송이 막혀도 드러나지 않았다.
+  # Alloy는 12345번 포트에 /metrics를 노출하지만 compose가 그 포트를 게시하지
+  # 않으므로, api-network 안의 Prometheus만 이 주소에 닿는다.
+  # basic-logging 규칙 두 개가 여기에서 오는 loki_write_* 지표를 본다.
+  - job_name: 'alloy'
+    static_configs:
+      - targets: ['alloy:12345']
+        labels:
+          instance: 'vm2'
+
+  # 오리진(VM1 Nginx) 직접 HTTP probe. 공개 endpoint 감시의 기준이 되는 job이며,
+  # basic.yml의 OriginEndpointDown과 TLS 인증서 경보가 이 job만 본다.
+  #
+  # 왜 공개 도메인이 아니라 사설 주소로 붙는가
+  #   공개 도메인으로 접속하면 Cloudflare edge를 거친다. Cloudflare는 요청을 봇으로
+  #   판단하면 챌린지 403을 돌려주며, 2026-09-19에 GitHub 러너가 실제로 그 403을
+  #   받은 적이 있다. 오리진이 멀쩡한데도 경보가 울리는 구성이므로, 감시 기준을
+  #   VM1에 직접 붙는 probe로 옮긴다. 인증서도 Cloudflare edge 것이 아니라 VM1이
+  #   들고 있는 origin 인증서를 보게 된다.
+  #
+  # 왜 Host와 SNI를 지정해야 하는가
+  #   VM1 Nginx에는 이름이 맞지 않는 요청을 444로 끊는 default server가 있고,
+  #   443 vhost가 server_name으로만 갈린다. 사설 주소로 그냥 붙으면 default
+  #   server에 걸려 연결이 끊기고, 인증서에도 IP SAN이 없어서 검증에 실패한다.
+  #   blackbox의 hostname 질의 인자가 Host 헤더와 TLS SNI를 함께 덮어 준다.
+  #
+  # relabel이 하는 일
+  #   static_configs에 적는 것은 사람이 읽을 공개 URL이다. 그 값을 instance label에
+  #   그대로 남겨 대시보드와 경보 본문에 표시되게 하고, 같은 값에서 도메인만 떼어
+  #   __param_hostname으로, 경로만 떼어 VM1 사설 주소에 붙여 __param_target으로
+  #   만든다. 즉 표시용 주소(instance)와 실제 접속 주소(__param_target)가 분리된다.
+  #
+  # 경로 선택
+  #   api.bnbong.com은 /를 쓰면 게이트웨이의 api rate limit zone에 걸리므로 예외로
+  #   둔 /health를 쓴다. monitoring.bnbong.com은 /가 Grafana의 로그인 화면으로
+  #   302를 돌려주는데, 오리진 probe는 redirect를 따라가지 않으므로(따라가면 공개
+  #   도메인으로 나가 다시 Cloudflare를 거친다) 인증 없이 200을 돌려주는
+  #   /api/health를 쓴다. 나머지 셋은 정적 index.html이라 /로 충분하다.
+  #
+  # 한계: 이 probe도 VM2 안에서 실행되므로 VM2 자체가 죽으면 함께 멈춘다. VM2
+  # 장애는 VM2 밖의 독립된 probe로만 감지할 수 있으며 그 구성은 아직 과제로 남았다.
+  - job_name: 'blackbox-http-origin'
+    metrics_path: '/probe'
+    params:
+      module: ['http_2xx_origin']
+    static_configs:
+      - targets:
+          - 'https://api.bnbong.com/health'
+          - 'https://bnbong.com/'
+          - 'https://admin.bnbong.com/'
+          - 'https://monitoring.bnbong.com/api/health'
+          - 'https://overlock.bnbong.com/'
+    relabel_configs:
+      # 표시용 공개 URL을 instance로 남긴다. 아래에서 __address__를 exporter
+      # 주소로 덮으므로 이 단계가 가장 먼저 와야 한다.
+      - source_labels: [__address__]
+        target_label: instance
+
+      # 공개 URL에서 도메인만 떼어 Host 헤더와 SNI로 넘긴다.
+      #
+      # 경로 부분을 (/.*)? 로 두어 선택으로 만든다. Prometheus의 relabel 정규식은
+      # 양끝이 고정되어 있어서 (/.*)로 두면 'https://bnbong.com' 처럼 트레일링
+      # 슬래시가 없는 주소가 아예 매칭되지 않는다. 매칭에 실패한 relabel 규칙은
+      # 오류를 내지 않고 조용히 건너뛰므로, __param_hostname과 __param_target이
+      # 비어 있는 채로 target이 만들어지고 probe가 계속 실패한다. 지금 targets에
+      # 그런 주소는 없지만 하나만 늘어나도 같은 일이 생긴다.
+      #
+      # 매칭되지 않은 선택 그룹의 replacement 값은 빈 문자열이다. 따라서
+      # 'https://bnbong.com' 은 hostname=bnbong.com, target=https://10.0.1.133 이
+      # 되어 의도한 대로 오리진의 루트를 찌른다.
+      - source_labels: [__address__]
+        regex: 'https://([^/]+)(/.*)?'
+        target_label: __param_hostname
+        replacement: '${1}'
+
+      # 실제 접속 주소는 VM1의 사설 주소다. 경로는 공개 URL의 것을 그대로 쓴다.
+      - source_labels: [__address__]
+        regex: 'https://([^/]+)(/.*)?'
+        target_label: __param_target
+        replacement: 'https://10.0.1.133${2}'
+
+      - target_label: __address__
+        replacement: 'blackbox-exporter:9115'
+
+  # 공개 도메인 HTTP probe(Cloudflare 경유).
+  # relabel 네 줄은 blackbox exporter의 표준 패턴이다. static_configs에 적은
+  # 주소를 __param_target으로 옮겨 /probe의 질의 인자로 만들고, instance label에
+  # 남긴 뒤, 실제 scrape 주소를 exporter로 바꾼다. 이 과정을 거치지 않으면
+  # Prometheus가 대상 URL 자체를 scrape하려고 한다.
+  #
+  # 이 job은 대시보드 표시용으로만 남긴다. 어떤 경보도 이 job의 시계열을 보지
+  # 않는다. Cloudflare가 봇으로 판단한 요청에 챌린지 403을 돌려주기 때문이며,
+  # 그 403을 장애로 오판한 전례가 있다(2026-09-19 GitHub 러너). 403을 성공 코드로
+  # 인정하는 대신 감시 기준을 오리진 probe로 옮겼다.
+  #
+  # 경로가 오리진 job과 다른 곳이 하나 있다. monitoring.bnbong.com은 여기서
+  # follow_redirects로 로그인 화면까지 따라가므로 /를 그대로 둔다.
+  #
+  # 남겨 두는 값: 이 job과 오리진 job의 결과가 갈리는 구간이 곧 Cloudflare 쪽
+  # 문제다. VM2에서 실제 결과를 얼마간 모아 본 뒤에 이 job을 경보에 연결할지,
+  # 예를 들어 두 job이 함께 실패할 때에만 울리는 규칙을 둘지 다시 판단한다.
+  - job_name: 'blackbox-http-external'
+    metrics_path: '/probe'
+    params:
+      module: ['http_2xx_tls']
+    static_configs:
+      - targets:
+          - 'https://api.bnbong.com/health'
+          - 'https://bnbong.com/'
+          - 'https://admin.bnbong.com/'
+          - 'https://monitoring.bnbong.com/'
+          - 'https://overlock.bnbong.com/'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 'blackbox-exporter:9115'
+
+  # 내부 endpoint HTTP probe.
+  # Bifrost의 /ready는 DB 연결과 서비스 등록부를 함께 확인하므로, /metrics만
+  # 수집해서는 알 수 없던 준비 상태가 probe_success로 드러난다.
+  - job_name: 'blackbox-http-internal'
+    metrics_path: '/probe'
+    params:
+      module: ['http_2xx']
+    static_configs:
+      - targets:
+          - 'http://gateway:8000/ready'
+          - 'http://auth-server:8001/health'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 'blackbox-exporter:9115'
+
+  # blackbox exporter 자신의 지표. probe 결과가 아니라 exporter 프로세스의 상태다.
+  - job_name: 'blackbox-exporter'
+    static_configs:
+      - targets: ['blackbox-exporter:9115']
+
+  # ------------------------------------------------------------------
+  # 원격 호스트 exporter. 설치 정의는 monitoring/remote-exporters/에 있다.
+  #
+  # static_configs가 아니라 file_sd를 쓰는 이유
+  #   두 exporter는 아직 VM1과 VM3에 설치되어 있지 않다. static_configs로 주소를
+  #   적어 두면 설치 전까지 target이 계속 down으로 남고 TargetDown 경보가 울린다.
+  #   울리는 경보가 하나 늘어나면 나머지 경보까지 함께 무시되므로, 설치가 끝난
+  #   뒤에 사람이 켜는 구조로 만든다. file_sd는 대상 파일이 없으면 target을
+  #   만들지 않고, 파일이 생기면 30초 안에 스스로 읽어 들인다. Prometheus를
+  #   재시작하지 않아도 된다.
+  #
+  # 대상 파일을 targets/remote/ 아래에 두는 이유
+  #   .github/workflows/deploy-monitoring.yml의 rsync는 --delete를 쓰면서
+  #   prometheus/targets/를 제외한다. 운영 중에 추가한 target이 배포 때 지워지지
+  #   않게 하려는 것이며, 그 제외는 하위 디렉터리에도 그대로 적용된다. 따라서
+  #   targets/remote/ 아래에 만든 파일은 배포를 반복해도 살아남는다.
+  #
+  #   같은 디렉터리의 msa-services job은 targets/*.json만 읽는다. file_sd의 *는
+  #   경로 구분자를 넘지 않으므로 targets/remote/*.json은 그 glob에 걸리지 않고,
+  #   두 job이 같은 대상을 두 번 수집하는 일도 생기지 않는다.
+  #
+  # 활성화 절차
+  #   저장소의 prometheus/targets-examples/ 아래에 예시 파일을 두었다. exporter를
+  #   설치한 뒤 VM2에서 그 파일을 targets/remote/로 복사하면 수집이 시작된다.
+  #   단계별 절차는 monitoring/README.md의 "원격 exporter 수집 활성화" 항목에 있다.
+  #
+  #   활성화하기 전까지는 promtool check config가 "file ... does not exist"
+  #   경고를 남긴다. 이 경고는 아직 켜지 않았다는 표시이며 검사 자체는 통과한다.
+  # ------------------------------------------------------------------
+
+  # VM1 Nginx. stub_status를 nginx-prometheus-exporter 1.5.3이 변환해 노출한다.
+  - job_name: 'vm1-nginx'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/targets/remote/vm1-nginx.json'
+        refresh_interval: 30s
+
+  # VM3 호스트 PostgreSQL. 컨테이너가 아니라 호스트 패키지로 동작하는 17 클러스터를
+  # postgres_exporter 0.20.1이 본다. 5433번 포트의 구 PG14 클러스터는 2026-11에
+  # 제거할 예정이므로 관측 대상에 넣지 않는다.
+  - job_name: 'vm3-postgres'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/targets/remote/vm3-postgres.json'
+        refresh_interval: 30s

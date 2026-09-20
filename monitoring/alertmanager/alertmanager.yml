@@ -1,0 +1,143 @@
+# Alertmanager 설정
+#
+# 운영 배치 위치: /opt/bnbong/monitoring/alertmanager/alertmanager.yml
+#
+# 이 설정은 준비만 해 둔 상태이며 기본 기동에서는 동작하지 않는다.
+# compose의 alertmanager 서비스에 `profiles: ["alerting"]`을 붙였기 때문이다.
+# Discord webhook URL을 아직 발급받지 않았으므로, 도달하지 못하는 통지 경로를
+# 켜 두지 않는다는 기존 결정을 그대로 지킨다.
+#
+# 통지를 Grafana가 아니라 Alertmanager가 맡는 이유
+#   Grafana의 contact point는 Grafana가 직접 관리하는 규칙만 통지하고,
+#   Prometheus가 rule_files에서 평가하는 규칙은 통지하지 못한다. 규칙의 단일
+#   출처를 prometheus/rules/basic.yml로 유지하려면 Alertmanager가 필요하다.
+#
+# 비밀 값은 이 파일에 적지 않는다. webhook URL은 저장소 밖인
+# /opt/bnbong/secrets/discord-webhook-url에 두고 컨테이너의
+# /run/secrets/discord_webhook_url로 읽기 전용 mount한다. 저장소를 VM2로
+# 전송하는 rsync의 대상 밖이므로 배포할 때 덮어써지지 않는다.
+#
+# 그 파일의 소유자는 65534:65534여야 하고 권한은 600이다. 컨테이너가 uid
+# 65534로 실행되기 때문이다. 소유자를 root로 두면 아래 webhook_url_file을 열지
+# 못하는데, Alertmanager는 설정을 읽을 때 이 파일을 확인하지 않으므로 기동은
+# 성공하고 경보가 발생한 뒤에야 permission denied로 통지를 버린다.
+#
+# 활성화 절차는 monitoring/README.md의 "통지 경로" 항목에 단계별로 적어 두었다.
+
+global:
+  # 경보가 해소된 뒤 Alertmanager가 스스로 resolved로 넘기기까지의 시간이다.
+  # Prometheus가 평가를 멈춰도 통지가 영원히 firing으로 남지 않게 한다.
+  resolve_timeout: 5m
+
+route:
+  # 기준이 되는 receiver다. severity가 critical이 아닌 경보는 모두 여기로 간다.
+  receiver: discord-warning
+  # 같은 경보 이름과 대상끼리 하나의 통지로 묶는다. instance까지 넣는 이유는,
+  # 여러 호스트에서 같은 이름의 경보가 났을 때 어느 호스트인지 통지에 남기기
+  # 위해서다. severity를 넣어야 아래 하위 route의 묶음과 어긋나지 않는다.
+  group_by: ['alertname', 'instance', 'severity']
+  # 첫 통지를 보내기 전에 같은 묶음의 경보를 모으는 시간이다.
+  group_wait: 30s
+  # 이미 통지한 묶음에 새 경보가 붙었을 때 다시 보내기까지 기다리는 시간이다.
+  group_interval: 5m
+  # 해소되지 않은 같은 경보를 다시 알리는 주기다. Discord 채널 하나로 받으므로
+  # 너무 짧으면 알림에 둔감해진다. warning은 하루에 두 번 정도로 둔다.
+  repeat_interval: 12h
+
+  routes:
+    # critical은 대응 시점이 빨라야 하므로 묶는 시간을 줄이고 재통지를 자주 한다.
+    - matchers:
+        - severity = "critical"
+      receiver: discord-critical
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 4h
+
+receivers:
+  # 두 receiver가 같은 webhook 파일을 읽는다. 채널을 나눌 계획이 서면 이 자리에
+  # 서로 다른 파일 경로를 지정하고 compose의 mount를 하나 더 추가한다.
+  - name: discord-warning
+    discord_configs:
+      - webhook_url_file: /run/secrets/discord_webhook_url
+        send_resolved: true
+
+  - name: discord-critical
+    discord_configs:
+      - webhook_url_file: /run/secrets/discord_webhook_url
+        send_resolved: true
+
+inhibit_rules:
+  # 억제 규칙을 쓰는 원칙
+  #   equal에 적는 label은 source 경보와 target 경보 양쪽에 모두, 같은 값으로
+  #   남아 있는 것이어야 한다. 한쪽에만 있는 label을 적으면 두 경보가 절대
+  #   같아지지 않아 억제가 영영 일어나지 않고, 규칙이 있는데도 통지는 두 번 간다.
+  #   특히 규칙식이 sum by(...)나 min by(...)로 묶여 있으면 묶음에 들어가지 않은
+  #   label은 결과에서 사라지므로, 원래 지표에 그 label이 있다는 것만 보고
+  #   equal에 적으면 안 된다.
+
+  # 같은 대상에서 critical이 이미 울리고 있으면 같은 이름의 warning은 보내지
+  # 않는다. alertname까지 맞추므로, 서로 다른 문제를 가리키는 경보가 조용히
+  # 묻히지는 않는다.
+  #
+  # 이 규칙은 그대로 둔다. 지금 prometheus/rules/basic.yml의 경보는 이름마다
+  # severity가 하나로 고정되어 있어 이 규칙이 실제로 맞물리는 쌍은 없지만,
+  # 뒤에 severity를 식으로 정하는 규칙이 들어오거나 다른 출처의 경보가 붙었을 때
+  # 기본 안전망이 된다. 반대로 여기서 alertname을 빼면 어떤 critical이든 같은
+  # 호스트의 관계없는 warning을 전부 묻어 버리므로 빼서는 안 된다. 이름이 다른
+  # 쌍은 아래에 쌍마다 따로 적는다.
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    equal: ['alertname', 'instance']
+
+  # 같은 파일시스템의 디스크 경보 두 단계를 묶는다.
+  # DiskSpaceCritical(5% 미만)이 울리는 동안 DiskSpaceLow(15% 미만)는 같은 사실을
+  # 낮은 심각도로 한 번 더 말하는 것뿐이다. 이름이 달라서 위의 일반 규칙으로는
+  # 묶이지 않으므로 쌍을 직접 지정한다.
+  #
+  # equal을 instance와 mountpoint로 두는 근거
+  #   두 규칙식 모두 node_filesystem_avail_bytes를 node_filesystem_size_bytes로
+  #   나누기만 하고 집계하지 않는다. 나눗셈은 양변의 label이 전부 같은 계열끼리만
+  #   짝지으므로 결과에는 instance, job, device, mountpoint, fstype이 그대로 남고,
+  #   두 경보는 같은 계열에서 나온 같은 label 묶음을 갖는다.
+  #   억제의 단위는 "어느 호스트의 어느 마운트"이므로 그 둘만 맞춘다. instance만
+  #   맞추면 한 마운트가 위험할 때 같은 호스트의 다른 마운트 경고까지 묻힌다.
+  - source_matchers:
+      - alertname = "DiskSpaceCritical"
+    target_matchers:
+      - alertname = "DiskSpaceLow"
+    equal: ['instance', 'mountpoint']
+
+  # 로그 전송 실패의 두 단계를 묶는다.
+  # LogShippingWriteFailing은 Loki가 2xx가 아닌 응답을 돌려주어 Alloy가 아직
+  # 재시도 중인 구간이고, LogShippingDropping은 재시도를 소진해 로그를 버리기
+  # 시작한 구간이다. 뒤 단계가 울리고 있으면 앞 단계는 같은 장애의 경과일 뿐이다.
+  #
+  # equal을 service로만 두는 근거
+  #   두 규칙식이 각각 sum by (reason)과 sum by (status_code)로 묶여 있어
+  #   instance와 job은 결과에서 사라졌고, 남는 label도 서로 다르다. 양쪽에 같은
+  #   값으로 남는 것은 규칙이 직접 붙이는 service="alloy"뿐이다.
+  #   basic.yml에서 service="alloy"를 붙이는 규칙은 이 두 개뿐이므로, 이 범위가
+  #   다른 경보까지 삼키지는 않는다.
+  - source_matchers:
+      - alertname = "LogShippingDropping"
+    target_matchers:
+      - alertname = "LogShippingWriteFailing"
+    equal: ['service']
+
+  # 백업 오프사이트 전송 실패와 그 결과로 쌓이는 미전송 백업을 묶는다.
+  # 전송에 성공하지 못한 백업은 보존 정책이 지우지 않으므로 쌓인다.
+  # BackupShipStale이 울리는 동안의 BackupUnshippedPileup은 원인이 아니라 증상이다.
+  #
+  # equal을 instance로만 두는 근거
+  #   두 규칙식 모두 집계하지 않아 instance, job, component가 남지만 component 값은
+  #   서로 다르다. BackupShipStale은 전송 단계만 보므로 component="ship"으로
+  #   고정되고, BackupUnshippedPileup의 component는 쌓인 백업의 구성 요소다.
+  #   component를 equal에 넣으면 값이 영원히 어긋나 억제가 일어나지 않는다.
+  #   백업과 전송은 호스트마다 독립해서 돌므로 억제 단위는 instance가 맞다.
+  - source_matchers:
+      - alertname = "BackupShipStale"
+    target_matchers:
+      - alertname = "BackupUnshippedPileup"
+    equal: ['instance']

@@ -1,0 +1,9 @@
+[
+  {
+    "targets": ["10.0.1.133:9113"],
+    "labels": {
+      "instance": "vm1",
+      "role": "frontend"
+    }
+  }
+]

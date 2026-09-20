@@ -1,0 +1,282 @@
+# promtool 단위 시험
+#
+# 실행 방법(저장소 루트의 monitoring/ 디렉터리에서)
+#   docker run --rm --entrypoint promtool \
+#     -v "$PWD/prometheus:/etc/prometheus:ro" prom/prometheus:v3.7.2 \
+#     test rules /etc/prometheus/tests/blackbox-and-containers.yml
+#
+# 이번에 추가한 blackbox probe 규칙과 컨테이너 규칙이 의도한 시점에 발화하는지
+# 확인한다. 기존 규칙은 이 파일의 대상이 아니다.
+#
+# rule_files 경로는 컨테이너 안의 절대 경로이며, 위 실행 방법의 mount 위치와 같다.
+
+rule_files:
+  - /etc/prometheus/rules/basic.yml
+
+evaluation_interval: 30s
+
+tests:
+  # 오리진 probe가 실패하는 상황이다.
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="blackbox-http-origin",instance="https://api.bnbong.com/health"}'
+        values: '0x30'
+    alert_rule_test:
+      # 4분 시점에는 for: 5m을 채우지 못했으므로 아직 발화하지 않는다.
+      - eval_time: 4m
+        alertname: OriginEndpointDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OriginEndpointDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: blackbox-http-origin
+              instance: https://api.bnbong.com/health
+            exp_annotations:
+              summary: '오리진 endpoint https://api.bnbong.com/health가 5분 넘게 2xx를 돌려주지 않는다'
+              description: 'VM1 Nginx와 그 뒤의 VM2 애플리케이션 가운데 어디에서 끊겼는지 확인한다. instance는 표시용 공개 URL이며 probe는 Cloudflare를 거치지 않고 10.0.1.133에 직접 붙는다.'
+              action: 'VM2에서 sudo docker compose -f docker-compose.monitoring.yml exec blackbox-exporter wget -qO- "http://localhost:9115/probe?module=http_2xx_origin&target=https://10.0.1.133<경로>&hostname=<도메인>&debug=true" 를 실행해 실패 단계를 읽는다. 경로와 도메인은 instance의 것을 그대로 쓴다. 내부 probe가 정상이면 VM1 Nginx를 확인한다.'
+
+  # 오리진 probe가 정상이면 발화하지 않는다.
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="blackbox-http-origin",instance="https://bnbong.com/"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OriginEndpointDown
+        exp_alerts: []
+
+  # Cloudflare 경유 job은 경보에 연결되어 있지 않다.
+  #
+  # Cloudflare가 챌린지 403을 돌려주면 오리진이 멀쩡해도 이 job의 probe_success는
+  # 0이 된다. 그 상황을 장애로 오판하지 않으려고 감시 기준을 오리진 job으로
+  # 옮겼으므로, 이 job의 probe_success가 계속 0이어도 어떤 경보도 울리지 않아야
+  # 한다. 같은 대상의 오리진 probe는 정상이라는 점을 함께 둔다.
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="blackbox-http-external",instance="https://api.bnbong.com/health"}'
+        values: '0x60'
+      - series: 'probe_success{job="blackbox-http-origin",instance="https://api.bnbong.com/health"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: OriginEndpointDown
+        exp_alerts: []
+      # 옛 이름이 남아 있으면 이 시험이 잡아낸다. 규칙이 없는 이름은 빈 결과가 된다.
+      - eval_time: 30m
+        alertname: ExternalEndpointDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: InternalEndpointDown
+        exp_alerts: []
+
+  # Bifrost의 /ready가 준비 상태를 보고하지 못하는 상황이다.
+  # 같은 job의 auth-server probe는 정상이므로 InternalEndpointDown은 울리지 않아야 한다.
+  # 두 규칙이 같은 장애로 겹쳐서 발화하지 않는다는 점을 함께 확인한다.
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="blackbox-http-internal",instance="http://gateway:8000/ready"}'
+        values: '0x30'
+      - series: 'probe_success{job="blackbox-http-internal",instance="http://auth-server:8001/health"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GatewayNotReady
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: GatewayNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: gateway
+              job: blackbox-http-internal
+              instance: http://gateway:8000/ready
+            exp_annotations:
+              summary: 'Bifrost 게이트웨이의 /ready가 3분 넘게 준비 상태를 보고하지 않는다'
+              description: '컨테이너가 실행 중이어도 DB 연결이나 서비스 등록부가 준비되지 않으면 프록시가 동작하지 못한다.'
+              action: 'sudo docker logs vm2-gateway --tail 200 으로 원인을 확인하고, VM3 PostgreSQL 접속과 services 테이블을 점검한다.'
+      - eval_time: 10m
+        alertname: InternalEndpointDown
+        exp_alerts: []
+
+  # gateway 이외의 내부 probe가 실패하는 상황이다.
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="blackbox-http-internal",instance="http://auth-server:8001/health"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: InternalEndpointDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: InternalEndpointDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: blackbox-http-internal
+              instance: http://auth-server:8001/health
+            exp_annotations:
+              summary: '내부 endpoint http://auth-server:8001/health가 5분 넘게 2xx를 돌려주지 않는다'
+              description: '해당 컨테이너의 상태와 api-network 연결을 확인한다.'
+
+  # 인증서 만료가 14일 남은 상황이다. warning만 발화하고 critical은 발화하지 않아야 한다.
+  # promtool의 시험 시계는 0초에서 시작하므로 time()은 eval_time과 같은 값이다.
+  # 따라서 만료 시각을 (2시간 + 14일)로 두면 2시간 시점에 남은 기간이 정확히 14일이 된다.
+  - interval: 1m
+    input_series:
+      # 7200 + 14 * 24 * 3600 = 1216800
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http-origin",instance="https://admin.bnbong.com/"}'
+        values: '1216800x180'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: TLSCertExpiringSoon
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: blackbox-http-origin
+              instance: https://admin.bnbong.com/
+            exp_annotations:
+              summary: 'https://admin.bnbong.com/의 origin TLS 인증서가 21일 안에 만료된다'
+              description: '남은 기간은 14d 0h 0m 0s이다. VM1이 들고 있는 Cloudflare Origin CA 인증서의 만료 시각이다.'
+              action: 'Cloudflare 대시보드의 SSL/TLS > Origin Server에서 origin 인증서를 다시 발급하고, VM1의 /etc/ssl/cloudflare/cert.pem과 key.pem을 교체한 뒤 nginx -s reload 한다.'
+      - eval_time: 2h
+        alertname: TLSCertExpiringCritical
+        exp_alerts: []
+
+  # 인증서 만료가 3일 남은 상황이다. critical만 발화하고, 조건에 하한을 두었으므로
+  # warning은 함께 울리지 않아야 한다.
+  - interval: 1m
+    input_series:
+      # 3600 + 3 * 24 * 3600 = 262800
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http-origin",instance="https://monitoring.bnbong.com/api/health"}'
+        values: '262800x180'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: TLSCertExpiringCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: blackbox-http-origin
+              instance: https://monitoring.bnbong.com/api/health
+            exp_annotations:
+              summary: 'https://monitoring.bnbong.com/api/health의 origin TLS 인증서가 7일 안에 만료된다'
+              description: '남은 기간은 3d 0h 0m 0s이다. 만료되면 Cloudflare가 오리진에 접속하지 못해 해당 도메인이 전부 실패한다.'
+              action: 'TLSCertExpiringSoon과 같은 절차를 즉시 수행한다.'
+      - eval_time: 1h
+        alertname: TLSCertExpiringSoon
+        exp_alerts: []
+
+  # 만료가 충분히 남았으면 어느 쪽도 발화하지 않는다.
+  - interval: 1m
+    input_series:
+      # 3600 + 60 * 24 * 3600 = 5187600
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http-origin",instance="https://bnbong.com/"}'
+        values: '5187600x180'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: TLSCertExpiringSoon
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: TLSCertExpiringCritical
+        exp_alerts: []
+
+  # TLS 경보는 오리진 job의 인증서만 본다.
+  #
+  # Cloudflare 경유 job이 보는 것은 edge 인증서이며, 그쪽은 Cloudflare가 자동으로
+  # 갱신하므로 우리가 손댈 일이 없다. job selector가 빠지면 갱신 직전 구간마다
+  # 대응할 수 없는 경보가 울리므로, edge 쪽 만료가 아무리 임박해도 조용해야 한다.
+  # 같은 시각에 오리진 쪽 인증서는 넉넉하다는 점을 함께 둔다.
+  - interval: 1m
+    input_series:
+      # edge 인증서는 1시간 뒤에 만료된다. 그래도 발화하지 않아야 한다.
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http-external",instance="https://bnbong.com/"}'
+        values: '3600x180'
+      # 같은 대상의 origin 인증서는 60일 남았다.
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http-origin",instance="https://bnbong.com/"}'
+        values: '5187600x180'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: TLSCertExpiringSoon
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: TLSCertExpiringCritical
+        exp_alerts: []
+
+  # 반대로 오리진 인증서가 임박하면, 같은 시각 edge 인증서가 넉넉해도 발화한다.
+  # 두 시계열이 섞여 있을 때 규칙이 오리진 쪽만 골라내는지 확인한다.
+  - interval: 1m
+    input_series:
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http-external",instance="https://overlock.bnbong.com/"}'
+        values: '5187600x180'
+      # 3600 + 3 * 24 * 3600 = 262800
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http-origin",instance="https://overlock.bnbong.com/"}'
+        values: '262800x180'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: TLSCertExpiringCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: blackbox-http-origin
+              instance: https://overlock.bnbong.com/
+            exp_annotations:
+              summary: 'https://overlock.bnbong.com/의 origin TLS 인증서가 7일 안에 만료된다'
+              description: '남은 기간은 3d 0h 0m 0s이다. 만료되면 Cloudflare가 오리진에 접속하지 못해 해당 도메인이 전부 실패한다.'
+              action: 'TLSCertExpiringSoon과 같은 절차를 즉시 수행한다.'
+      - eval_time: 1h
+        alertname: TLSCertExpiringSoon
+        exp_alerts: []
+
+  # 컨테이너가 계속 다시 시작되는 상황이다. cAdvisor에는 재시작 횟수 지표가 없고
+  # container_start_time_seconds는 재시작해도 바뀌지 않는다는 것을 실제로 측정해서
+  # 확인했으므로, 재시작마다 0으로 돌아가는 누적 CPU 카운터의 reset 횟수로 판단한다.
+  #
+  # vm2-gateway는 1분마다 값이 0으로 떨어졌다가 다시 오르는 모양이며 15분 창에서
+  # reset이 3보다 많다. vm2-loki는 단조 증가라서 reset이 0이다.
+  - interval: 1m
+    input_series:
+      - series: 'container_cpu_usage_seconds_total{name="vm2-gateway"}'
+        values: '10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10 0 10'
+      # 한 번도 다시 시작하지 않은 컨테이너는 발화 대상이 아니다.
+      - series: 'container_cpu_usage_seconds_total{name="vm2-loki"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ContainerRestartLoop
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              name: vm2-gateway
+            exp_annotations:
+              summary: '컨테이너 vm2-gateway이 15분 동안 세 번 넘게 다시 시작되었다'
+              description: 'restart 정책이 실패를 계속 되돌리고 있으므로, 컨테이너 목록만 보아서는 정상으로 보인다.'
+              action: 'sudo docker logs vm2-gateway --tail 200 으로 기동 실패 원인을 확인한다. 환경 변수 누락과 의존 서비스 연결을 먼저 본다.'
+
+  # 메모리 한도의 95%를 쓰는 컨테이너와, 한도를 지정하지 않아 0으로 보고되는
+  # 컨테이너를 함께 둔다. 뒤쪽은 0으로 나누는 자리이므로 반드시 걸러져야 한다.
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_working_set_bytes{name="vm2-gateway"}'
+        values: '950x30'
+      - series: 'container_spec_memory_limit_bytes{name="vm2-gateway"}'
+        values: '1000x30'
+      - series: 'container_memory_working_set_bytes{name="vm2-loki"}'
+        values: '950x30'
+      - series: 'container_spec_memory_limit_bytes{name="vm2-loki"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ContainerMemoryNearLimit
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ContainerMemoryNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              name: vm2-gateway
+            exp_annotations:
+              summary: '컨테이너 vm2-gateway의 메모리 사용량이 한도의 90%를 넘었다'
+              description: '이 상태가 이어지면 커널이 컨테이너를 OOM으로 종료한다.'
+              action: 'sudo docker stats --no-stream 으로 현재 사용량을 확인하고, 누수인지 정상적인 증가인지 판단한 뒤 한도를 조정하거나 애플리케이션을 고친다.'

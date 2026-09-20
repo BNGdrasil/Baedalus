@@ -1,0 +1,93 @@
+# blackbox exporter 모듈 정의
+#
+# 운영 배치 위치: /opt/bnbong/monitoring/blackbox/blackbox.yml
+# 컨테이너 안에서는 /etc/blackbox_exporter/config.yml로 읽힌다.
+#
+# 모듈을 셋으로 나눈 이유
+#   내부 probe는 api-network 안의 평문 HTTP이고, 외부 probe는 Cloudflare를 거친
+#   HTTPS다. 하나의 모듈로 묶으면 내부 target에도 TLS를 요구하게 되거나,
+#   반대로 외부 target의 인증서 검증을 건너뛰게 된다. 여기에 더해 오리진 probe는
+#   VM1에 직접 접속하면서 Cloudflare Origin CA로 검증해야 하므로, 신뢰 앵커가
+#   다른 세 번째 모듈이 필요하다.
+#
+# 어떤 모듈을 쓰든 probe 결과는 probe_success로 나오고, HTTPS probe에서만
+# probe_ssl_earliest_cert_expiry가 함께 나온다. basic.yml의 blackbox 규칙이
+# 이 두 지표를 사용한다.
+
+modules:
+  # 내부 컨테이너 endpoint용. 평문 HTTP이므로 TLS를 요구하지 않는다.
+  # valid_status_codes를 비워 두면 기본값인 2xx만 성공으로 본다. Bifrost의
+  # /ready는 DB 연결이나 서비스 등록부가 준비되지 않으면 503을 돌려주므로,
+  # 그 상황이 probe_success 0으로 그대로 드러난다.
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_http_versions: ['HTTP/1.1', 'HTTP/2.0']
+      follow_redirects: true
+      # 컨테이너 이름은 IPv4로만 해석되므로 IPv6 시도를 생략한다.
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+
+  # 공개 도메인용. HTTPS로 접속해야 인증서 만료 시각 지표가 나오므로
+  # fail_if_not_ssl로 평문 응답을 실패 처리한다. 인증서 검증은 켜 둔다.
+  # insecure_skip_verify를 true로 두면 만료된 인증서도 성공으로 보이며,
+  # 인증서 만료 규칙을 두는 목적과 어긋난다.
+  http_2xx_tls:
+    prober: http
+    timeout: 10s
+    http:
+      method: GET
+      valid_http_versions: ['HTTP/1.1', 'HTTP/2.0']
+      follow_redirects: true
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      fail_if_not_ssl: true
+      tls_config:
+        insecure_skip_verify: false
+
+  # 오리진(VM1 Nginx) 직접 probe용.
+  #
+  # 무엇이 다른가
+  #   http_2xx_tls는 공개 도메인으로 접속하므로 Cloudflare edge를 거친다. 이
+  #   모듈은 VM2에서 VM1의 사설 주소(10.0.1.133)로 곧장 붙고, Host 헤더와 TLS
+  #   SNI만 공개 도메인으로 맞춘다. 그 결과 Cloudflare가 봇 챌린지로 403을
+  #   돌려주는 상황에 휘둘리지 않고, 인증서도 VM1이 실제로 들고 있는 것을 본다.
+  #
+  # 다섯 vhost를 모듈 하나로 다루는 방법
+  #   /probe의 hostname 질의 인자를 쓴다. 이 인자는 Host 헤더와 TLS SNI를 함께
+  #   덮으므로 vhost마다 모듈을 복제하지 않아도 된다. prom/blackbox-exporter
+  #   v0.28.0에서 실제로 동작하는 것을 확인했다. 자체 CA로 서명한 인증서를 단
+  #   nginx를 띄우고, 이름이 맞지 않으면 444로 끊는 default server를 함께 두었을
+  #   때 hostname을 지정한 probe만 성공했다. 인자를 빼면 인증서에 IP SAN이 없어서
+  #   검증 단계에서 멈춘다. 값은 prometheus.yml의 relabel이 넣는다.
+  #
+  # 인증서 검증
+  #   VM1의 인증서는 Cloudflare Origin CA가 서명한 것이라 공인 신뢰 저장소로는
+  #   검증되지 않는다. insecure_skip_verify로 넘기면 만료된 인증서까지 성공으로
+  #   보이므로, 그 대신 해당 루트를 ca_file로 지정한다. ca_file을 지정하면 Go는
+  #   시스템 루트를 쓰지 않고 이 파일의 인증서만 신뢰하며, 그것이 여기서 원하는
+  #   동작이다. ca_file을 빼면 probe가 unknown authority로 실패하는 것도 같은
+  #   시험에서 확인했다.
+  #
+  # valid_status_codes를 비워 두어 기본값인 2xx만 성공으로 본다. 403을 성공
+  # 코드로 넣지 않는다. 챌린지 403을 성공으로 인정하면 이 모듈을 만든 이유가
+  # 사라진다. 403 응답이 probe_success 0으로 나오는 것도 확인했다.
+  http_2xx_origin:
+    prober: http
+    timeout: 10s
+    http:
+      method: GET
+      valid_http_versions: ['HTTP/1.1', 'HTTP/2.0']
+      # 오리진은 최종 응답을 직접 돌려준다. 여기서 redirect를 따라가면 Location이
+      # 가리키는 공개 도메인으로 나가면서 다시 Cloudflare를 거치게 되므로 끈다.
+      follow_redirects: false
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      fail_if_not_ssl: true
+      tls_config:
+        insecure_skip_verify: false
+        # 컨테이너 안의 경로다. docker-compose.monitoring.yml이 이 파일을
+        # /etc/blackbox_exporter/cloudflare-origin-ca.pem으로 mount해야 한다.
+        ca_file: /etc/blackbox_exporter/cloudflare-origin-ca.pem

@@ -1,0 +1,104 @@
+# promtool 단위 시험
+#
+# 실행 방법(저장소 루트의 monitoring/ 디렉터리에서)
+#   docker run --rm --entrypoint promtool \
+#     -v "$PWD/prometheus:/etc/prometheus:ro" prom/prometheus:v3.7.2 \
+#     test rules /etc/prometheus/tests/gateway-upstreams.yml
+#
+# GatewayUpstreamHighServerErrorRate가 업스트림을 실제로 구분해서 발화하는지
+# 확인한다.
+#
+# 아래 input_series의 service label은 Bifrost가 직접 내보내는 label이다
+# (bifrost/docs/observability.md). prometheus.yml의 msa-services job이 file_sd의
+# service label을 job으로 옮긴 뒤 target label 쪽 service를 지우기 때문에, 이
+# label이 그대로 남아 시계열이 업스트림별로 나뉜다.
+#
+# 그 labeldrop이 없으면 target label의 service(gateway)가 우선하고 metric 쪽
+# service는 exported_service로 밀려난다. 그러면 아래 세 업스트림의 시계열이
+# service="gateway" 하나로 뭉쳐서 이 시험의 기대 결과가 성립하지 않는다.
+# 실제로 두 설정을 모두 띄워서 확인한 내용이다.
+#
+# rule_files 경로는 컨테이너 안의 절대 경로이며, 위 실행 방법의 mount 위치와 같다.
+
+rule_files:
+  - /etc/prometheus/rules/basic.yml
+
+evaluation_interval: 30s
+
+tests:
+  # 업스트림 둘 가운데 한쪽에만 5xx가 몰리는 상황이다.
+  #
+  #   upstream-a : 30초마다 2xx 500건, 5xx 1건   -> 비율 약 0.2%
+  #   upstream-b : 30초마다 2xx 10건,  5xx 10건  -> 비율 50%
+  #   gateway    : 30초마다 2xx 50건            -> 5xx 없음
+  #
+  # 전체 비율은 11 / 571 로 약 1.9%이므로 GatewayHighServerErrorRate의 5% 기준에는
+  # 닿지 않는다. 업스트림별 규칙만 울려야 한다.
+  - interval: 30s
+    input_series:
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="upstream-a",method="GET",status_class="2xx"}'
+        values: '0+500x60'
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="upstream-a",method="GET",status_class="5xx"}'
+        values: '0+1x60'
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="upstream-b",method="GET",status_class="2xx"}'
+        values: '0+10x60'
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="upstream-b",method="GET",status_class="5xx"}'
+        values: '0+10x60'
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="gateway",method="GET",status_class="2xx"}'
+        values: '0+50x60'
+    alert_rule_test:
+      # for가 10분이므로 8분 시점에는 아직 발화하지 않는다.
+      - eval_time: 8m
+        alertname: GatewayUpstreamHighServerErrorRate
+        exp_alerts: []
+      # 12분 시점에는 upstream-b 하나만 발화해야 한다. upstream-a와 gateway는
+      # 기준 아래이므로 목록에 없어야 한다.
+      - eval_time: 12m
+        alertname: GatewayUpstreamHighServerErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: upstream-b
+            exp_annotations:
+              summary: '게이트웨이가 프록시하는 upstream-b의 5xx 비율이 10%를 넘는다'
+              description: '해당 upstream 서비스의 상태를 먼저 확인한다. service가 gateway이면 게이트웨이 자체 endpoint의 오류다.'
+      # 전체 비율 규칙은 같은 구간에서 조용하다.
+      - eval_time: 12m
+        alertname: GatewayHighServerErrorRate
+        exp_alerts: []
+
+  # 게이트웨이 자체 endpoint에서 5xx가 나는 상황이다. service label의 값이
+  # gateway이며, 업스트림 장애와 구분되어야 한다.
+  - interval: 30s
+    input_series:
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="gateway",method="GET",status_class="2xx"}'
+        values: '0+10x60'
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="gateway",method="GET",status_class="5xx"}'
+        values: '0+10x60'
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="upstream-a",method="GET",status_class="2xx"}'
+        values: '0+500x60'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: GatewayUpstreamHighServerErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: gateway
+            exp_annotations:
+              summary: '게이트웨이가 프록시하는 gateway의 5xx 비율이 10%를 넘는다'
+              description: '해당 upstream 서비스의 상태를 먼저 확인한다. service가 gateway이면 게이트웨이 자체 endpoint의 오류다.'
+
+  # 모든 업스트림이 정상인 구간이다. 어느 쪽도 발화하지 않아야 한다.
+  - interval: 30s
+    input_series:
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="upstream-a",method="GET",status_class="2xx"}'
+        values: '0+100x60'
+      - series: 'http_requests_total{job="msa-gateway",instance="gateway:8000",service="upstream-b",method="GET",status_class="2xx"}'
+        values: '0+100x60'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: GatewayUpstreamHighServerErrorRate
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: GatewayHighServerErrorRate
+        exp_alerts: []

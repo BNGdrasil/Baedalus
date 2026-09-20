@@ -1,0 +1,194 @@
+# promtool 단위 시험
+#
+# 실행 방법(저장소 루트의 monitoring/ 디렉터리에서)
+#   docker run --rm --entrypoint promtool \
+#     -v "$PWD/prometheus:/etc/prometheus:ro" prom/prometheus:v3.7.2 \
+#     test rules /etc/prometheus/tests/logging.yml
+#
+# basic-logging 그룹의 두 규칙을 확인한다. 두 규칙이 읽는 지표는
+# grafana/alloy:v1.19.2를 실제로 띄워서 /metrics에 나오는 이름을 그대로
+# 옮긴 것이며, 아래 input_series의 label 구성도 그때 본 것과 같다.
+#   loki_write_dropped_entries_total{component_id, component_path, host, reason, tenant}
+#   loki_write_request_duration_seconds_count{component_id, component_path, host, status_code, tenant}
+#
+# 두 규칙은 rate와 긴 for의 조합에서 increase와 짧은 for의 조합으로 바꾸었다.
+# 이전 형태는 한 번에 크게 늘어난 뒤 멈추는 유실을 영영 잡지 못했다. rate의 창이
+# 지나가면 식이 0으로 돌아가서 for의 15분을 채울 수 없기 때문이다. 아래의
+# "한 번 늘어난 뒤 멈춤" 시험이 그 상황을 고정한다.
+#
+# rule_files 경로는 컨테이너 안의 절대 경로이며, 위 실행 방법의 mount 위치와 같다.
+
+rule_files:
+  - /etc/prometheus/rules/basic.yml
+
+evaluation_interval: 30s
+
+tests:
+  # Loki가 요청을 거절해서 Alloy가 재시도를 소진하고 로그를 버리는 상황이다.
+  # Alloy 프로세스는 살아 있으므로 up은 계속 1이고 TargetDown은 울리지 않는다.
+  # 30초마다 다섯 줄씩 버리는 값을 넣는다. for가 없으므로 첫 증가가 창에 들어오는
+  # 즉시 발화한다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0+5x60'
+      - series: 'up{job="alloy",instance="vm2"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: LogShippingDropping
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: alloy
+              reason: ingester_error
+            exp_annotations:
+              summary: 'Alloy가 Loki로 보내지 못한 로그를 버리고 있다 (reason=ingester_error)'
+              description: '최근 10분 안에 재시도를 모두 소진한 뒤 버린 로그 줄이 있다. 이 구간의 로그는 Loki에 남지 않는다.'
+              action: 'sudo docker logs vm2-alloy --tail 100 으로 오류를 읽고, reason이 rate_limited나 stream_limited이면 monitoring/loki/loki-config.yml의 limits_config를, ingester_error이면 Loki 쪽 로그를 확인한다.'
+      - eval_time: 26m
+        alertname: LogShippingDropping
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: alloy
+              reason: ingester_error
+            exp_annotations:
+              summary: 'Alloy가 Loki로 보내지 못한 로그를 버리고 있다 (reason=ingester_error)'
+              description: '최근 10분 안에 재시도를 모두 소진한 뒤 버린 로그 줄이 있다. 이 구간의 로그는 Loki에 남지 않는다.'
+              action: 'sudo docker logs vm2-alloy --tail 100 으로 오류를 읽고, reason이 rate_limited나 stream_limited이면 monitoring/loki/loki-config.yml의 limits_config를, ingester_error이면 Loki 쪽 로그를 확인한다.'
+      # 같은 구간에서 TargetDown은 울리지 않는다. 두 규칙이 보는 대상이 다르다.
+      - eval_time: 26m
+        alertname: TargetDown
+        exp_alerts: []
+
+  # 한 번에 대량으로 버리고 멈추는 상황이다. 2분 시점에 한 번 뛰고 그 뒤로는
+  # 값이 그대로다. 이전 판의 rate + for: 15m 조합은 이 상황에서 한 번도 발화하지
+  # 않았다. 아래 두 확인이 그 회귀를 막는다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="rate_limited",tenant=""}'
+        values: '0 0 0 0 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400'
+    alert_rule_test:
+      # 유실이 한 번뿐이어도 잡아야 한다.
+      - eval_time: 4m
+        alertname: LogShippingDropping
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: alloy
+              reason: rate_limited
+            exp_annotations:
+              summary: 'Alloy가 Loki로 보내지 못한 로그를 버리고 있다 (reason=rate_limited)'
+              description: '최근 10분 안에 재시도를 모두 소진한 뒤 버린 로그 줄이 있다. 이 구간의 로그는 Loki에 남지 않는다.'
+              action: 'sudo docker logs vm2-alloy --tail 100 으로 오류를 읽고, reason이 rate_limited나 stream_limited이면 monitoring/loki/loki-config.yml의 limits_config를, ingester_error이면 Loki 쪽 로그를 확인한다.'
+      # 증가가 10분 창에서 빠져나가면 스스로 해소된다. 계속 울리지 않는다.
+      - eval_time: 20m
+        alertname: LogShippingDropping
+        exp_alerts: []
+
+  # 정상 구간이다. Alloy는 reason마다 값이 0인 시계열을 항상 노출하므로, 시계열이
+  # 있다는 사실만으로 발화하면 안 된다. 값이 늘지 않으면 increase가 0이어야 한다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="rate_limited",tenant=""}'
+        values: '0x60'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: LogShippingDropping
+        exp_alerts: []
+
+  # 버리기 전 단계다. Loki가 500을 돌려주는 동안 Alloy는 재시도하므로 아직
+  # 유실이 없고, dropped 쪽은 0으로 유지된다. 경고 하나만 울려야 한다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="500",tenant=""}'
+        values: '0+2x60'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="204",tenant=""}'
+        values: '0x60'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0x60'
+    alert_rule_test:
+      # for가 5분이므로 3분 시점에는 아직 발화하지 않는다.
+      - eval_time: 3m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: LogShippingWriteFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: alloy
+              status_code: '500'
+            exp_annotations:
+              summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code=500)'
+              description: '최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 아직 재시도 중이라 유실은 없지만, 재시도가 소진되면 LogShippingDropping으로 이어진다.'
+              action: 'curl -s http://127.0.0.1:3100/ready 로 Loki 상태를 먼저 보고, sudo docker logs vm2-loki --tail 100 으로 거절 사유를 확인한다.'
+      - eval_time: 26m
+        alertname: LogShippingDropping
+        exp_alerts: []
+
+  # 밀어넣기 실패도 한 번 묶여서 일어나고 멈출 수 있다. 2분 시점에 한 번 뛰고
+  # 그대로 멈추는 구간이다. 이전 판의 rate + for: 15m 조합은 이 상황도 놓쳤다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="503",tenant=""}'
+        values: '0 0 0 0 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LogShippingWriteFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: alloy
+              status_code: '503'
+            exp_annotations:
+              summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code=503)'
+              description: '최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 아직 재시도 중이라 유실은 없지만, 재시도가 소진되면 LogShippingDropping으로 이어진다.'
+              action: 'curl -s http://127.0.0.1:3100/ready 로 Loki 상태를 먼저 보고, sudo docker logs vm2-loki --tail 100 으로 거절 사유를 확인한다.'
+      - eval_time: 20m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+
+  # 정상 전송만 이어지는 구간이다. 204 응답 수만 늘어나므로 두 규칙 모두
+  # 조용해야 한다. status_code!~"2.." 조건이 204를 제대로 거르는지 확인한다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="204",tenant=""}'
+        values: '0+20x60'
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: LogShippingDropping
+        exp_alerts: []
+
+  # Alloy 컨테이너가 통째로 사라진 상황이다. 로그 전송 규칙은 시계열이 없어서
+  # 조용하고, TargetDown 하나만 울린다. 규칙을 겹쳐 두지 않은 결과를 확인한다.
+  - interval: 30s
+    input_series:
+      - series: 'up{job="alloy",instance="vm2"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LogShippingDropping
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: alloy
+              instance: vm2
+            exp_annotations:
+              summary: 'alloy target이 5분 이상 응답하지 않는다'
+              description: 'vm2의 alloy scrape가 실패하고 있다. 컨테이너 상태와 네트워크를 확인한다.'

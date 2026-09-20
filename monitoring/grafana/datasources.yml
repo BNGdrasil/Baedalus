@@ -1,7 +1,44 @@
 apiVersion: 1
 
+# 데이터 원본 프로비저닝
+#
+# 운영 배치 위치: /opt/bnbong/monitoring/grafana/datasources.yml
+# 컨테이너 안에서는 /etc/grafana/provisioning/datasources/datasources.yml로 읽힌다.
+#
+# uid를 고정하는 이유
+#   grafana/dashboards/ 아래의 대시보드 JSON과 Bantheon 어드민의 Explore 링크가
+#   데이터 원본을 uid로 가리킨다. uid를 적지 않으면 Grafana가 이름에서 파생한
+#   값을 스스로 붙이는데, 실제로 확인해 보니 그 값은 PBFA97CFB590B2093과
+#   P8E80F9AEF21F6940이었다. 저장소의 JSON에 적어 둘 수 있는 값이 아니므로
+#   여기에서 prometheus와 loki로 고정한다.
+#
+# deleteDatasources를 함께 두는 이유
+#   grafana/grafana:12.2.1에서 실제로 시험한 결과다. 이미 같은 이름의 데이터
+#   원본이 자동 생성 uid로 들어 있는 grafana_data 볼륨에 대고 uid만 추가한
+#   파일을 붙이면, Grafana는 제자리 갱신도 중복 생성도 하지 않고
+#   "Datasource provisioning error: data source not found"를 남기면서
+#   프로세스가 종료 코드 1로 끝난다. 즉 Grafana가 아예 뜨지 않는다.
+#
+#   deleteDatasources로 같은 이름의 항목을 먼저 지우게 하면, 프로비저닝이
+#   지운 자리에 고정 uid로 다시 만들어서 오류 없이 기동한다. 이 블록은 전환이
+#   끝난 뒤에도 그대로 둔다. 대상이 없으면 아무 일도 하지 않으므로 새 볼륨에서도
+#   문제가 없고, 사람이 전환 시점을 맞추어 파일을 두 번 고칠 필요도 없다.
+#   부수 효과는 Grafana를 재기동할 때마다 내부 정수 id가 새로 매겨지는 것뿐이며,
+#   이 저장소의 모든 참조는 id가 아니라 uid를 사용한다.
+#
+# 전환이 운영에 미치는 영향은 monitoring/README.md의 "데이터 원본 uid" 항목에
+# 적어 두었다. 요약하면, 화면에서 손으로 만든 대시보드가 예전 uid를 직접
+# 참조하고 있었다면 그 패널만 데이터 원본을 다시 지정해 주어야 한다.
+
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+  - name: Loki
+    orgId: 1
+
 datasources:
   - name: Prometheus
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
@@ -9,6 +46,7 @@ datasources:
     editable: false
 
   - name: Loki
+    uid: loki
     type: loki
     access: proxy
     url: http://loki:3100

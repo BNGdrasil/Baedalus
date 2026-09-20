@@ -1,0 +1,154 @@
+// VM2 로그 수집 설정 (Grafana Alloy)
+//
+// Promtail을 대체한다. Promtail은 2026-03-02에 지원이 끝났다.
+// 이 파일의 출발점은 `alloy convert --source-format=promtail`의 출력이며,
+// 읽기 쉽게 재배치하고 아래 두 가지를 손으로 고쳤다.
+//   1. service label의 fallback을 pipeline stage가 아니라 relabel 규칙으로 옮겼다.
+//      이유는 docker 소스 항목의 주석에 적었다.
+//   2. Docker 소켓을 직접 열지 않고 docker-socket-proxy를 거치게 했다.
+//
+// 운영 배치 위치: /opt/bnbong/monitoring/alloy/config.alloy
+// 컨테이너 안 경로: /etc/alloy/config.alloy
+
+logging {
+	level  = "info"
+	format = "logfmt"
+}
+
+// ---------------------------------------------------------------------------
+// Docker 컨테이너 로그
+// ---------------------------------------------------------------------------
+
+// 컨테이너 목록을 Docker API에서 가져온다. 소켓을 직접 mount하지 않고
+// docker-socket-proxy(HAProxy)를 거친다. 프록시는 GET 계열만 통과시키므로
+// 이 수집기가 컨테이너를 만들거나 exec을 실행할 수 있는 경로가 사라진다.
+// 선택 근거는 monitoring/README.md의 "Docker API 접근 범위" 항목에 있다.
+discovery.docker "containers" {
+	host             = "tcp://docker-socket-proxy:2375"
+	refresh_interval = "15s"
+}
+
+// 수집한 컨테이너에 붙일 label을 만든다. Promtail 시절의 label 계약을 그대로
+// 유지한다. Grafana 대시보드 여덟 개와 Bantheon 어드민의 Explore 링크가
+// 아래 label 이름에 의존하므로 이름과 값을 바꾸면 안 된다.
+discovery.relabel "docker_logs" {
+	// 이 블록은 규칙만 제공하고 대상은 넘기지 않는다. 실제 대상은
+	// loki.source.docker가 discovery.docker.containers.targets로 받는다.
+	targets = []
+
+	// Docker API가 돌려주는 컨테이너 이름에는 앞에 "/"가 붙는다. 그대로 두면
+	// container label이 "/vm2-gateway"가 되어 기존 조회식과 어긋난다.
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/?(.*)"
+		target_label  = "container"
+	}
+
+	// compose가 붙이는 service 이름이다. 수동 docker run으로 띄운 컨테이너에는
+	// 이 label이 없으므로 결과가 빈 문자열이 된다. 바로 아래 규칙이 그 경우를 메운다.
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service"
+	}
+
+	// compose label이 없는 컨테이너(수동 run으로 띄운 wegis_server 등)의
+	// service label을 컨테이너 이름으로 채운다.
+	//
+	// Promtail 설정은 이 fallback을 pipeline의 template stage로 처리했다.
+	// Alloy에서도 같은 stage를 쓸 수 있지만, template stage가 읽는 값은
+	// 파이프라인의 extracted map이고 relabel이 만든 label은 그 map에 들어 있지
+	// 않다. 즉 stage 방식은 두 값이 모두 비어 있는 상태에서 동작하므로 의도한
+	// 결과를 내지 못한다. 그래서 relabel 단계에서 끝내도록 옮겼다.
+	//
+	// 두 source_label을 ";"로 이어 붙인 뒤 "앞부분이 비어 있을 때"만 regex가
+	// 맞도록 했다. relabel의 replace는 regex가 맞지 않으면 아무 일도 하지
+	// 않으므로, compose label이 있는 컨테이너는 이 규칙을 그냥 지나간다.
+	// 컨테이너 이름 앞의 "/"는 여기에서도 함께 떼어 낸다.
+	rule {
+		source_labels = [
+			"__meta_docker_container_label_com_docker_compose_service",
+			"__meta_docker_container_name",
+		]
+		separator    = ";"
+		regex        = ";/?(.*)"
+		target_label = "service"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		target_label  = "compose_project"
+	}
+
+	// stdout과 stderr를 구분하는 label이다. 이 meta label은 컨테이너 목록을
+	// 조회할 때가 아니라 로그 줄을 읽을 때 붙으며, loki.source.docker가 줄마다
+	// 이 규칙을 다시 적용한다. 규칙을 빼면 stream label이 아예 사라진다.
+	// 실제로 빼고 띄워 본 결과 Loki의 스트림에 stream이 없었고, 같은 조건의
+	// Promtail에는 있었다.
+	rule {
+		source_labels = ["__meta_docker_container_log_stream"]
+		target_label  = "stream"
+	}
+
+	rule {
+		target_label = "job"
+		replacement  = "docker"
+	}
+
+	rule {
+		target_label = "host"
+		replacement  = "vm2"
+	}
+}
+
+// 컨테이너 로그를 Docker API로 읽어 Loki에 보낸다.
+//
+// 읽은 위치는 --storage.path 아래에 저장된다. Promtail의 positions.yaml을
+// 가져오는 기능은 이 컴포넌트에 없다. 전환 절차는 README에 적어 두었다.
+loki.source.docker "containers" {
+	host             = "tcp://docker-socket-proxy:2375"
+	targets          = discovery.docker.containers.targets
+	relabel_rules    = discovery.relabel.docker_logs.rules
+	forward_to       = [loki.write.loki.receiver]
+	refresh_interval = "15s"
+}
+
+// ---------------------------------------------------------------------------
+// 호스트 시스템 로그
+// ---------------------------------------------------------------------------
+
+// /var/log/*log를 tail한다. Promtail의 system job과 같은 대상이고 같은 label을 붙인다.
+loki.source.file "system" {
+	targets = [
+		{
+			__address__ = "localhost",
+			__path__    = "/var/log/*log",
+			job         = "varlogs",
+			host        = "vm2",
+		},
+	]
+	forward_to = [loki.write.loki.receiver]
+
+	// __path__를 glob으로 펼치고 새로 생긴 파일을 주기적으로 다시 찾는다.
+	file_match {
+		enabled = true
+	}
+
+	// Promtail이 남긴 positions.yaml을 한 번 읽어 들여서 이어서 tail한다.
+	// 이 줄이 없으면 전환 직후에 /var/log 아래의 모든 파일을 처음부터 다시 읽어
+	// 같은 줄이 Loki에 두 번 들어간다. 파일 소스에만 있는 기능이며 docker
+	// 소스에는 없다. 변환은 --storage.path 아래에 이 컴포넌트의 positions.yml이
+	// 아직 없을 때만 일어나고, 원본 파일은 읽기만 할 뿐 지우지 않는다. 다만 파일이
+	// 있는데 읽지 못하면(권한 오류 등) Alloy는 로그 재수집을 피하려고 기동을
+	// 거부한다. 전환이 끝난 뒤의 정리 절차는 README에 있다.
+	legacy_positions_file = "/var/lib/promtail/positions.yaml"
+}
+
+// ---------------------------------------------------------------------------
+// 전송 대상
+// ---------------------------------------------------------------------------
+
+loki.write "loki" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}
