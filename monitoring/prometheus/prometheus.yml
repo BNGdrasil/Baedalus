@@ -24,10 +24,10 @@ rule_files:
 #   3. 아래 alerting 블록의 주석을 풀고 Prometheus를 다시 읽힌다.
 # 자세한 절차와 확인 방법은 monitoring/README.md의 "통지 경로" 항목에 있다.
 #
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets: ['alertmanager:9093']
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
 
 scrape_configs:
   # VM1 (Frontend). 2026-09-20 실사 기준으로 VM1의 node-exporter는 docker run으로
