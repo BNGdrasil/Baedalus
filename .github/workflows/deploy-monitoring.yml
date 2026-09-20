@@ -15,6 +15,44 @@ concurrency:
   group: deploy-monitoring-vm2
   cancel-in-progress: false
 
+env:
+  # 배포 성공을 판정하는 기준이 되는 Prometheus job label 목록이다. 공백으로
+  # 구분하며, 이 중 하나라도 up이 아니면 워크플로를 실패로 끝낸다.
+  #
+  # msa-services job은 relabel_configs가 각 target의 service label을 job label로
+  # 옮기므로, 최종 job label이 msa-gateway와 msa-auth-server가 된다. 그래서
+  # 여기에는 scrape pool 이름인 msa-services가 아니라 relabel 이후의 이름을 적는다.
+  #
+  # blackbox-exporter와 cadvisor와 alloy를 넣는 기준은 "이 compose가 직접
+  # 기동하는 서비스인가"이다. 세 서비스 모두 이 워크플로가 up -d로 띄우므로,
+  # 배포가 끝난 뒤에도 down이라면 배포 자체가 잘못된 것이지 다른 호스트의
+  # 사정이 아니다. alloy job은 로그 수집이 실제로 살아 있는지를 알려 주는
+  # 유일한 신호이기도 하다. Promtail 시절에는 지표를 긁는 job이 없어서
+  # 2026-09-18 실사 때처럼 수집기가 created 상태로 멈춰 있어도 드러나지 않았다.
+  #
+  # 이 목록에 없는 target(vm1-node, vm3-node, msa-wegis-server, msa-redis,
+  # grafana 등)은 down이어도 경고만 남기고 배포는 성공으로 끝낸다.
+  #
+  # vm1-node와 vm3-node를 넣지 않는 기준은 "이 워크플로가 기동하는 대상인가"이다.
+  # 이 판정이 답해야 하는 질문은 "이번 모니터링 배포가 올바른가"이지 "다른 호스트가
+  # 살아 있는가"가 아니다. 원격 VM의 exporter가 내려간 것은 배포 결함이 아니므로
+  # 배포를 실패로 끝낼 이유가 없고, 그 상태는 basic-availability의 TargetDown
+  # 경보가 담당한다. 여기에 넣으면 다른 호스트의 사정 때문에 모니터링 배포가
+  # 막히고, 그 결과 경보 규칙을 고치는 배포조차 나가지 못하게 된다.
+  #
+  # 2026-09-20 실사 기준으로 VM1(10.0.1.133)과 VM3(10.0.2.134)의 node-exporter는
+  # docker run으로 띄운 prom/node-exporter:v1.9.1 컨테이너(host network, *:9100)이며
+  # Prometheus에서 두 target 모두 정상 수집된다. 2026-09-18에 exited였던 상태는
+  # 그 뒤에 해소되었다. 그래도 위의 기준은 그대로 유지한다.
+  REQUIRED_JOBS: 'prometheus vm2-node msa-gateway msa-auth-server blackbox-exporter cadvisor alloy'
+
+  # 설정 파일을 bind mount로 들고 있는 서비스 목록이다. rsync가 파일을 바꾸어도
+  # 이 서비스들은 스스로 새 내용을 읽지 않으므로 배포 때마다 다시 시작한다.
+  # 근거는 monitoring/README.md의 "설정 변경을 반영하는 방법" 항목에 있다.
+  # alertmanager는 alerting profile이라 여기에 넣지 않고, 실행 중일 때에만
+  # 아래 단계에서 따로 다시 시작한다.
+  CONFIG_SERVICES: 'prometheus grafana loki alloy blackbox-exporter'
+
 jobs:
   deploy:
     name: 'Deploy monitoring to VM2'
@@ -57,8 +95,43 @@ jobs:
           # 아래 절차로 사람이 직접 판단하여 옮긴다.
           #   ssh ubuntu@<VM2> 'ls /opt/bnbong/monitoring/prometheus/targets/'
           #   scp monitoring/prometheus/targets/<파일> ubuntu@<VM2>:/opt/bnbong/monitoring/prometheus/targets/
+          #
+          # monitoring/ 디렉터리 전체를 보내므로 grafana/provisioning, grafana/dashboards,
+          # blackbox, alertmanager처럼 나중에 추가되는 하위 디렉터리도 별도 조치 없이
+          # 함께 전송된다. 제외 목록에 새 항목을 더할 필요가 없다.
+          #
+          # loki/promtail-config.yml도 제외한다. 이 파일은 저장소에서 지웠지만 VM2에는
+          # 아직 남아 있어야 한다. 운영 중인 vm2-promtail 컨테이너가 그 파일 하나를
+          # 단일 파일 bind mount로 들고 있기 때문이다. --delete가 이 파일을 지운 뒤에
+          # 배포가 실패해서 Promtail을 되살리려 하면 복구 자체가 불가능해진다.
+          #
+          # docker:27-dind 안에서 실제로 재현한 결과는 아래와 같다.
+          #   1. 단일 파일 bind mount의 원본을 지우고 docker stop을 한 뒤 docker start를
+          #      하면 start가 실패한다.
+          #      Error response from daemon: ... error mounting "/exp1/conf.yml" to rootfs
+          #      at "/etc/app/conf.yml": ... not a directory: unknown: Are you trying to
+          #      mount a directory onto a file (or vice-versa)?
+          #   2. 그 실패 과정에서 Docker가 원본 경로에 빈 디렉터리를 만든다. 그래서
+          #      나중에 파일을 되돌려 놓으려 해도 먼저 그 디렉터리를 지워야 하고,
+          #      지우기 전에는 몇 번을 다시 시도해도 같은 오류로 실패한다.
+          #
+          # 별도 경로 백업만 두는 방법과 비교해서 제외를 고른 이유는, 제외는 bind mount
+          # 원본 경로가 비는 구간 자체를 만들지 않기 때문이다. 백업만 두면 배포 도중에
+          # 워크플로가 취소되거나 러너가 죽었을 때 원본 경로가 빈 상태로 남고, 그 뒤에는
+          # 사람이 디렉터리를 지우고 파일을 되돌려야 Promtail이 다시 뜬다.
+          #
+          # 제외만 두면 전환이 끝난 뒤에도 이 파일이 VM2에 영구히 남는다. 그 문제는
+          # 마지막 단계인 "Remove the old Promtail container"가 배포가 완전히 성공한
+          # 뒤에 파일을 지워서 해결한다. 그 단계가 한 번 돌고 나면 이 제외 규칙은
+          # 지킬 대상이 없는 빈 규칙이 되므로, 아래 Promtail 관련 단계들과 함께 통째로
+          # 지우면 된다. 남겨 두어도 동작에는 영향이 없다.
+          #
+          # 제외에 더해 아래 "Apply compose" 단계가 이 파일의 사본을 rsync 대상 밖인
+          # /opt/bnbong/.monitoring-deploy-state/에 둔다. 제외 규칙을 누가 먼저 지웠을
+          # 때를 대비한 복구용이며, 복구 단계가 위 2번의 빈 디렉터리까지 치운다.
           rsync -az --delete \
             --exclude 'prometheus/targets/' \
+            --exclude '/loki/promtail-config.yml' \
             -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes" \
             monitoring/ "ubuntu@${VM2_HOST}:/opt/bnbong/monitoring/"
 
@@ -67,21 +140,207 @@ jobs:
             monitoring/docker-compose.monitoring.yml \
             "ubuntu@${VM2_HOST}:/opt/bnbong/docker-compose.monitoring.yml"
 
-      - name: Apply compose and verify
+      - name: Apply compose and verify on VM2
+        id: apply
         env:
           VM2_HOST: ${{ secrets.VM2_HOST }}
+          CONFIG_SERVICES: ${{ env.CONFIG_SERVICES }}
+          # 로그가 실제로 Alloy를 거쳐 Loki까지 도착하는지 확인할 때 쓰는 표식이다.
+          # 배포 실행 번호로만 만들므로 비밀이 아니고, 실행마다 반드시 달라진다.
+          # 같은 실행을 다시 돌리는 경우까지 구분하려고 run_attempt도 넣는다.
+          LOG_PROBE_MARKER: 'bngdrasil-log-probe-${{ github.run_id }}-${{ github.run_attempt }}'
+          # 미완료 전환 표식에 적는 값이다. 다음 배포가 "어느 실행이 전환을 끝내지
+          # 못했는가"를 로그에 그대로 옮길 수 있어야 사람이 추적할 수 있다.
+          DEPLOY_RUN_REF: '${{ github.run_id }}/${{ github.run_attempt }}'
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
-            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH'
+            "ubuntu@${VM2_HOST}" \
+            "CONFIG_SERVICES='${CONFIG_SERVICES}' LOG_PROBE_MARKER='${LOG_PROBE_MARKER}' DEPLOY_RUN_REF='${DEPLOY_RUN_REF}' bash -s" <<'ENDSSH'
+          # === remote-apply begin ===
           set -euo pipefail
           cd /opt/bnbong
+          COMPOSE="sudo docker compose -f docker-compose.monitoring.yml"
+
+          # 전환 상태를 남기는 디렉터리다. /opt/bnbong/monitoring/ 밖에 두어야
+          # rsync --delete의 대상이 되지 않는다. 복구 단계와 마지막 정리 단계가
+          # 이 디렉터리를 읽고, 정리 단계가 통째로 지운다.
+          STATE_DIR=/opt/bnbong/.monitoring-deploy-state
+          PROMTAIL_CONFIG=/opt/bnbong/monitoring/loki/promtail-config.yml
+
+          # 로그 종단 확인에 쓰는 시험 컨테이너 이름이다. 아래 trap이 이 이름을
+          # 쓰므로 함수 정의보다 먼저 둔다.
+          LOG_PROBE_NAME='vm2-log-probe'
+
+          cleanup_log_probe() {
+            sudo docker rm -f "$LOG_PROBE_NAME" >/dev/null 2>&1 || true
+          }
+
+          # 시험 컨테이너를 반드시 치운다.
+          #
+          # 이전 판은 확인이 끝난 자리에서 docker rm -f를 두 번 부르기만 했다.
+          # 그래서 그 사이에서 스크립트가 끝나면(확인 실패로 exit, 워크플로 취소로
+          # ssh가 끊김) 컨테이너가 남았다. EXIT trap을 걸면 어느 경로로 끝나도
+          # 정리가 돌아간다.
+          #
+          # HUP과 PIPE까지 잡는 이유는 워크플로가 취소될 때 러너가 ssh를 죽이고,
+          # 원격 bash는 그때 SIGHUP을 받거나 닫힌 파이프에 쓰다가 SIGPIPE를 받기
+          # 때문이다. 다만 원격이 아무 신호도 받지 못하는 경로가 남아 있으므로
+          # 이 trap은 최선의 노력이며, 실제 보증은 아래 check_log_pipeline이
+          # 시작할 때 같은 이름을 먼저 지우는 쪽이 맡는다.
+          trap 'cleanup_log_probe' EXIT
+          trap 'cleanup_log_probe; exit 143' HUP INT TERM PIPE
+
+          # 상태 파일을 원자적으로 쓴다.
+          #
+          # 같은 디렉터리에 임시 파일을 만들고 mv로 갈아 끼운다. 쓰는 도중에
+          # 배포가 끊겨서 반쪽짜리 파일이 남으면, 다음 배포가 그 값을 그대로
+          # 믿고 잘못된 판단을 내린다. mv는 같은 파일 시스템 안이라 원자적이다.
+          write_state() {
+            local name="$1" content="$2" tmp
+            tmp="$(sudo mktemp "${STATE_DIR}/.${name}.XXXXXX")"
+            printf '%s\n' "$content" | sudo tee "$tmp" >/dev/null
+            sudo mv -f "$tmp" "${STATE_DIR}/${name}"
+          }
+
+          # 구 Promtail 컨테이너의 상태를 가장 먼저 기록한다.
+          #
+          # compose에서 promtail 서비스를 없앴으므로 이 컨테이너는 orphan으로
+          # 남는다. 아래 up -d는 --remove-orphans를 쓰지 않으니(alerting profile로
+          # 꺼 둔 Alertmanager를 지우지 않으려는 의도다) 이름으로 지목해서 다룬다.
+          #
+          # "있었는지"와 "돌고 있었는지"를 따로 본다. 2026-09-18 실사 때처럼
+          # 컨테이너가 created 상태로 멈춰 있었다면 로그를 보내고 있지 않았다는
+          # 뜻이므로, 배포가 실패해도 그 컨테이너를 새로 살리면 안 된다.
+          #
+          # 두 값을 파일로 남기는 이유는 복구가 별도의 step이기 때문이다. 이 step이
+          # 어디에서 실패하든 복구 step이 같은 판단을 다시 내릴 수 있어야 한다.
+          # 판정 자체는 아무것도 바꾸지 않으므로 config 검사와 pull보다 앞에 두어
+          # 지난 배포가 남긴 값이 그대로 쓰이는 일을 막는다.
+          promtail_exists=0
+          promtail_was_running=0
+          if sudo docker ps -a --format '{{.Names}}' | grep -qx 'vm2-promtail'; then
+            promtail_exists=1
+          fi
+          if sudo docker ps --format '{{.Names}}' | grep -qx 'vm2-promtail'; then
+            promtail_was_running=1
+          fi
+          sudo mkdir -p "$STATE_DIR"
+
+          # 지난 배포가 전환을 끝내지 못한 채 끝났는지 본다.
+          #
+          # docker ps로 계산한 값만 믿으면 안 되는 이유가 여기에 있다. 지난 배포가
+          # Promtail을 멈춘 뒤 복구 없이 끝났다면(워크플로 취소, 러너 사망) 이번
+          # 배포의 docker ps는 was_running=0을 돌려준다. 그 값을 그대로 기록하면
+          # 이번 배포가 실패해도 복구 단계가 "되돌릴 것이 없다"고 판단하고,
+          # Promtail은 영영 멈춘 채로 남는다. Alloy가 실제로 전달하지 못하는
+          # 상태라면 그 시점에 수집기가 하나도 없다.
+          #
+          # 그래서 전환 진행 표식을 상태 디렉터리에 영속으로 남긴다. 이 표식은
+          # 전환이 성공적으로 끝났을 때(마지막 삭제 단계)나 복구가 성공했을
+          # 때에만 지워진다. 표식이 남아 있다는 것은 곧 지난 실행이 미완료라는
+          # 뜻이므로 was_running=1을 유지한다.
+          #
+          # 컨테이너가 이미 사라진 경우에는 표식이 낡은 것이다. 사람이 손으로
+          # docker rm을 했다는 뜻이고 되살릴 대상이 없으므로 표식을 치운다.
+          # 그러지 않으면 복구 단계가 없는 컨테이너에 docker start를 건다.
+          TRANSITION_MARK="$STATE_DIR/transition_in_progress"
+          if [ -f "$TRANSITION_MARK" ]; then
+            prev_run="$(sudo cat "$TRANSITION_MARK" 2>/dev/null || echo '(읽을 수 없음)')"
+            if [ "$promtail_exists" -eq 1 ]; then
+              echo "::warning::지난 배포(${prev_run})가 Promtail 전환을 끝내지 못했다. 그 배포가 멈춘 Promtail을 이번 배포의 복구 대상으로 삼는다."
+              promtail_was_running=1
+            else
+              echo "::warning::지난 배포(${prev_run})의 전환 표식이 남아 있지만 vm2-promtail 컨테이너가 없다. 낡은 표식으로 보고 지운다."
+              sudo rm -f "$TRANSITION_MARK"
+            fi
+          fi
+
+          write_state promtail_exists      "$promtail_exists"
+          write_state promtail_was_running "$promtail_was_running"
+
+          # 구 Promtail 설정 파일의 사본을 남긴다. rsync가 --exclude로 원본을
+          # 지키므로 평소에는 쓰이지 않지만, 제외 규칙을 누가 먼저 지웠거나 사람이
+          # 파일을 지운 상태에서 배포가 실패하면 복구 단계가 이 사본으로 되돌린다.
+          if [ "$promtail_exists" -eq 1 ] && [ -f "$PROMTAIL_CONFIG" ]; then
+            sudo cp "$PROMTAIL_CONFIG" "$STATE_DIR/promtail-config.yml"
+          fi
+          echo "  구 Promtail 상태: exists=${promtail_exists} was_running=${promtail_was_running}"
 
           # 설정 파일의 문법 오류는 컨테이너를 올리기 전에 잡는다.
-          sudo docker compose -f docker-compose.monitoring.yml config --quiet
+          $COMPOSE config --quiet
 
-          sudo docker compose -f docker-compose.monitoring.yml up -d
-          sudo docker compose -f docker-compose.monitoring.yml ps
+          # 이미지를 먼저 받는다.
+          #
+          # 이 단계가 실패하면 아무것도 건드리지 않은 채로 배포가 끝난다. 이미지를
+          # 받지 못하는 상태에서 컨테이너를 재구성하면 관측이 끊긴 채로 배포가
+          # 실패한다.
+          $COMPOSE pull
+
+          # profile이 붙은 서비스(alerting)는 --profile 없이는 기동되지 않는다.
+          # Alertmanager를 기본 비활성으로 두려는 의도이므로 여기서도 profile을
+          # 지정하지 않는다. --remove-orphans도 쓰지 않는다. profile로 꺼 둔
+          # 컨테이너를 orphan으로 보고 지우는 일을 피하기 위해서다.
+          $COMPOSE up -d
+
+          # 설정을 들고 있는 서비스를 다시 시작한다.
+          #
+          # up -d만으로는 설정 변경이 반영되지 않는다. compose 정의가 그대로이면
+          # 컨테이너를 다시 만들지 않고, bind mount한 설정 파일의 내용만 바뀐
+          # 경우가 정확히 그 상황이다. 게다가 rsync는 임시 파일을 rename으로
+          # 갈아 끼우므로 inode가 바뀌는데, 단일 파일 bind mount는 컨테이너를
+          # 만들 때의 inode에 묶여 있어서 컨테이너 안에서는 계속 옛 내용이
+          # 보인다. restart는 컨테이너를 다시 만들지 않으면서 mount를 다시 잡아
+          # 주므로 새 파일이 그대로 반영된다. 근거는 monitoring/README.md의
+          # "설정 변경을 반영하는 방법" 항목에 있다.
+          #
+          # 관측이 몇십 초 끊긴다. 이 워크플로가 수동 실행만 받는 이유 가운데
+          # 하나이며 이미 문서에 적어 둔 전제다.
+          echo "  설정을 들고 있는 서비스를 다시 시작한다: ${CONFIG_SERVICES}"
+          # shellcheck disable=SC2086
+          $COMPOSE restart $CONFIG_SERVICES
+
+          # Alertmanager는 alerting profile이라 평소에는 없다. 돌고 있을 때에만
+          # 대상에 넣는다. profile을 지정해야 compose가 이 서비스를 인식한다.
+          if sudo docker ps --format '{{.Names}}' | grep -qx 'vm2-alertmanager'; then
+            echo "  alertmanager가 실행 중이므로 함께 다시 시작한다."
+            sudo docker compose -f docker-compose.monitoring.yml --profile alerting \
+              restart alertmanager
+          else
+            echo "  alertmanager가 실행 중이 아니므로 건너뛴다."
+          fi
+
+          # 새 수집기가 뜬 뒤에 구 수집기를 멈춘다.
+          #
+          # 순서를 이렇게 잡은 이유는 두 가지다. 첫째, 어느 시점에도 수집기가 하나도
+          # 없는 구간이 생기지 않는다. 배포가 중간에 취소되거나 러너가 죽어도 남는
+          # 상태는 "Promtail 정지, Alloy 실행"이므로 로그가 끊기지 않는다. 둘째,
+          # 두 수집기가 겹쳐서 보내는 몇십 초 동안의 로그는 stream label과 시각과
+          # 내용이 같으므로 Loki가 중복으로 보고 버린다. 근거는 README의
+          # "positions와 전환 시점의 중복과 유실" 항목에 있다.
+          #
+          # 아래의 로그 종단 확인보다는 반드시 앞에 두어야 한다. Promtail이 아직
+          # 돌고 있으면 시험 문자열을 Promtail이 넣었는지 Alloy가 넣었는지 구분할
+          # 수 없어서 확인이 의미를 잃는다.
+          #
+          # 여기에서는 멈추기만 하고 지우지 않는다. 지워 버리면 되돌릴 수단이
+          # 없어진다. promtail_positions volume도 건드리지 않는다.
+          if [ "$promtail_was_running" -eq 1 ]; then
+            # 멈추기 직전에 전환 진행 표식을 남긴다. 순서가 중요하다. 멈춘 뒤에
+            # 적으면 그 사이에 배포가 끊겼을 때 "멈췄는데 표식이 없는" 상태가
+            # 남고, 그것이 바로 이번에 고치려는 결함이다. 먼저 적어 두면 최악의
+            # 경우에도 "표식은 있는데 멈추지는 않은" 상태가 되고, 그 상태에서
+            # 다음 배포는 was_running=1로 보고 복구 대상에 넣을 뿐이라 무해하다.
+            write_state transition_in_progress "$DEPLOY_RUN_REF"
+            echo "  vm2-promtail을 멈춘다 (아직 지우지 않는다)."
+            # 이미 멈춰 있는 컨테이너에도 docker stop은 0을 돌려준다. 지난 배포가
+            # 미완료로 끝나 표식만 남은 경우가 그 경로로 들어온다.
+            sudo docker stop vm2-promtail >/dev/null
+          else
+            echo "  vm2-promtail이 돌고 있지 않으므로 멈출 것이 없다."
+          fi
+
+          $COMPOSE ps
 
           # 기동 직후에는 아직 준비되지 않았을 수 있으므로 몇 차례 다시 확인한다.
           check() {
@@ -97,23 +356,777 @@ jobs:
             return 1
           }
 
+          # Alloy는 포트를 게시하지 않으므로 호스트에서 curl로 닿지 않는다.
+          # compose에 붙여 둔 healthcheck 결과를 그대로 읽는다.
+          check_health() {
+            local label="$1" name="$2" status
+            for _ in $(seq 1 20); do
+              status="$(sudo docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$name" 2>/dev/null || echo missing)"
+              if [ "$status" = "healthy" ]; then
+                echo "  OK: $label"
+                return 0
+              fi
+              sleep 3
+            done
+            echo "  FAIL: $label (상태 $status)" >&2
+            return 1
+          }
+
+          # 로그가 Alloy를 거쳐 Loki까지 실제로 도착하는지 확인한다.
+          #
+          # Alloy의 /-/ready healthcheck만으로는 부족하다. Alloy 프로세스가 살아
+          # 있으면 그 endpoint는 200을 돌려주므로, docker-socket-proxy 연결이 막혀
+          # 컨테이너 목록을 아예 가져오지 못하는 상태에서도 healthy로 보인다.
+          # 그 상태로 Promtail을 지우면 로그 수집이 조용히 끊긴다.
+          #
+          # 시험 문자열을 만드는 방법
+          #   컨테이너 하나를 새로 띄워 stdout에 표식을 찍는다. 일회성 docker run
+          #   --rm은 쓰지 않는다. Alloy의 discovery.docker는 실행 중인 컨테이너만
+          #   목록에 올리고 갱신 주기가 15초이므로, 곧바로 끝나고 사라지는 컨테이너는
+          #   한 번도 발견되지 않을 수 있다. 그래서 --rm 없이 띄우고 10초 간격으로
+          #   열 번 같은 줄을 찍게 해서, discovery 주기를 두세 번 넘기는 동안 계속
+          #   새 줄이 나오게 한다. 확인이 끝나면 이 스크립트 첫머리의 EXIT trap이
+          #   컨테이너를 지운다.
+          #
+          #   compose label이 없으므로 service label은 config.alloy의 fallback 규칙이
+          #   컨테이너 이름으로 채운다. 이 확인은 그 규칙까지 함께 시험한다.
+          #
+          #   이미지는 방금 pull한 grafana/alloy를 쓴다. VM2에 반드시 있고 /bin/sh가
+          #   들어 있다. 네트워크는 none으로 둔다. Alloy는 Docker API로 로그를 읽으므로
+          #   이 컨테이너가 어느 네트워크에 붙어 있는지는 상관이 없다.
+          #
+          # 확인 방법
+          #   VM2의 loopback Loki에 query_range를 던지고 응답 본문에 표식이 있는지만
+          #   본다. VM2에 jq가 설치되어 있다고 보장할 수 없어서 curl과 grep만 쓴다.
+          #   질의 문자열은 응답 본문에 되돌아오지 않으므로, 본문에 표식이 있다는 것은
+          #   그 줄이 실제로 Loki에 적재되었다는 뜻이다.
+          #
+          # LOG_PROBE_NAME과 정리 trap은 이 스크립트 첫머리에 있다.
+
+          wait_for_probe_line() {
+            local marker="$1" query start body i
+            query="{job=\"docker\",container=\"${LOG_PROBE_NAME}\"} |= \"${marker}\""
+            start="$(( $(date +%s) - 600 ))000000000"
+
+            for i in $(seq 1 30); do
+              body="$(curl -fsS --max-time 10 -G \
+                --data-urlencode "query=${query}" \
+                --data-urlencode "start=${start}" \
+                --data-urlencode 'limit=5' \
+                'http://127.0.0.1:3100/loki/api/v1/query_range' 2>/dev/null || true)"
+              if printf '%s' "$body" | grep -q "$marker"; then
+                echo "  OK: 로그 종단 확인 (시도 ${i}, 표식 ${marker})"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "  FAIL: 시험 로그가 Loki에 도착하지 않았다 (표식 ${marker})" >&2
+            echo "  마지막 응답: ${body}" >&2
+            sudo docker logs vm2-alloy --tail 50 >&2 || true
+            sudo docker logs vm2-docker-socket-proxy --tail 20 >&2 || true
+            return 1
+          }
+
+          check_log_pipeline() {
+            local marker="$1" rc=0
+            # 지난 배포가 남긴 것이 있으면 먼저 치운다. 같은 이름으로 다시 띄워야
+            # 위의 질의가 그대로 들어맞는다.
+            cleanup_log_probe
+
+            # docker run의 실패를 명시적으로 확인한다.
+            #
+            # 이 함수는 `check_log_pipeline ... || exit 1` 형태로 불린다. 그렇게
+            # 부르면 함수 본문 전체가 || 의 왼쪽이 되어 set -e가 꺼지므로,
+            # docker run이 실패해도 다음 줄이 그대로 이어진다. 이전 판은 그래서
+            # 시험 컨테이너가 뜨지도 않은 채로 도착 대기 30회를 끝까지 돌고
+            # 150초를 버린 뒤에야 실패했다. 종료 코드를 직접 보고 곧바로 끝낸다.
+            if ! sudo docker run -d --name "$LOG_PROBE_NAME" --network none \
+              --entrypoint /bin/sh grafana/alloy:v1.19.2 \
+              -c "for i in 1 2 3 4 5 6 7 8 9 10; do echo '$marker'; sleep 10; done" >/dev/null; then
+              echo "  FAIL: 시험 컨테이너(${LOG_PROBE_NAME})를 띄우지 못해 로그 종단 확인을 수행할 수 없다." >&2
+              return 1
+            fi
+
+            wait_for_probe_line "$marker" || rc=1
+            cleanup_log_probe
+            return "$rc"
+          }
+
           failed=0
           check "Prometheus"  "http://127.0.0.1:9090/-/healthy"    || failed=1
           check "Loki"        "http://127.0.0.1:3100/ready"        || failed=1
           check "Grafana"     "http://127.0.0.1:3000/api/health"   || failed=1
+          check_health "Alloy" "vm2-alloy"                         || failed=1
 
           if [ "$failed" -ne 0 ]; then
             echo "확인에 실패했다. 아래로 원인을 찾는다." >&2
-            sudo docker compose -f docker-compose.monitoring.yml logs --tail 50 >&2
+            $COMPOSE logs --tail 50 >&2
             exit 1
           fi
 
-          # target 수집 상태까지 확인한다. 컨테이너가 떠 있어도 scrape가 전부
-          # 실패하고 있으면 관측이 사실상 멈춘 것이다.
-          echo "수집에 실패한 target 목록:"
-          curl -fsS 'http://127.0.0.1:9090/api/v1/targets?state=active' \
-            | grep -o '"health":"[^"]*"' | sort | uniq -c
+          # Grafana의 데이터 원본과 대시보드 프로비저닝은 컨테이너가 정상으로 떠
+          # 있어도 조용히 실패한다. /api/health는 그 경우에도 200을 돌려주므로
+          # 기동 로그를 직접 읽는다. Grafana HTTP API로 대시보드 목록을 조회하는
+          # 방법은 쓰지 않는다. 그러려면 관리자 비밀번호가 필요하고, 그 값을
+          # 러너로 가져오지 않는다는 원칙(.env를 전송하지 않는 것과 같은 이유)을
+          # 깨게 된다.
+          #
+          # 기준 시각을 Grafana 컨테이너의 이번 기동 시각으로 잡는다. 고정된
+          # --since 20m으로 두면 20분 안에 다시 배포했을 때 직전 배포가 남긴
+          # 프로비저닝 오류를 다시 읽어서, 이미 고친 배포가 계속 실패한다.
+          # 위에서 CONFIG_SERVICES에 grafana가 들어 있어 반드시 restart하므로
+          # StartedAt은 항상 이번 배포의 값이고, 그 시각 이후의 로그에는 이번
+          # 배포의 프로비저닝 결과가 빠짐없이 들어 있다.
+          #
+          # docker의 --since는 RFC3339를 받는다. StartedAt은 나노초까지 붙은
+          # 형식이라 소수점 이하를 떼어 초 단위로 내림한다. 내림한 시각은 실제
+          # 기동 시각보다 앞서므로 첫 줄을 놓치지 않는다. inspect가 실패하면
+          # 이 step이 시작한 시각으로 물러선다.
+          deploy_start="$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
+          grafana_since="$(sudo docker inspect -f '{{.State.StartedAt}}' vm2-grafana 2>/dev/null \
+            | sed -E 's/\.[0-9]+Z?$/Z/' || true)"
+          if [ -z "$grafana_since" ]; then
+            grafana_since="${deploy_start:-20m}"
+          fi
+          echo "  Grafana 프로비저닝 로그를 ${grafana_since} 이후로 한정해서 읽는다."
+
+          # 로그 조회 자체의 성공 여부를 먼저 가린다.
+          #
+          # 이전 판은 `$COMPOSE logs ... 2>&1 | grep ... || true` 한 줄이었다.
+          # 파이프라인의 종료 코드는 마지막 grep의 것이고 거기에 || true가 붙어
+          # 있으므로, compose가 컨테이너를 찾지 못해 실패해도 결과는 "오류 없음"과
+          # 구분되지 않았다. 검사가 조용히 통과하는 쪽으로 무너지는 형태다.
+          #
+          # 2>&1로 stderr를 섞지 않는 이유도 같다. compose가 stderr로 내보내는
+          # 경고에 error라는 낱말이 들어 있으면 프로비저닝 오류로 오판한다.
+          # 컨테이너 로그는 stdout으로만 오므로 두 흐름을 나누어 받고, stderr는
+          # 조회가 실패했을 때 원인을 보여 주는 데에만 쓴다.
+          prov_out="$(mktemp)"
+          prov_diag="$(mktemp)"
+          logs_rc=0
+          $COMPOSE logs --no-color --since "$grafana_since" grafana \
+            > "$prov_out" 2> "$prov_diag" || logs_rc=$?
+          if [ "$logs_rc" -ne 0 ]; then
+            echo "::error::Grafana 로그를 조회하지 못해 프로비저닝 검사를 수행할 수 없다 (docker compose logs 종료 코드 ${logs_rc})."
+            cat "$prov_diag" >&2
+            rm -f "$prov_out" "$prov_diag"
+            exit 1
+          fi
+          prov_err="$(grep -iE 'level=(error|eror)|lvl=eror' "$prov_out" \
+            | grep -i 'provision' || true)"
+          rm -f "$prov_out" "$prov_diag"
+          if [ -n "$prov_err" ]; then
+            echo "Grafana 프로비저닝 오류가 있다:" >&2
+            printf '%s\n' "$prov_err" >&2
+            exit 1
+          fi
+          echo "  OK: Grafana provisioning (오류 로그 없음)"
+
+          check_log_pipeline "$LOG_PROBE_MARKER" || exit 1
+          # === remote-apply end ===
           ENDSSH
+
+      - name: Verify scrape targets and rules
+        id: verify
+        env:
+          VM2_HOST: ${{ secrets.VM2_HOST }}
+        run: |
+          set -euo pipefail
+
+          SSH_OPTS="-i $HOME/.ssh/id_deploy -o StrictHostKeyChecking=yes"
+          REMOTE="ubuntu@${VM2_HOST}"
+          TARGETS_JSON="${RUNNER_TEMP}/targets.json"
+          RULES_JSON="${RUNNER_TEMP}/rules.json"
+          CONFIG_JSON="${RUNNER_TEMP}/config.json"
+
+          # VM2에 jq가 설치되어 있다고 보장할 수 없다. 기존 단계가 원격에서 curl과
+          # grep만 쓰던 것도 같은 이유다. 그래서 원격에서는 JSON을 그대로 받아오기만
+          # 하고, 파싱과 판정은 jq가 기본 제공되는 러너에서 수행한다.
+          fetch() {
+            # SSH_OPTS는 여러 인자라서 분리되어야 하고(SC2086), $1은 원격이 아니라
+            # 러너에서 펼쳐지는 것이 의도한 동작이다(SC2029).
+            # shellcheck disable=SC2086,SC2029
+            ssh $SSH_OPTS "$REMOTE" "curl -fsS --max-time 10 'http://127.0.0.1:9090$1'"
+          }
+
+          # === verify-logic begin ===
+          # 아래 함수들은 순수 판정 로직이다. 인자로 받은 파일만 읽고 네트워크에
+          # 접근하지 않으므로, 가짜 응답으로 따로 시험할 수 있다.
+
+          # YAML을 파싱하는 도구를 먼저 확인한다.
+          #
+          # 기대값은 저장소의 prometheus.yml과 rule 파일에서 뽑는데, 이전 판은 그
+          # 일을 grep과 sed로 했다. 줄 모양만 보는 방식이라 아래 두 가지를 오판한다.
+          #   - 인라인 주석: `- job_name: "alloy"  # 잠시 끔` 은 주석까지 이름에
+          #     들어가거나, 주석으로 꺼 둔 `# - job_name: "x"` 를 살아 있는 job으로
+          #     세지는 않지만 들여쓰기가 다른 형태에서는 경계가 흐려진다.
+          #   - 블록 스칼라: expr나 annotations 안의 여러 줄 문자열에 `- alert: X`
+          #     같은 텍스트가 들어 있으면 그것까지 규칙 이름으로 센다.
+          # 그래서 실제 YAML 파서를 쓴다.
+          #
+          # 러너 이미지 문서(actions/runner-images의 Ubuntu Readme) 기준으로
+          # ubuntu-latest에는 yq 4.x(mikefarah)와 jq가 기본으로 들어 있다. PyYAML은
+          # 문서에 없으므로 python3 쪽에 기대지 않는다. 그래도 도구가 조용히
+          # 사라졌을 때 검사가 통과하는 쪽으로 무너지면 안 되므로, 없거나 다른
+          # 구현이면 여기에서 분명하게 실패시킨다. (kislyuk/yq는 같은 이름이지만
+          # 인자 문법이 달라서 섞이면 조용히 빈 결과를 낸다.)
+          require_yaml_tools() {
+            if ! command -v yq >/dev/null 2>&1; then
+              echo "::error::yq가 없어서 저장소의 YAML에서 기대값을 계산할 수 없다. 러너 이미지를 확인한다."
+              return 1
+            fi
+            if ! yq --version 2>&1 | grep -qi 'mikefarah'; then
+              echo "::error::yq가 mikefarah 판이 아니다. 이 단계는 'yq -o=json' 문법을 전제한다. 판별 결과: $(yq --version 2>&1)"
+              return 1
+            fi
+            if ! command -v jq >/dev/null 2>&1; then
+              echo "::error::jq가 없어서 응답을 판정할 수 없다. 러너 이미지를 확인한다."
+              return 1
+            fi
+            return 0
+          }
+
+          # YAML 파일 하나를 한 줄 JSON으로 바꾼다. 뒤의 추출은 모두 jq가 맡는다.
+          # yq만으로도 뽑을 수 있지만, 이 파일의 나머지 판정이 전부 jq로 쓰여 있어
+          # 표현을 한 가지로 맞추는 편이 읽기 쉽다.
+          yaml_to_json() {
+            yq -o=json -I=0 '.' "$1"
+          }
+
+          # 필수 job 중 up이 아닌 것을 job/health/instance/lastError 순서의 TSV로
+          # 출력한다. 출력이 비어 있으면 필수 집합이 모두 up이라는 뜻이다.
+          # 활성 target이 아예 없는 job도 실패로 본다. target 파일이 지워지면
+          # 그 job은 down이 아니라 목록에서 사라지기 때문이다.
+          required_down() {
+            jq -r --arg req "$REQUIRED_JOBS" '
+              ($req | split(" ") | map(select(length > 0))) as $required
+              | (.data.activeTargets // []) as $targets
+              | $required[]
+              | . as $job
+              | [ $targets[] | select(.labels.job == $job) ] as $inst
+              | if ($inst | length) == 0 then
+                  [$job, "missing", "-", "활성 target이 없다"]
+                else
+                  ( $inst[]
+                    | select(.health != "up")
+                    | [ $job,
+                        .health,
+                        (.labels.instance // .scrapeUrl // "-"),
+                        ((.lastError // "") | gsub("[|\n\t]"; " ")) ] )
+                end
+              | @tsv
+            ' "$1"
+          }
+
+          # 필수 집합에 없으면서 up이 아닌 target을 job/instance/health/lastError
+          # 순서의 TSV로 출력한다. 경고와 job summary에만 쓰고 실패로 다루지 않는다.
+          optional_down() {
+            jq -r --arg req "$REQUIRED_JOBS" '
+              ($req | split(" ") | map(select(length > 0))) as $required
+              | (.data.activeTargets // [])[]
+              | select(.health != "up")
+              # job 이름을 먼저 붙잡아 둔다. index(...)의 인자 안에서는 .이
+              # $required 배열을 가리키므로 .labels.job을 그대로 쓸 수 없다.
+              | (.labels.job // "-") as $job
+              | select(($required | index($job)) == null)
+              | [ $job,
+                  (.labels.instance // .scrapeUrl // "-"),
+                  .health,
+                  ((.lastError // "") | gsub("[|\n\t]"; " ") | .[0:160]) ]
+              | @tsv
+            ' "$1"
+          }
+
+          # health 값별 target 수를 TSV로 출력한다.
+          health_counts() {
+            jq -r '
+              (.data.activeTargets // [])
+              | group_by(.health)[]
+              | [ (.[0].health), (length | tostring) ]
+              | @tsv
+            ' "$1"
+          }
+
+          # 로드된 rule group 수를 출력한다.
+          rule_group_count() {
+            jq -r '(.data.groups // []) | length' "$1"
+          }
+
+          # Prometheus가 실제로 들고 있는 rule group 이름과 alert 이름이다.
+          loaded_groups() {
+            jq -r '(.data.groups // [])[].name' "$1" | sort
+          }
+          loaded_alerts() {
+            jq -r '(.data.groups // [])[].rules[] | select(.type == "alerting") | .name' "$1" | sort
+          }
+
+          # Prometheus가 실제로 읽고 있는 설정의 scrape job 이름이다.
+          # /api/v1/status/config는 파일을 그대로 돌려주지 않고 기본값을 채워
+          # 다시 직렬화한 YAML을 돌려준다. 그래서 파일과 통째로 비교하지 않고
+          # job 이름 집합만 뽑아서 본다. 이 집합이 저장소와 다르면 컨테이너가
+          # 옛 prometheus.yml을 그대로 들고 있다는 뜻이다.
+          #
+          # 응답의 .data.yaml은 YAML 문자열이므로 한 번 더 파싱한다. Prometheus가
+          # 직렬화한 YAML에는 주석이 없지만, relabel의 replacement 값처럼 문자열
+          # 안에 job_name이라는 낱말이 들어갈 수 있어서 줄 모양으로 세면 틀린다.
+          loaded_jobs() {
+            local tmp
+            tmp="$(mktemp)"
+            jq -r '.data.yaml' "$1" > "$tmp"
+            yaml_to_json "$tmp" | jq -r '(.scrape_configs // [])[].job_name' | sort
+            rm -f "$tmp"
+          }
+
+          # 저장소 파일에서 계산한 기대값이다. 러너의 checkout만 읽으며 비밀을
+          # 사용하지 않는다. rsync가 rules 디렉터리를 --delete로 맞추므로 저장소의
+          # rule 파일 집합과 VM2의 집합은 같아야 한다.
+          #
+          # 한계: 이름 집합만 비교하므로 "규칙이 거기 있다"까지만 보증한다. expr나
+          # for나 labels가 바뀐 것은 이름이 같으면 잡지 못한다. 식 내용까지 보려면
+          # 저장소 쪽 expr를 Prometheus가 /api/v1/rules로 돌려주는 query 문자열과
+          # 맞춰야 하는데, Prometheus는 식을 파싱한 뒤 제 표기로 다시 직렬화해서
+          # 돌려주므로(공백, 괄호, 숫자 표기가 모두 달라진다) 해시 비교가 성립하지
+          # 않는다. PromQL 파서를 러너에 들여 정규화하는 방법이 남지만, 이 단계가
+          # 막으려는 실패("설정이 전송되지 않았다", "옛 파일을 들고 있다")는 이름
+          # 집합만으로도 드러나므로 거기까지 가지 않는다. 식 내용은 promtool test
+          # rules가 맡는다. 같은 한계를 monitoring/README.md에도 적어 두었다.
+          expected_groups() {
+            local f
+            for f in "$1"/*.yml; do
+              yaml_to_json "$f" | jq -r '(.groups // [])[].name'
+            done | sort
+          }
+          expected_alerts() {
+            local f
+            for f in "$1"/*.yml; do
+              yaml_to_json "$f" \
+                | jq -r '(.groups // [])[].rules[] | select(has("alert")) | .alert'
+            done | sort
+          }
+          expected_jobs() {
+            yaml_to_json "$1" | jq -r '(.scrape_configs // [])[].job_name' | sort
+          }
+
+          # 기대 집합과 실제 집합을 비교한다. 같으면 0, 다르면 차이를 출력하고 1이다.
+          compare_sets() {
+            local label="$1" expected_file="$2" actual_file="$3"
+            if diff -u "$expected_file" "$actual_file" > /tmp/setdiff.$$ 2>&1; then
+              rm -f /tmp/setdiff.$$
+              return 0
+            fi
+            echo "${label}이 저장소의 기대값과 다르다. -는 저장소, +는 Prometheus다." >&2
+            sed -e '1,2d' /tmp/setdiff.$$ >&2
+            rm -f /tmp/setdiff.$$
+            return 1
+          }
+          # === verify-logic end ===
+
+          require_yaml_tools || exit 1
+
+          # scrape_interval이 15초이고 msa-services의 file_sd는 30초마다 다시 읽는다.
+          # 기동 직후에는 아직 한 번도 수집하지 못한 target이 unknown으로 남으므로,
+          # 한 바퀴 돌 시간을 준 뒤에 확인하고 실패하면 다시 본다.
+          echo "scrape가 안정될 때까지 기다린다."
+          sleep 30
+
+          attempts=12
+          down=''
+          for i in $(seq 1 "$attempts"); do
+            fetch '/api/v1/targets?state=active' > "$TARGETS_JSON"
+            down="$(required_down "$TARGETS_JSON")"
+            if [ -z "$down" ]; then
+              echo "필수 target이 모두 up이다 (시도 ${i}/${attempts})."
+              break
+            fi
+            if [ "$i" -eq "$attempts" ]; then
+              break
+            fi
+            echo "아직 up이 아닌 필수 target이 있다 (시도 ${i}/${attempts}). 15초 뒤에 다시 확인한다."
+            printf '%s\n' "$down"
+            sleep 15
+          done
+
+          {
+            echo "### 모니터링 배포 검증"
+            echo
+            echo "필수 job: \`${REQUIRED_JOBS}\`"
+            echo
+            echo "| health | target 수 |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          health_counts "$TARGETS_JSON" | while IFS=$'\t' read -r health count; do
+            echo "| ${health} | ${count} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          failed=0
+
+          if [ -n "$down" ]; then
+            failed=1
+            {
+              echo
+              echo "#### 필수 target 실패"
+              echo
+              echo "| job | health | instance | lastError |"
+              echo "|---|---|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$down" | while IFS=$'\t' read -r job health inst err; do
+              echo "::error::필수 target이 up이 아니다. job=${job} instance=${inst} health=${health} ${err}"
+              echo "| ${job} | ${health} | ${inst} | ${err} |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
+          opt="$(optional_down "$TARGETS_JSON")"
+          if [ -n "$opt" ]; then
+            {
+              echo
+              echo "#### 선택 target 경고"
+              echo
+              echo "아래 target은 배포를 실패시키지 않는다. VM1과 VM3의 node-exporter처럼"
+              echo "이 배포가 기동하지 않는 대상이 섞여 있기 때문이다."
+              echo
+              echo "| job | instance | health | lastError |"
+              echo "|---|---|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$opt" | while IFS=$'\t' read -r job inst health err; do
+              echo "::warning::선택 target이 up이 아니다. job=${job} instance=${inst} health=${health} ${err}"
+              echo "| ${job} | ${inst} | ${health} | ${err} |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
+          # rule 파일이 전송되지 않았거나 경로가 어긋나면 Prometheus는 오류 없이
+          # 그냥 규칙이 없는 상태로 뜬다. 경보가 전부 사라진 채로 배포가 성공하는
+          # 상황을 막기 위해 group 수를 확인한다.
+          fetch '/api/v1/rules' > "$RULES_JSON"
+          groups="$(rule_group_count "$RULES_JSON")"
+          echo "로드된 rule group 수: ${groups}"
+          if [ "$groups" -eq 0 ]; then
+            echo "::error::rule group이 하나도 로드되지 않았다. monitoring/prometheus/rules 전송과 prometheus.yml의 rule_files를 확인한다."
+            failed=1
+          fi
+
+          # 여기부터가 "설정이 실제로 반영되었는가"를 가르는 판정이다.
+          #
+          # 컨테이너가 옛 설정 파일을 그대로 들고 있어도 컨테이너는 정상으로 떠
+          # 있고 target도 up이다. 그래서 상태 확인만으로는 배포가 반영되지 않은
+          # 것을 알 수 없다. 저장소에서 계산한 기대값과 Prometheus가 지금 들고
+          # 있는 값을 직접 비교해서, 다르면 배포를 실패로 끝낸다.
+          fetch '/api/v1/status/config' > "$CONFIG_JSON"
+
+          expected_groups monitoring/prometheus/rules      > "${RUNNER_TEMP}/exp_groups"
+          expected_alerts monitoring/prometheus/rules      > "${RUNNER_TEMP}/exp_alerts"
+          expected_jobs   monitoring/prometheus/prometheus.yml > "${RUNNER_TEMP}/exp_jobs"
+          loaded_groups "$RULES_JSON"  > "${RUNNER_TEMP}/got_groups"
+          loaded_alerts "$RULES_JSON"  > "${RUNNER_TEMP}/got_alerts"
+          loaded_jobs   "$CONFIG_JSON" > "${RUNNER_TEMP}/got_jobs"
+
+          exp_group_n="$(wc -l < "${RUNNER_TEMP}/exp_groups" | tr -d ' ')"
+          exp_alert_n="$(wc -l < "${RUNNER_TEMP}/exp_alerts" | tr -d ' ')"
+          got_alert_n="$(wc -l < "${RUNNER_TEMP}/got_alerts" | tr -d ' ')"
+
+          {
+            echo
+            echo "| 반영 확인 | 저장소 | Prometheus |"
+            echo "|---|---|---|"
+            echo "| rule group 수 | ${exp_group_n} | ${groups} |"
+            echo "| alert 규칙 수 | ${exp_alert_n} | ${got_alert_n} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if ! compare_sets 'rule group 이름' "${RUNNER_TEMP}/exp_groups" "${RUNNER_TEMP}/got_groups"; then
+            echo "::error::rule group 이름이 저장소와 다르다. rules 전송과 prometheus 재시작을 확인한다."
+            failed=1
+          fi
+          if ! compare_sets 'alert 규칙 이름' "${RUNNER_TEMP}/exp_alerts" "${RUNNER_TEMP}/got_alerts"; then
+            echo "::error::alert 규칙 이름이 저장소와 다르다. rules 전송과 prometheus 재시작을 확인한다."
+            failed=1
+          fi
+          # scrape job 비교는 설정에 적힌 job_name 기준이다. file_sd를 쓰는
+          # msa-services job은 relabel이 최종 job label을 msa-<service>로 바꾸지만,
+          # /api/v1/status/config가 돌려주는 것은 relabel 이전의 설정이므로 양쪽
+          # 모두 msa-services로 나온다. relabel 이후의 이름을 보는 곳은 위의
+          # REQUIRED_JOBS 판정이고, 두 판정은 서로 다른 질문에 답한다.
+          if ! compare_sets 'scrape job 이름' "${RUNNER_TEMP}/exp_jobs" "${RUNNER_TEMP}/got_jobs"; then
+            echo "::error::Prometheus가 읽고 있는 prometheus.yml이 저장소와 다르다. 단일 파일 bind mount가 옛 inode를 보고 있을 수 있다."
+            failed=1
+          fi
+          if [ "$failed" -eq 0 ]; then
+            echo "  OK: rule group ${groups}개, alert 규칙 ${got_alert_n}개, scrape job 목록이 저장소와 같다."
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+
+      # 여기까지 오면 필수 검증이 모두 끝났다. 원격 healthcheck와 로그 종단 확인은
+      # 앞 step이, target과 rule과 job 집합 판정은 바로 위 step이 마쳤다. 구
+      # Promtail 컨테이너를 지우는 일은 그 뒤에 오는 마지막 단계여야 한다. 이전
+      # 판은 원격 step 안에서 지웠기 때문에, 러너에서 도는 target과 rule 판정이
+      # 실패해도 되돌릴 대상이 이미 사라진 뒤였다.
+      - name: Remove the old Promtail container
+        env:
+          VM2_HOST: ${{ secrets.VM2_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
+            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH'
+          # === remote-finalize begin ===
+          set -euo pipefail
+          STATE_DIR=/opt/bnbong/.monitoring-deploy-state
+          PROMTAIL_CONFIG=/opt/bnbong/monitoring/loki/promtail-config.yml
+
+          promtail_exists="$(sudo cat "$STATE_DIR/promtail_exists" 2>/dev/null || echo 0)"
+
+          if [ "$promtail_exists" = "1" ]; then
+            echo "  vm2-promtail 컨테이너를 지운다."
+            sudo docker rm vm2-promtail >/dev/null
+          else
+            echo "  vm2-promtail 컨테이너가 처음부터 없었다."
+          fi
+          if sudo docker ps -a --format '{{.Names}}' | grep -qx 'vm2-promtail'; then
+            echo "vm2-promtail 컨테이너가 아직 남아 있다." >&2
+            exit 1
+          fi
+          echo "  OK: vm2-promtail 컨테이너 없음"
+
+          # 컨테이너를 지웠으므로 구 설정 파일을 들고 있을 이유가 없어졌다. 여기에서
+          # 지우지 않으면 rsync의 --exclude 때문에 이 파일이 VM2에 영구히 남는다.
+          # 파일이 없으면 아무 일도 하지 않으므로 몇 번을 배포해도 결과가 같다.
+          if [ -e "$PROMTAIL_CONFIG" ]; then
+            echo "  구 Promtail 설정 파일을 지운다: ${PROMTAIL_CONFIG}"
+            sudo rm -rf "$PROMTAIL_CONFIG"
+          fi
+
+          # 전환 상태 파일도 함께 치운다. 전환 진행 표식(transition_in_progress)이
+          # 여기에서 사라지는 것이 핵심이다. 그 표식은 전환이 성공적으로 끝났을
+          # 때(이 단계)나 복구가 성공했을 때에만 지워지며, 남아 있으면 다음 배포가
+          # "지난 실행이 미완료였다"고 판단한다. 다음 배포는 컨테이너가 없다는
+          # 사실을 다시 판정해서 모든 단계를 조용히 건너뛴다.
+          sudo rm -rf "$STATE_DIR"
+          echo "  OK: 전환 잔여물 정리 완료"
+          # === remote-finalize end ===
+          ENDSSH
+
+      # 위의 두 검증 step 가운데 하나가 실패했거나 취소되었으면 구 Promtail을
+      # 되살린다.
+      #
+      # if: failure()를 쓰지 않고 step outcome을 직접 보는 이유는, 마지막 정리
+      # step이 실패했을 때에는 되돌리면 안 되기 때문이다. 그 시점에는 이미 모든
+      # 검증을 통과해서 Alloy가 정상으로 로그를 보내고 있으므로, Promtail을 다시
+      # 띄우려고 Alloy를 멈추는 쪽이 더 나쁘다. 남는 문제는 컨테이너 하나가 정지
+      # 상태로 남아 있는 것뿐이고 그것은 다음 배포가 정리한다. 같은 이유로
+      # cancelled도 정리 step의 것은 보지 않는다.
+      #
+      # cancelled를 조건에 넣은 이유
+      #   워크플로를 취소하면 그 시점에 돌고 있던 step의 outcome은 failure가 아니라
+      #   cancelled다. 이전 판은 failure만 보았기 때문에, apply가 Promtail을 멈춘 뒤
+      #   로그 종단 확인 도중에 취소되면 복구가 한 번도 돌지 않았다. Alloy가 실제로
+      #   전달하지 못하는 상태였다면 그 순간 수집기가 하나도 없다.
+      #
+      # apply가 skipped일 때(앞의 SSH 설정이나 파일 전송이 실패한 경우)는 넣지
+      # 않는다. 그 경로에서는 이 실행이 Promtail을 멈춘 적이 없으므로 되돌릴
+      # 대상도 없다. 그런데 상태 디렉터리에는 지난 실행의 값이 남아 있을 수 있어서,
+      # 조건에 넣으면 이번 배포가 건드리지도 않은 호스트를 지난 값으로 되돌리는
+      # 일이 생긴다. 그 상황의 정리는 다음 배포의 미완료 전환 감지가 맡는다.
+      # verify가 skipped인 경우(apply 실패)는 첫째 조건이 이미 받는다.
+      #
+      # always()를 쓰는 이유와 그 한계
+      #   취소된 job에서도 step이 돌게 하려면 always()가 필요하다. !cancelled()는
+      #   취소된 job에서 false가 되어 이 step을 건너뛴다. GitHub 문서는 always()를
+      #   "실패하면 워크플로가 시간 초과까지 멈출 수 있는 작업"에는 쓰지 말라고
+      #   하는데, 이 step은 ssh 한 번이고 아래에서 시간 상한을 걸어 두었다.
+      #   취소 뒤에 남는 시간은 5분이며(서버가 그 뒤에 강제로 끝낸다) 이 step의
+      #   최악 소요는 그보다 짧다. timeout-minutes를 4로 둔 것은 그 5분 안에서
+      #   러너가 스스로 끝맺고 아래의 수동 복구 안내를 남기게 하려는 것이다.
+      #
+      # 러너 자체가 죽는 경우는 워크플로로 막을 수 없다. 그때는 apply가 남긴
+      # 전환 진행 표식이 그대로 남고, 다음 배포가 그 표식을 보고 미완료 전환으로
+      # 판단한다. 사람이 곧바로 손으로 되돌리는 절차는 monitoring/README.md의
+      # "취소와 러너 사망으로 남는 상태" 항목에 있다.
+      - name: Restore Promtail after a failed deploy
+        if: >-
+          always() && (
+            steps.apply.outcome == 'failure' || steps.apply.outcome == 'cancelled' ||
+            (steps.apply.outcome == 'success' &&
+              (steps.verify.outcome == 'failure' || steps.verify.outcome == 'cancelled'))
+          )
+        timeout-minutes: 4
+        env:
+          VM2_HOST: ${{ secrets.VM2_HOST }}
+        run: |
+          # === restore-step begin ===
+          set -uo pipefail
+          # 이 step 자신의 ssh가 실패하는 경우를 사람이 반드시 알아야 한다.
+          # set -e로 곧바로 끝내면 로그 맨 끝에 ssh의 오류 한 줄만 남고, 무엇이
+          # 어떤 상태로 남았는지와 무엇을 손으로 해야 하는지가 드러나지 않는다.
+          # 그래서 종료 코드를 받아서 처리한다.
+          rc=0
+          ssh -o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=6 \
+            -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
+            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH' || rc=$?
+          # === remote-restore begin ===
+          set -euo pipefail
+          cd /opt/bnbong
+          COMPOSE="sudo docker compose -f docker-compose.monitoring.yml"
+          STATE_DIR=/opt/bnbong/.monitoring-deploy-state
+          PROMTAIL_CONFIG=/opt/bnbong/monitoring/loki/promtail-config.yml
+
+          # 어느 수집기가 돌고 있는지를 한 줄로 보고한다. 실패해서 끝낼 때마다
+          # 이 줄을 남겨야 사람이 지금 로그가 흐르고 있는지 곧바로 알 수 있다.
+          collector_state() {
+            local running p=중지 a=중지
+            running="$(sudo docker ps --format '{{.Names}}' 2>/dev/null || true)"
+            printf '%s\n' "$running" | grep -qx 'vm2-promtail' && p=실행
+            printf '%s\n' "$running" | grep -qx 'vm2-alloy'    && a=실행
+            echo "Promtail ${p}, Alloy ${a}"
+          }
+
+          was_running="$(sudo cat "$STATE_DIR/promtail_was_running" 2>/dev/null || echo 0)"
+          if [ "$was_running" != "1" ]; then
+            # 구 Promtail이 원래 없었거나 created 상태로 멈춰 있었던 경우다. 멈춰
+            # 있던 컨테이너는 로그를 보내고 있지 않았으므로 새로 살리지 않는다.
+            # 전환이 이미 끝난 호스트에서는 이 step 전체가 여기에서 끝난다.
+            echo "  이 배포가 멈춘 Promtail이 없으므로 되돌릴 것이 없다. 현재 상태: $(collector_state)"
+            exit 0
+          fi
+
+          # 순서를 "Promtail을 살린 뒤에 Alloy를 멈춘다"로 잡은 이유
+          #
+          # 이전 판은 Alloy를 가장 먼저 멈췄다. 그런데 이 step이 도는 경우 가운데
+          # 로그 종단 확인까지는 통과하고 러너의 target·rule 판정만 실패한 경로가
+          # 있다. 그 경로에서는 Alloy가 실제로 로그를 보내고 있었는데도 먼저 멈추고,
+          # 그 뒤 복원이나 기동이 실패하면 set -euo pipefail이 곧바로 스크립트를
+          # 끝내서 두 수집기가 모두 멈춘 채로 배포가 끝난다. 고치려던 문제보다 나쁜
+          # 상태를 복구가 직접 만드는 셈이다.
+          #
+          # 그래서 되돌릴 수 있는지부터 확인하고, Promtail이 실제로 running이 된
+          # 뒤에만 Alloy를 멈춘다. Promtail을 되살리지 못하면 Alloy는 건드리지 않고
+          # 그대로 둔 채 실패로 끝낸다. 적어도 한쪽은 계속 돌고 있게 하는 것이
+          # 이 단계의 목적이다.
+          #
+          # 그 대가로 두 수집기가 겹쳐 도는 구간이 생긴다. 그 구간의 로그는 stream
+          # label과 시각과 내용이 모두 같으므로 Loki가 중복으로 보고 버린다.
+          # 근거는 README의 "positions와 전환 시점의 중복과 유실" 항목에 있고,
+          # 전환 시험에서 실제로 측정한 결과다. 겹침은 버려지는 쪽이고 공백은
+          # 되돌릴 수 없는 쪽이므로 겹침을 고른다.
+          #
+          # 아래에서는 각 명령의 종료 코드를 직접 받는다. set -e에 맡기면 어느
+          # 줄에서 끊겼는지와 그때 어느 수집기가 돌고 있는지를 남기지 못한 채
+          # 스크립트가 끝난다.
+
+          # 1. 되돌릴 수 있는 상태인지 먼저 확인한다. 아직 아무것도 멈추지 않았다.
+          #
+          #    Promtail은 설정 파일 하나를 단일 파일 bind mount로 들고 있다. 원본이
+          #    없는 상태에서 docker start를 하면 Docker가 그 경로에 빈 디렉터리를
+          #    만들고 "Are you trying to mount a directory onto a file" 오류로
+          #    시작에 실패한다. 한 번 디렉터리가 생기면 파일을 되돌려 놓기 전에
+          #    먼저 디렉터리를 지워야 한다. docker:27-dind에서 재현해서 확인했다.
+          if [ -d "$PROMTAIL_CONFIG" ]; then
+            echo "  bind mount 원본 경로에 빈 디렉터리가 생겨 있다. 지운다."
+            sudo rm -rf "$PROMTAIL_CONFIG" || true
+          fi
+          if [ ! -f "$PROMTAIL_CONFIG" ]; then
+            if [ -f "$STATE_DIR/promtail-config.yml" ]; then
+              echo "  구 설정 파일이 없어서 보존해 둔 사본으로 되돌린다."
+              sudo mkdir -p "$(dirname "$PROMTAIL_CONFIG")" || true
+              if ! sudo cp "$STATE_DIR/promtail-config.yml" "$PROMTAIL_CONFIG"; then
+                echo "::error::구 Promtail 설정 사본을 되돌리지 못했다. Alloy는 건드리지 않았다. 현재 상태: $(collector_state)"
+                exit 1
+              fi
+            else
+              echo "::error::구 Promtail 설정 파일도 사본도 없어서 컨테이너를 되살릴 수 없다. 경로 ${PROMTAIL_CONFIG}. rsync의 --exclude 규칙이 지워졌는지 확인한다. Alloy는 건드리지 않았다. 현재 상태: $(collector_state)"
+              exit 1
+            fi
+          fi
+          echo "  OK: 구 설정 파일이 제자리에 있다."
+
+          # 2. 구 수집기를 시작한다. 여기까지도 Alloy는 그대로 돌고 있다.
+          if ! sudo docker start vm2-promtail >/dev/null; then
+            echo "::error::vm2-promtail을 시작하지 못했다. Alloy는 멈추지 않고 그대로 두었으므로 로그 수집은 Alloy가 이어 간다. 현재 상태: $(collector_state)"
+            sudo docker logs vm2-promtail --tail 50 >&2 || true
+            exit 1
+          fi
+
+          # 3. 정말로 돌고 있는지 확인한다. start가 0을 돌려주어도 곧바로 죽는
+          #    경우가 있으므로 상태를 몇 차례 다시 읽는다.
+          status=''
+          restored=0
+          for _ in $(seq 1 10); do
+            status="$(sudo docker inspect -f '{{.State.Status}}' vm2-promtail 2>/dev/null || echo missing)"
+            if [ "$status" = "running" ]; then
+              sleep 3
+              status="$(sudo docker inspect -f '{{.State.Status}}' vm2-promtail 2>/dev/null || echo missing)"
+              if [ "$status" = "running" ]; then
+                restored=1
+                break
+              fi
+            fi
+            sleep 3
+          done
+
+          if [ "$restored" -ne 1 ]; then
+            echo "::error::vm2-promtail을 되살리지 못했다 (상태 ${status}). Alloy는 멈추지 않고 그대로 두었으므로 로그 수집은 Alloy가 이어 간다. 현재 상태: $(collector_state)"
+            sudo docker logs vm2-promtail --tail 50 >&2 || true
+            exit 1
+          fi
+          echo "  OK: vm2-promtail이 다시 돌고 있다."
+
+          # 4. Promtail이 확인된 뒤에만 새 수집기를 멈춘다. docker-socket-proxy도
+          #    함께 멈춘다. 그 프록시를 쓰는 것은 Alloy뿐이므로, Alloy가 없는 동안
+          #    Docker 소켓을 든 컨테이너를 하나라도 줄여 두는 편이 낫다.
+          echo "  Alloy와 docker-socket-proxy를 멈춘다."
+          if ! $COMPOSE stop alloy docker-socket-proxy; then
+            # 여기서 실패해도 수집이 끊기지는 않는다. 두 수집기가 함께 도는
+            # 상태일 뿐이고 겹치는 로그는 Loki가 버린다. 배포를 실패로 끝낼
+            # 이유가 아니므로 경고만 남기고 복구는 성공으로 본다.
+            echo "::warning::Alloy와 docker-socket-proxy를 멈추지 못해 두 수집기가 함께 돌고 있다. 겹치는 로그는 Loki가 중복으로 버리지만, 손으로 정리한다. 현재 상태: $(collector_state)"
+          fi
+
+          # 5. 복구에 성공했으므로 전환 진행 표식을 지운다. 이 호스트는 배포 이전
+          #    상태로 돌아왔고 미완료 전환이 아니다. 표식을 남겨 두면 다음 배포가
+          #    지난 실행을 미완료로 오인한다.
+          sudo rm -f "$STATE_DIR/transition_in_progress" || true
+          echo "  OK: 로그 수집을 되살렸다. 현재 상태: $(collector_state)"
+          exit 0
+          # === remote-restore end ===
+          ENDSSH
+
+          # ssh 자체가 실패했거나 원격 스크립트가 실패로 끝난 경우다. 이 step이
+          # 조용히 넘어가면 사람은 "복구가 돌았다"고 믿게 된다. 로그와 job summary
+          # 양쪽에 손으로 확인할 명령을 남긴다.
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Promtail 복구 단계가 실패했다 (종료 코드 ${rc}). VM2의 로그 수집 상태를 손으로 확인한다."
+            {
+              echo
+              echo "#### Promtail 복구 실패"
+              echo
+              echo "복구 단계가 종료 코드 \`${rc}\`로 끝났습니다. ssh가 닿지 않았다면 원격에서 아무 일도"
+              echo "일어나지 않았고, 원격 스크립트가 실패했다면 Alloy는 멈추지 않은 채로 남아 있습니다."
+              echo "아래 명령으로 어느 수집기가 돌고 있는지 먼저 확인하십시오."
+              echo
+              echo '```bash'
+              echo "ssh ubuntu@<VM2_PUBLIC_IP>"
+              echo "sudo docker ps --format '{{.Names}} {{.Status}}' | grep -E 'vm2-(promtail|alloy)'"
+              echo "cat /opt/bnbong/.monitoring-deploy-state/promtail_was_running"
+              echo
+              echo "# 둘 다 멈춰 있으면 Alloy를 먼저 되살립니다"
+              echo "cd /opt/bnbong"
+              echo "sudo docker compose -f docker-compose.monitoring.yml up -d alloy docker-socket-proxy"
+              echo
+              echo "# 구 Promtail로 되돌려야 한다면"
+              echo "ls -l /opt/bnbong/monitoring/loki/promtail-config.yml"
+              echo "# 그 경로가 디렉터리이면 지우고 사본을 되돌립니다"
+              echo "sudo rm -rf /opt/bnbong/monitoring/loki/promtail-config.yml"
+              echo "sudo cp /opt/bnbong/.monitoring-deploy-state/promtail-config.yml \\"
+              echo "  /opt/bnbong/monitoring/loki/promtail-config.yml"
+              echo "sudo docker start vm2-promtail"
+              echo "sudo docker compose -f docker-compose.monitoring.yml stop alloy docker-socket-proxy"
+              echo
+              echo "# 되살린 뒤에는 전환 표식을 지웁니다"
+              echo "sudo rm -f /opt/bnbong/.monitoring-deploy-state/transition_in_progress"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
+          # === restore-step end ===
 
       - name: Clean up SSH key
         if: always()
