@@ -1250,6 +1250,64 @@ VM1이 들고 있는 `/etc/ssl/cloudflare/cert.pem`은 Cloudflare Origin CA가 �
 compose는 이 파일을 blackbox exporter 컨테이너에 따로 mount합니다. 설정 파일 하나만 mount하던
 이전 상태에서는 컨테이너 안에 CA 파일이 없어서 오리진 probe가 전부 실패합니다.
 
+#### CA 파일이 디렉터리로 보일 때의 복구
+
+2026-09-21에 오리진 probe가 한꺼번에 실패한 적이 있습니다. 증상은 두 가지 모습으로 드러납니다.
+첫째, 모든 오리진 target에서 `probe_success`가 0이 되는데, probe 한 번에 걸린 시간이 1밀리초에도
+미치지 않습니다. 네트워크에 나가 보지도 못한 채로 끝났다는 뜻입니다. 둘째, probe를 `&debug=true`와
+함께 호출하면 아래와 같은 줄이 나옵니다.
+
+```
+level=ERROR msg="Error generating HTTP client" module=http_2xx_origin
+  err="unable to read CA cert: unable to read file /etc/blackbox_exporter/cloudflare-origin-ca.pem:
+  read /etc/blackbox_exporter/cloudflare-origin-ca.pem: is a directory"
+```
+
+원인은 운영이 아니라 저장소 쪽에 있었습니다. `.gitignore`의 `*.pem` 규칙이
+`monitoring/blackbox/cloudflare-origin-ca.pem`까지 무시하고 있어서 이 파일이 git에 추적되지
+않았습니다. 배포 워크플로는 러너가 checkout한 `monitoring/` 디렉터리를 그대로 VM2로 rsync하므로,
+추적되지 않는 파일은 VM2에 도착할 수 없습니다. 원본이 없는 경로에 compose가 단일 파일 bind mount를
+걸면 Docker는 그 자리에 빈 디렉터리를 만듭니다. 그래서 컨테이너 안에서는 CA 파일이 있어야 할 자리가
+디렉터리로 보였습니다. 컨테이너도 정상으로 떠 있었고 `blackbox-exporter` job도 계속 up이었기 때문에,
+파일 하나가 없다는 사실이 어디에도 드러나지 않았습니다.
+
+지금은 세 곳에서 이 상황을 막습니다. `.gitignore`에 부정 규칙을 두어 이 파일을 추적하고, 배포
+워크플로가 전송 전에 compose가 참조하는 mount 원본이 checkout에 모두 있는지 점검하며, 배포가 끝난
+뒤에는 컨테이너 안에서 이 경로가 일반 파일인지 다시 확인합니다.
+
+컨테이너를 다시 시작하는 것만으로는 고쳐지지 않는다는 점에 주의해야 합니다. 컨테이너 안의 대상
+경로는 컨테이너를 만들 때 원본의 종류를 따라 만들어집니다. 따라서 원본만 파일로 바꾸어 놓고
+`docker restart`를 실행하면 mount 양쪽의 종류가 어긋나서
+`Are you trying to mount a directory onto a file (or vice-versa)?` 오류가 발생하고, 컨테이너가 아예
+기동하지 못합니다. 반드시 컨테이너를 다시 만들어야 파일로 붙습니다.
+
+배포를 기다리지 않고 VM2에서 곧바로 고칠 때에는 아래 순서를 따릅니다.
+
+```bash
+cd /opt/bnbong
+sudo docker compose -f docker-compose.monitoring.yml stop blackbox-exporter
+sudo rmdir monitoring/blackbox/cloudflare-origin-ca.pem
+# pem 파일을 제자리에 놓습니다. scp로 올리거나 배포를 다시 실행합니다.
+sudo docker compose -f docker-compose.monitoring.yml up -d --force-recreate blackbox-exporter
+```
+
+`rm -rf`가 아니라 `rmdir`을 쓰는 이유는, 그 경로에 예상하지 못한 내용이 들어 있을 때 조용히 지우지
+않고 분명하게 실패하도록 만들기 위해서입니다. 컨테이너를 먼저 멈추어야 mount가 풀리고, 그래야
+`rmdir`이 성공합니다. 고친 뒤에는 아래 두 명령으로 확인합니다.
+
+```bash
+sudo docker compose -f docker-compose.monitoring.yml exec -T blackbox-exporter \
+  test -f /etc/blackbox_exporter/cloudflare-origin-ca.pem && echo "CA 파일이 제자리에 있습니다"
+
+sudo docker compose -f docker-compose.monitoring.yml exec -T blackbox-exporter \
+  wget -qO- 'http://localhost:9115/probe?module=http_2xx_origin&target=https://10.0.1.133/health&hostname=api.bnbong.com' \
+  | grep '^probe_success'
+```
+
+첫 명령이 실패하면 CA 파일이나 mount에 문제가 남아 있다는 뜻입니다. 첫 명령이 성공하는데 둘째
+명령이 `probe_success 0`을 돌려준다면 CA 문제는 해소되었고 VM1의 오리진이 응답하지 않는 상황이므로,
+`OriginEndpointDown` 경보의 조치 항목을 따라 VM1 Nginx를 확인합니다.
+
 덕분에 감시 범위가 넓어졌습니다. 이전에는 `probe_ssl_earliest_cert_expiry`가 Cloudflare edge
 인증서의 만료 시각만 보여 주었고, VM1이 들고 있는 origin 인증서의 만료는 어떤 규칙으로도 감지되지
 않았습니다. 이제는 그 origin 인증서를 직접 봅니다. 갱신 주체도 Cloudflare가 아니라 사람이므로,

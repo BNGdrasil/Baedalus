@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import time
@@ -567,6 +568,96 @@ class RemoteExporterPreflight(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('(dry-run) chmod 0755', result.stdout)
         self.assertEqual(owned.stat().st_mode & 0o777, 0o700, result.stdout)
+
+class MonitoringBindMountSources(unittest.TestCase):
+    """2026-09-21 오리진 probe 전면 실패의 재발 방지 검사.
+
+    .gitignore 의 *.pem 규칙이 monitoring/blackbox/cloudflare-origin-ca.pem 을 무시했고,
+    deploy-monitoring.yml 은 러너가 checkout 한 monitoring/ 을 그대로 VM2 로 rsync 하므로
+    그 파일이 VM2 에 도착하지 않았다. 그 자리에 compose 가 단일 파일 bind mount 를 걸자
+    Docker 가 빈 디렉터리를 만들었고, 컨테이너 안에서는 CA 파일이 디렉터리로 보여서 모든
+    오리진 probe 가 1ms 도 되지 않아 "is a directory" 오류로 끝났다.
+
+    저장소 파일만 읽으므로 Docker 데몬과 SSH 와 운영 VM 이 모두 필요하지 않다.
+    """
+
+    COMPOSE = ROOT / 'monitoring/docker-compose.monitoring.yml'
+    BLACKBOX = ROOT / 'monitoring/blackbox/blackbox.yml'
+
+    # compose 의 짧은 문법 mount 한 줄이다. "- ./monitoring/<원본>:<대상>[:<옵션>]" 형태만
+    # 받는다. 긴 문법으로 적힌 항목은 지금 모두 /var/run/docker.sock 같은 호스트 절대
+    # 경로라서 이 검사의 대상이 아니다.
+    MOUNT_RE = re.compile(
+        r'^\s*-\s*(\./monitoring/[^:\s]+):(/[^:\s]+?)(?::([a-z,]+))?\s*$')
+
+    def mounts(self):
+        """compose 에서 ./monitoring/ 아래를 원본으로 삼는 mount 를 (원본, 대상) 으로 돌려준다."""
+        found = []
+        for line in self.COMPOSE.read_text().splitlines():
+            m = self.MOUNT_RE.match(line)
+            if m:
+                found.append((m.group(1), m.group(2)))
+        # 정규식이나 compose 의 표기가 바뀌어서 한 건도 잡히지 않으면 이 검사는
+        # 아무것도 보지 않으면서 통과하게 된다. 그 상태를 실패로 못 박는다.
+        self.assertGreaterEqual(
+            len(found), 10,
+            'compose 에서 ./monitoring/ mount 를 거의 찾지 못했다. MOUNT_RE 나 compose 표기를 확인한다.')
+        return found
+
+    def test_bind_mount_sources_exist_and_are_tracked(self):
+        """compose 가 참조하는 원본은 모두 존재해야 하고 무시 대상이 아니어야 한다.
+
+        무시되는 파일은 clean checkout 에 들어오지 않으므로 rsync 가 보낼 수 없다.
+        이 검사는 고치기 전의 .gitignore 에서 반드시 실패한다.
+        """
+        missing = []
+        ignored = []
+        for source, _target in self.mounts():
+            relative = source[len('./'):]
+            path = ROOT / relative
+            if not path.exists():
+                missing.append(source)
+                continue
+            # 종료 코드 0 은 "무시된다" 는 뜻이다. 부정 규칙에 걸린 경로는 0 이 아니다.
+            result = subprocess.run(['git', 'check-ignore', '-q', '--', relative],
+                                    cwd=str(ROOT), capture_output=True, timeout=30)
+            if result.returncode == 0:
+                ignored.append(source)
+
+        self.assertEqual(missing, [], 'compose 가 mount 하는 원본이 저장소에 없다.')
+        self.assertEqual(
+            ignored, [],
+            'compose 가 mount 하는 원본이 .gitignore 로 무시되고 있다. '
+            '배포는 checkout 의 내용만 보내므로 이 경로는 VM2 에 도착하지 않고, '
+            'Docker 가 그 자리에 빈 디렉터리를 만든다.')
+
+    def test_blackbox_ca_file_points_at_a_compose_mount_target(self):
+        """blackbox.yml 의 ca_file 은 compose 가 실제로 mount 하는 대상 경로여야 한다.
+
+        두 파일 가운데 한쪽만 고치면 컨테이너는 정상으로 뜨고 probe 시점에만 실패한다.
+        그 실패는 오리진이 죽은 것과 지표에서 구분되지 않으므로 여기에서 묶어 둔다.
+        """
+        ca_files = re.findall(r'^\s*ca_file:\s*(\S+)\s*$',
+                              self.BLACKBOX.read_text(), re.MULTILINE)
+        self.assertEqual(len(ca_files), 1,
+                         'blackbox.yml 의 ca_file 항목이 하나가 아니다: %r' % (ca_files,))
+        ca_file = ca_files[0]
+
+        targets = {target: source for source, target in self.mounts()}
+        self.assertIn(ca_file, targets,
+                      'blackbox.yml 의 ca_file 경로를 compose 가 mount 하지 않는다. '
+                      '이 상태에서는 컨테이너 안에 CA 파일이 없어서 오리진 probe 가 전부 실패한다.')
+
+        # 원본 쪽도 함께 본다. 빈 파일이거나 인증서가 아니면 exporter 는 기동에
+        # 성공하고 probe 에서만 실패한다.
+        source = ROOT / targets[ca_file][len('./'):]
+        self.assertTrue(source.is_file(), '%s 가 일반 파일이 아니다.' % source)
+        body = source.read_text()
+        self.assertIn('BEGIN CERTIFICATE', body,
+                      '%s 에 인증서가 들어 있지 않다.' % source)
+        self.assertNotIn('PRIVATE KEY', body,
+                         '%s 에 개인 키가 들어 있다. 이 파일은 공개 루트 묶음이어야 한다.' % source)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -63,6 +63,19 @@ Thumbs.db
 id_rsa
 id_rsa.pub
 
+# 위의 *.pem은 개인 키가 저장소에 들어오는 것을 막으려는 규칙이지만, 이 파일
+# 하나는 예외로 두어 반드시 추적한다. Cloudflare가 공개하는 Origin CA 루트
+# 인증서 묶음이라 개인 키가 들어 있지 않고 비밀도 아니다. blackbox exporter가
+# 오리진 probe의 신뢰 앵커로 읽는 파일이다.
+#
+# 추적해야 하는 이유는 배포 경로에 있다. deploy-monitoring.yml은 러너가
+# checkout한 monitoring/ 디렉터리를 그대로 VM2로 rsync한다. 무시되는 파일은
+# checkout에 아예 없으므로 VM2에도 도착하지 않는다. 그 상태에서 compose가 단일
+# 파일 bind mount를 걸면 Docker가 원본 경로에 빈 디렉터리를 만들고, 컨테이너
+# 안에서는 CA 파일 자리가 디렉터리로 보여서 오리진 probe가 전부 "is a directory"
+# 오류로 실패한다. 2026-09-21에 운영에서 실제로 겪은 장애다.
+!monitoring/blackbox/cloudflare-origin-ca.pem
+
 # OCI specific
 oci_api_key.pem
 oci_api_key_public.pem

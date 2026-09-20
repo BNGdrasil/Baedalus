@@ -64,6 +64,129 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 저장소의 checkout만 읽는 사전 점검이다. SSH도 VM2도 필요하지 않으므로
+      # 가장 앞에 두었고, 보낼 수 없는 상태라면 운영을 아무것도 건드리기 전에
+      # 배포가 끝난다.
+      #
+      # 이 점검이 막으려는 결함
+      #   2026-09-21에 오리진 probe가 전부 실패했다. 원인은 .gitignore의 *.pem
+      #   규칙이 monitoring/blackbox/cloudflare-origin-ca.pem을 무시한 것이었다.
+      #   무시된 파일은 러너의 checkout에 아예 없으므로 아래 rsync가 보낼 것도
+      #   없었고, VM2에는 파일이 도착하지 않았다. 그 경로에 compose가 단일 파일
+      #   bind mount를 걸자 Docker가 원본 자리에 빈 디렉터리를 만들었고,
+      #   컨테이너 안에서는 CA 파일이 디렉터리로 보여서 모든 probe가 1ms도 되지
+      #   않아 "is a directory" 오류로 끝났다.
+      #
+      #   이 결함이 오래 숨어 있었던 이유는 기존 검증이 전부 통과했기 때문이다.
+      #   컨테이너는 정상으로 떠 있고 blackbox-exporter job도 up이며 rule 집합도
+      #   저장소와 같다. 파일 하나가 없다는 사실만 어디에도 드러나지 않았다.
+      #   그래서 "compose가 참조하는 원본이 checkout에 실제로 있는가"를 전송 전에
+      #   직접 묻는다. 같은 형태의 결함은 어느 서비스에서도 생길 수 있으므로
+      #   pem 하나가 아니라 ./monitoring/ 아래의 모든 mount 원본을 훑는다.
+      - name: Pre-flight bind mount sources in the checkout
+        run: |
+          set -euo pipefail
+
+          # YAML 파서를 확인하는 기준은 아래 "Verify scrape targets and rules"
+          # 단계의 require_yaml_tools와 같다. 줄 모양만 보는 grep으로 compose를
+          # 읽으면 인라인 주석이나 긴 문법 mount에서 틀리므로 실제 파서를 쓴다.
+          # 도구가 조용히 사라졌을 때 점검이 통과하는 쪽으로 무너지면 안 되므로
+          # 여기에서 분명하게 실패시킨다.
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "::error::yq가 없어서 compose의 mount 원본을 계산할 수 없다. 러너 이미지를 확인한다."
+            exit 1
+          fi
+          if ! yq --version 2>&1 | grep -qi 'mikefarah'; then
+            echo "::error::yq가 mikefarah 판이 아니다. 이 단계는 'yq -o=json' 문법을 전제한다. 판별 결과: $(yq --version 2>&1)"
+            exit 1
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq가 없어서 compose의 mount 원본을 계산할 수 없다. 러너 이미지를 확인한다."
+            exit 1
+          fi
+
+          COMPOSE_FILE=monitoring/docker-compose.monitoring.yml
+
+          # compose가 참조하는 ./monitoring/ 아래의 bind mount 원본 목록이다.
+          # 짧은 문법("원본:대상:옵션")과 긴 문법(source와 target을 적는 맵)을
+          # 모두 받는다. 지금 긴 문법으로 적힌 항목은 /var/run/docker.sock처럼
+          # 호스트의 절대 경로뿐이라 아래 필터에 걸리지 않지만, 나중에 표기가
+          # 바뀌어도 빠지지 않도록 함께 훑는다.
+          sources="$(yq -o=json -I=0 '.' "$COMPOSE_FILE" | jq -r '
+            [ .services[]?.volumes[]? ]
+            | map(if type == "string" then . else (.source // empty) end)
+            | .[]
+            | select(startswith("./monitoring/"))
+            | split(":")[0]
+          ' | sort -u)"
+
+          # 결과가 비면 파서나 경로 표기가 바뀐 것이다. 그 상태를 통과로 두면
+          # 이 단계는 아무것도 보지 않으면서 성공하는 빈 점검이 된다.
+          if [ -z "$sources" ]; then
+            echo "::error::compose에서 ./monitoring/ 아래의 bind mount 원본을 하나도 찾지 못했다. ${COMPOSE_FILE}의 경로 표기나 위의 추출식을 확인한다."
+            exit 1
+          fi
+
+          echo "compose가 참조하는 ./monitoring/ 아래 mount 원본:"
+          printf '%s\n' "$sources" | sed 's/^/  /'
+
+          preflight_failed=0
+          while IFS= read -r src; do
+            [ -n "$src" ] || continue
+            # compose의 경로는 VM2의 /opt/bnbong 기준이고, checkout에서는 앞의
+            # "./"만 떼면 그대로 맞는다.
+            path="${src#./}"
+
+            if [ ! -e "$path" ]; then
+              echo "::error::compose가 mount하는 ${src}이 checkout에 없다. 이대로 배포하면 VM2의 같은 경로에 Docker가 빈 디렉터리를 만들고 해당 서비스의 설정이 조용히 사라진다."
+              preflight_failed=1
+              continue
+            fi
+
+            # 존재하는 것만으로는 부족하다. 추적되지 않는 파일은 다음 clean
+            # checkout에서 사라지므로 rsync가 보낼 수 없다. 이번 장애의 파일이
+            # 정확히 그 상태였다. 무시 규칙에 걸렸다면 어느 줄 때문인지까지
+            # 함께 남겨야 사람이 곧바로 고칠 수 있다.
+            if [ -d "$path" ]; then
+              tracked="$(git ls-files -- "$path" | head -n 1)"
+            else
+              tracked=''
+              git ls-files --error-unmatch -- "$path" >/dev/null 2>&1 && tracked="$path"
+            fi
+            if [ -z "$tracked" ]; then
+              # 무시 규칙에 걸린 것과 단순히 git add를 하지 않은 것은 고치는
+              # 방법이 다르므로 나누어 알린다. check-ignore는 부정 규칙에
+              # 걸렸을 때에도 -v로는 그 줄을 보여 주므로, 실제로 무시되는지는
+              # -q의 종료 코드로 가린다.
+              if git check-ignore -q -- "$path"; then
+                echo "::error::compose가 mount하는 ${src}이 .gitignore로 무시되고 있어서 checkout에 들어오지 않는다. rsync가 보내는 것은 checkout의 내용이므로 이 경로는 VM2에 도착하지 않는다. 해당 규칙: $(git check-ignore -v -- "$path" 2>/dev/null || echo '(확인 실패)')"
+              else
+                echo "::error::compose가 mount하는 ${src}이 git에 추적되지 않는다. 무시 규칙에는 걸리지 않았으므로 git add를 하지 않은 것으로 보인다. rsync가 보내는 것은 checkout의 내용이므로 이 경로는 VM2에 도착하지 않는다."
+              fi
+              preflight_failed=1
+            fi
+          done <<< "$sources"
+
+          # 오리진 CA만 내용까지 본다. 위의 일반 점검은 "파일이 있는가"까지만
+          # 답하는데, 이 파일은 비어 있거나 엉뚱한 내용이어도 blackbox exporter가
+          # 기동에는 성공하고 probe 시점에만 실패한다. 그 실패는 VM1이 죽은
+          # 것과 지표에서 구분되지 않으므로 여기에서 걸러 둔다.
+          CA_PEM=monitoring/blackbox/cloudflare-origin-ca.pem
+          if [ ! -f "$CA_PEM" ]; then
+            echo "::error::${CA_PEM}이 일반 파일이 아니다. 오리진 probe의 신뢰 앵커이므로 이 상태로는 배포할 수 없다."
+            preflight_failed=1
+          elif ! grep -q 'BEGIN CERTIFICATE' "$CA_PEM"; then
+            echo "::error::${CA_PEM}에 인증서가 하나도 들어 있지 않다. Cloudflare Origin CA 루트 묶음이 맞는지 확인한다."
+            preflight_failed=1
+          else
+            echo "  OK: ${CA_PEM} (인증서 $(grep -c 'BEGIN CERTIFICATE' "$CA_PEM")개)"
+          fi
+
+          if [ "$preflight_failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "  OK: compose가 참조하는 mount 원본이 모두 checkout에 있고 추적되고 있다."
+
       - name: Configure SSH
         env:
           VM2_SSH_PRIVATE_KEY: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
@@ -78,6 +201,64 @@ jobs:
           # 중간자가 끼어들어도 배포가 그대로 진행된다.
           printf '%s\n' "$VM2_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+
+      # 지난 장애가 VM2에 남긴 빈 디렉터리를 파일이 도착하기 전에 치운다.
+      #
+      # 왜 rsync에 맡기지 않는가
+      #   rsync만으로 대체되는지 직접 시험했다. 원본이 일반 파일이고 대상이 빈
+      #   디렉터리일 때 rsync -az --delete는 디렉터리를 지우고 파일을 놓는다.
+      #   대상이 비어 있지 않은 디렉터리일 때에도 결과는 같았다. 그러니 파일
+      #   자체는 rsync가 제자리에 놓아 준다.
+      #
+      #   문제는 그 다음이다. 운영 중인 vm2-blackbox-exporter는 컨테이너를 만들
+      #   당시의 원본이 디렉터리였기 때문에 컨테이너 안의 대상 경로도 디렉터리로
+      #   만들어져 있다. 원본만 파일로 바뀌면 mount의 양쪽 종류가 어긋나서,
+      #   docker restart가 아래 오류로 실패하고 컨테이너가 아예 뜨지 못한다.
+      #     not a directory: unknown: Are you trying to mount a directory onto a
+      #     file (or vice-versa)?
+      #   prom/blackbox-exporter:v0.28.0으로 직접 재현해서 확인했다. 아래
+      #   "Apply compose" 단계가 CONFIG_SERVICES를 restart하므로, 손대지 않으면
+      #   파일을 되돌려 놓는 배포가 오히려 exporter를 죽이면서 실패한다.
+      #
+      # 그래서 컨테이너를 먼저 지운다. 멈추기만 하면 뒤의 up -d가 같은 컨테이너를
+      # 다시 시작할 뿐이라 같은 오류로 실패한다. 지우면 up -d가 새로 만들면서
+      # 그때의 원본 종류에 맞추어 mount를 걸므로 파일로 올바르게 붙는다.
+      # 컨테이너를 지워도 잃는 상태가 없다. blackbox exporter는 설정 파일만 읽고
+      # 자체 저장소를 두지 않는다.
+      #
+      # 디렉터리가 아니면 아무 일도 하지 않으므로 몇 번을 배포해도 결과가 같다.
+      # rm -rf가 아니라 rmdir을 쓰는 이유는, 그 자리에 예상하지 못한 내용이 들어
+      # 있을 때 조용히 지우지 않고 시끄럽게 실패하게 하려는 것이다.
+      - name: Heal a stale bind mount directory on VM2
+        env:
+          VM2_HOST: ${{ secrets.VM2_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
+            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH'
+          # === remote-heal begin ===
+          set -euo pipefail
+          cd /opt/bnbong
+          COMPOSE="sudo docker compose -f docker-compose.monitoring.yml"
+          CA_PEM=/opt/bnbong/monitoring/blackbox/cloudflare-origin-ca.pem
+
+          if [ ! -d "$CA_PEM" ]; then
+            echo "  오리진 CA 경로가 디렉터리가 아니므로 치울 것이 없다: ${CA_PEM}"
+            exit 0
+          fi
+
+          echo "::warning::${CA_PEM}이 빈 디렉터리 상태다. 지난 배포에서 파일이 도착하지 않아 Docker가 만든 것으로 보인다. 컨테이너를 지우고 디렉터리를 치운다."
+
+          # 컨테이너가 살아 있는 동안에는 이 경로가 컨테이너의 mount로 잡혀
+          # 있어서 rmdir이 EBUSY로 실패한다. 먼저 지워서 mount를 놓게 한다.
+          $COMPOSE rm --stop --force blackbox-exporter
+
+          # 비어 있을 때에만 성공한다. 안에 무엇인가 들어 있다면 이 자리에서
+          # 멈추고 사람이 내용을 확인하는 편이 옳다.
+          sudo rmdir "$CA_PEM"
+          echo "  OK: 빈 디렉터리를 치웠다. 뒤의 rsync가 파일을 놓고 up -d가 컨테이너를 새로 만든다."
+          # === remote-heal end ===
+          ENDSSH
 
       - name: Transfer monitoring files
         env:
@@ -282,6 +463,33 @@ jobs:
           # 지정하지 않는다. --remove-orphans도 쓰지 않는다. profile로 꺼 둔
           # 컨테이너를 orphan으로 보고 지우는 일을 피하기 위해서다.
           $COMPOSE up -d
+
+          # 오리진 CA가 컨테이너 안에서 일반 파일로 보이는지 확인하고, 아니면
+          # 컨테이너를 다시 만든다.
+          #
+          # 앞의 "Heal a stale bind mount directory on VM2" 단계가 정상 경로를
+          # 담당하지만, 그 단계가 돌기 전에 컨테이너가 다른 방식으로 잘못 만들어진
+          # 경우가 남는다. 사람이 손으로 up -d를 했거나, 지난 배포가 중간에 끊겨
+          # 원본이 디렉터리인 채로 컨테이너만 새로 생긴 경우가 그렇다. 그래서
+          # 최종 상태를 컨테이너 안에서 한 번 더 확인한다.
+          #
+          # restart로는 고칠 수 없다는 점이 중요하다. 컨테이너 안의 대상 경로는
+          # 컨테이너를 만들 때 원본의 종류를 따라 만들어지므로, 원본만 파일로
+          # 바뀌면 restart는 mount 종류가 어긋나 실패하고 컨테이너가 죽는다.
+          # 반드시 다시 만들어야 파일로 붙는다. 그래서 이 확인은 아래의
+          # CONFIG_SERVICES restart보다 앞에 있어야 한다. 순서가 바뀌면 restart가
+          # 먼저 실패하면서 배포가 그 자리에서 끝난다.
+          #
+          # exec 자체가 실패하는 경우(컨테이너가 멈춰 있거나 없는 경우)도 같은
+          # 처리로 묶는다. 어느 쪽이든 다시 만드는 것이 옳은 대응이고, 다시 만든
+          # 뒤에도 문제가 남으면 아래 검증이 잡는다.
+          CA_IN_CONTAINER=/etc/blackbox_exporter/cloudflare-origin-ca.pem
+          if $COMPOSE exec -T blackbox-exporter test -f "$CA_IN_CONTAINER" 2>/dev/null; then
+            echo "  OK: blackbox exporter 안의 오리진 CA가 일반 파일이다."
+          else
+            echo "::warning::blackbox exporter 안의 ${CA_IN_CONTAINER}이 일반 파일이 아니다. 컨테이너를 다시 만들어 mount를 새로 건다."
+            $COMPOSE up -d --force-recreate blackbox-exporter
+          fi
 
           # 설정을 들고 있는 서비스를 다시 시작한다.
           #
@@ -850,6 +1058,72 @@ jobs:
           fi
           if [ "$failed" -eq 0 ]; then
             echo "  OK: rule group ${groups}개, alert 규칙 ${got_alert_n}개, scrape job 목록이 저장소와 같다."
+          fi
+
+          # 오리진 probe가 실제로 동작하는지 확인한다.
+          #
+          # 위의 판정들은 "Prometheus가 저장소와 같은 설정을 들고 있는가"까지만
+          # 답한다. 2026-09-21의 장애는 그 질문을 모두 통과했다. 설정도 규칙도
+          # 맞았고 blackbox-exporter job도 up이었지만, 컨테이너 안에 CA 파일이
+          # 없어서 오리진 probe만 전부 실패하고 있었다. 그래서 exporter를 통해
+          # probe를 한 번 실제로 쏘아 본다. 아래 로그 종단 확인이 로그가 정말로
+          # Loki에 닿는지 보는 것과 같은 성격의 확인이다.
+          #
+          # 두 가지를 나누어 판정하는 이유
+          #   컨테이너 안의 CA 파일이 일반 파일인지는 이 배포가 책임지는 사항이다.
+          #   파일이 도착하지 않았거나 mount가 디렉터리로 걸린 것은 배포 결함이므로
+          #   배포를 실패로 끝낸다.
+          #
+          #   probe 결과는 다르다. CA 파일이 제자리에 있는데도 probe가 실패한다면
+          #   그것은 VM1의 오리진이 응답하지 않는다는 뜻이고, 이 워크플로가 기동하는
+          #   대상의 문제가 아니다. 위의 REQUIRED_JOBS 주석에 적어 둔 기준을 그대로
+          #   따른다. 이 판정이 답해야 하는 질문은 "이번 모니터링 배포가 올바른가"이지
+          #   "다른 호스트가 살아 있는가"가 아니다. 여기에서 배포를 막으면 VM1이
+          #   아픈 동안에는 경보 규칙을 고치는 배포조차 나가지 못한다. 오리진이
+          #   내려간 상황은 OriginEndpointDown 경보가 담당하므로 경고만 남긴다.
+          #
+          # 포트를 게시하지 않는 서비스라서 VM2 호스트에서는 9115에 닿지 않는다.
+          # 컨테이너 안에서 호출하며, 이미지가 busybox 기반이라 curl이 없고 wget을
+          # 쓴다. compose의 healthcheck도 같은 이유로 wget을 쓴다.
+          BB_COMPOSE='cd /opt/bnbong && sudo docker compose -f docker-compose.monitoring.yml'
+          CA_IN_CONTAINER=/etc/blackbox_exporter/cloudflare-origin-ca.pem
+
+          # 질의 인자는 prometheus.yml의 blackbox-http-origin job이 relabel로 만드는
+          # 것과 같은 모양이다. 다섯 vhost 가운데 하나만 확인해도 CA와 mount가
+          # 성립하는지는 드러나므로 api.bnbong.com 하나로 충분하다. 이 vhost의
+          # 경로가 /health인 이유는 prometheus.yml의 해당 주석에 적혀 있다.
+          PROBE_QUERY='module=http_2xx_origin&target=https://10.0.1.133/health&hostname=api.bnbong.com'
+
+          # shellcheck disable=SC2086,SC2029
+          if ssh $SSH_OPTS "$REMOTE" "${BB_COMPOSE} exec -T blackbox-exporter test -f ${CA_IN_CONTAINER}"; then
+            echo "  OK: blackbox exporter 안의 오리진 CA가 일반 파일이다."
+
+            probe_body=''
+            # shellcheck disable=SC2086,SC2029
+            probe_body="$(ssh $SSH_OPTS "$REMOTE" \
+              "${BB_COMPOSE} exec -T blackbox-exporter wget -qO- 'http://localhost:9115/probe?${PROBE_QUERY}'" 2>&1 || true)"
+
+            if printf '%s\n' "$probe_body" | grep -qx 'probe_success 1'; then
+              echo "  OK: 오리진 probe가 성공했다 (api.bnbong.com)."
+            else
+              echo "::warning::오리진 CA는 제자리에 있지만 오리진 probe가 성공하지 않았다. CA나 mount의 문제가 아니라 VM1의 오리진이 응답하지 않는 상황으로 보인다. 배포는 실패로 끝내지 않으며, 이 상태가 이어지면 OriginEndpointDown 경보가 울린다."
+              # 원인을 좁힐 수 있도록 debug 출력을 남긴다. 여기에는 TLS 악수와
+              # 각 단계의 소요 시간이 함께 들어 있다.
+              # shellcheck disable=SC2086,SC2029
+              ssh $SSH_OPTS "$REMOTE" \
+                "${BB_COMPOSE} exec -T blackbox-exporter wget -qO- 'http://localhost:9115/probe?${PROBE_QUERY}&debug=true'" 2>&1 \
+                | tail -n 60 || true
+              {
+                echo
+                echo "#### 오리진 probe 경고"
+                echo
+                echo "CA 파일은 컨테이너 안에 정상으로 있습니다. probe가 실패한 원인은 VM1 오리진 쪽에 있을"
+                echo "가능성이 높으므로 배포는 성공으로 끝냅니다."
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "::error::blackbox exporter 안의 ${CA_IN_CONTAINER}이 일반 파일이 아니다. 오리진 probe가 전부 'is a directory' 오류로 실패하는 상태다. monitoring/blackbox/cloudflare-origin-ca.pem이 저장소에 추적되고 있는지와, VM2의 같은 경로에 빈 디렉터리가 남아 있지 않은지 확인한다. 복구 절차는 monitoring/README.md의 '오리진 인증서 검증'에 있다."
+            failed=1
           fi
 
           if [ "$failed" -ne 0 ]; then
