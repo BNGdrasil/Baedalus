@@ -170,6 +170,12 @@ services:
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       # AUTH_SERVER_USERS_PATH는 기본값 /users가 현재 Bidar 배포와 맞으므로
       # 전달하지 않는다. Bidar가 사용자 관리 라우터를 옮길 때만 지정한다.
+      # PROMETHEUS_URL / ALERTMANAGER_URL: 둘 다 선택 값이고 기본값을 두지 않는다.
+      # 비워 두면 관측 요약 엔드포인트가 501을 돌려주고 게이트웨이는 정상 기동한다.
+      # 운영 값은 http://prometheus:9090 (모니터링 compose와 같은 api-network 내부
+      # 이름)이며 게이트웨이 밖으로 게시되지 않는다.
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-}
+      - ALERTMANAGER_URL=${ALERTMANAGER_URL:-}
     depends_on:
       auth-server:
         condition: service_healthy

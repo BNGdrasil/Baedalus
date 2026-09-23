@@ -97,6 +97,15 @@ compose가 빈 문자열을 컨테이너에 넘겼습니다. Bifrost는 빈 문�
 기동에 실패했습니다. 선택 변수라도 운영 `.env`에는 값을 적어 두는 편이 좋습니다. 기본값에 기대면
 지금 어떤 값으로 동작하고 있는지 파일만 보고 알 수 없기 때문입니다.
 
+| 선택 변수 (기본값 없음) | 비워 두었을 때 |
+|---|---|
+| `PROMETHEUS_URL` | Bifrost의 관측 요약 엔드포인트 중 Prometheus 관련 항목이 501을 반환합니다. 게이트웨이 자체는 정상 기동합니다. |
+| `ALERTMANAGER_URL` | 같은 이유로 Alertmanager 관련 항목이 501을 반환합니다. |
+
+두 변수는 `${VAR:-}` 형태로 참조하므로 값이 없거나 비어 있어도 compose는 중단되지 않고 빈
+문자열이 그대로 전달됩니다. 운영 값은 `http://prometheus:9090`이며, 모니터링 compose와 같은
+`api-network` 안에서만 통하는 이름이라 게이트웨이 밖으로 게시되지 않습니다.
+
 `DOMAIN_NAME`과 `VM3_PRIVATE_IP`와 `POSTGRES_USER`와 `POSTGRES_PASSWORD`는 compose가 직접 읽지
 않으며, 사람이 참고하거나 `DATABASE_URL`을 만들 때 사용합니다. `GRAFANA_ADMIN_PASSWORD`는
 모니터링 compose가 읽습니다.
