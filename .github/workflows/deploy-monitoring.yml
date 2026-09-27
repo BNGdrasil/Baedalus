@@ -53,6 +53,43 @@ env:
   # 아래 단계에서 따로 다시 시작한다.
   CONFIG_SERVICES: 'prometheus grafana loki alloy blackbox-exporter'
 
+  # 원격 스크립트를 실행하는 명령줄이다. 아래의 모든 ssh 단계가 heredoc으로 넘긴
+  # 스크립트를 이 명령줄로 실행한다.
+  #
+  # 이 값이 존재하는 이유
+  #   이전 판은 `ssh ... 'bash -s' <<'ENDSSH'` 형태였다. 그러면 스크립트 본문이
+  #   원격 bash의 표준 입력으로 들어가므로, 스크립트 중간에 표준 입력을 읽는
+  #   명령이 하나라도 있으면 그 명령이 아직 읽히지 않은 본문을 통째로 가져간다.
+  #   bash는 남은 입력이 없으니 EOF를 만난 것으로 보고 종료 코드 0으로 끝내고,
+  #   워크플로는 그 단계를 성공으로 판정한다.
+  #
+  #   2026-09-27 배포(run 36286042999)가 정확히 그렇게 끝났다. apply 스크립트의
+  #   `docker compose exec -T blackbox-exporter test -f ...`가 문제의 명령이었다.
+  #   `-T`는 의사 터미널만 붙이지 않을 뿐이고 `docker compose exec`는 `-i`가
+  #   기본이라 표준 입력을 컨테이너에 그대로 연결한다. 그래서 그 뒤에 남아 있던
+  #   설정 보유 서비스 restart, Promtail 정지, Alloy 헬스 확인, 로그 종단 확인,
+  #   `compose ps`가 한 줄도 실행되지 않았다. 로그의 마지막 줄은
+  #   "OK: blackbox exporter 안의 오리진 CA가 일반 파일이다."였고 그 다음 줄이
+  #   곧바로 다음 step이었다. Prometheus만 command 변경 때문에 `up -d`가 다시
+  #   만들어서 새 설정을 읽었고, Alloy와 Grafana와 Loki와 blackbox exporter는
+  #   옛 inode를 가리키는 mount를 그대로 들고 남았다.
+  #
+  # 무엇이 달라지는가
+  #   `cat >"$s"`가 heredoc 전체를 임시 파일로 먼저 받아 낸다. 그 다음에 실행되는
+  #   `bash "$s"`는 스크립트를 파일에서 읽으므로 표준 입력과 무관하고, 표준 입력은
+  #   `</dev/null`로 닫아 둔다. 스크립트 안의 어떤 명령이 표준 입력을 읽어도 빈
+  #   입력을 받을 뿐이고 본문은 끝까지 실행된다.
+  #
+  #   종료 코드는 `&&`로 이어진 마지막 명령인 `bash "$s"`의 것이 그대로 남으므로
+  #   ssh가 원격 스크립트의 실패를 러너에 전달한다. 임시 파일은 원격 로그인 셸의
+  #   EXIT trap이 지운다. 이 trap은 원격 스크립트 안쪽의 trap과 다른 프로세스에
+  #   걸리므로, 시험 컨테이너를 치우는 apply 스크립트의 trap은 그대로 동작한다.
+  #
+  #   환경 변수는 이 명령줄 앞에 `export ...;`를 붙여서 넘긴다. 변수 대입만 나열하면
+  #   원격 로그인 셸의 지역 변수가 되어 `bash "$s"`가 물려받지 못하므로 `export`가
+  #   필요하다.
+  REMOTE_BASH: 's=$(mktemp) && cat >"$s" && trap ''rm -f "$s"'' EXIT && bash "$s" </dev/null'
+
 jobs:
   deploy:
     name: 'Deploy monitoring to VM2'
@@ -234,8 +271,10 @@ jobs:
           VM2_HOST: ${{ secrets.VM2_HOST }}
         run: |
           set -euo pipefail
+          # 스크립트를 표준 입력이 아니라 파일로 실행한다. 근거는 이 파일 앞머리의
+          # REMOTE_BASH 주석에 있다.
           ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
-            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH'
+            "ubuntu@${VM2_HOST}" "$REMOTE_BASH" <<'ENDSSH'
           # === remote-heal begin ===
           set -euo pipefail
           cd /opt/bnbong
@@ -333,15 +372,80 @@ jobs:
           # 미완료 전환 표식에 적는 값이다. 다음 배포가 "어느 실행이 전환을 끝내지
           # 못했는가"를 로그에 그대로 옮길 수 있어야 사람이 추적할 수 있다.
           DEPLOY_RUN_REF: '${{ github.run_id }}/${{ github.run_attempt }}'
+          # 원격 apply 스크립트가 끝까지 실행되었는지를 러너가 확인하는 표식이다.
+          # LOG_PROBE_MARKER와 같은 이유로 실행마다 반드시 달라지며 비밀이 아니다.
+          APPLY_MARKER: 'bngdrasil-apply-complete-${{ github.run_id }}-${{ github.run_attempt }}'
         run: |
           set -euo pipefail
+
+          # 단일 파일 bind mount의 목록을 러너에서 계산한다.
+          #
+          # 이 목록으로 아래 원격 스크립트가 "컨테이너 안의 설정 파일이 호스트의
+          # 파일과 같은 내용인가"를 sha256으로 판정한다. 목록을 원격에서 만들지
+          # 않는 이유는 VM2에 yq와 jq가 설치되어 있다고 보장할 수 없기 때문이며,
+          # 러너에서 판정 입력을 만들고 원격에는 결과만 넘기는 방식은 아래
+          # "Verify scrape targets and rules" 단계와 같다.
+          #
+          # 목록을 compose에서 뽑는 이유는 손으로 적은 표가 실제 mount와 어긋나기
+          # 때문이다. blackbox의 blackbox.yml은 컨테이너 안에서 config.yml이고
+          # loki-config.yml은 local-config.yaml이므로, 파일 이름만 보고 대상 경로를
+          # 짐작하면 틀린다.
+          #
+          # 디렉터리 mount는 제외한다. rename으로 파일을 갈아 끼울 때 컨테이너가 옛
+          # 내용을 계속 보는 현상은 단일 파일 mount에서만 생긴다. 근거는
+          # monitoring/README.md의 "설정 변경을 반영하는 방법" 항목에 있다.
+          #
+          # 형식은 "<서비스>:<호스트 상대 경로>:<컨테이너 안 경로>"이며 공백으로
+          # 이어 붙인다. 세 값 모두 공백과 콜론을 담지 않으므로 이 구분자로 충분하다.
+          mount_rows="$(yq -o=json -I=0 '.' monitoring/docker-compose.monitoring.yml | jq -r '
+            .services
+            | to_entries[]
+            | .key as $svc
+            | (.value.volumes // [])[]
+            | (if type == "string" then split(":") else [(.source // ""), (.target // "")] end)
+            | select(length >= 2)
+            | select(.[0] | startswith("./monitoring/"))
+            | [$svc, .[0], .[1]]
+            | join(":")
+          ' | sort -u)"
+
+          MOUNT_CHECKS=''
+          while IFS=':' read -r svc src dst; do
+            [ -n "$svc" ] || continue
+            # 러너의 checkout에서 일반 파일인 것만 남긴다. 앞의 사전 점검 단계가
+            # 이 경로들이 모두 존재하고 추적되고 있음을 이미 확인했다.
+            [ -f "${src#./}" ] || continue
+            MOUNT_CHECKS="${MOUNT_CHECKS}${svc}:${src#./}:${dst} "
+          done <<< "$mount_rows"
+
+          if [ -z "$MOUNT_CHECKS" ]; then
+            echo "::error::compose에서 단일 파일 bind mount를 하나도 찾지 못했다. 설정 반영 판정이 아무것도 보지 않는 빈 검사가 되므로 여기에서 멈춘다. docker-compose.monitoring.yml의 경로 표기를 확인한다."
+            exit 1
+          fi
+          echo "설정 반영을 판정할 단일 파일 mount:"
+          # 공백으로 이어 붙인 목록을 한 줄씩 나누어 보여 주려는 것이므로 분리가 의도다.
+          # shellcheck disable=SC2086
+          printf '%s\n' $MOUNT_CHECKS | sed 's/^/  /'
+
+          # 원격 출력을 파일로도 받아 둔다. 스크립트가 끝까지 실행되었는지를 아래에서
+          # 완료 표식으로 확인하기 위한 것이다. tee를 쓰므로 로그에도 그대로 남고,
+          # pipefail이 걸려 있으므로 ssh의 실패는 그대로 이 단계의 실패가 된다.
+          apply_log="${RUNNER_TEMP}/apply.log"
+
+          # 스크립트를 표준 입력이 아니라 파일로 실행한다. 근거는 이 파일 앞머리의
+          # REMOTE_BASH 주석에 있다.
           ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
             "ubuntu@${VM2_HOST}" \
-            "CONFIG_SERVICES='${CONFIG_SERVICES}' LOG_PROBE_MARKER='${LOG_PROBE_MARKER}' DEPLOY_RUN_REF='${DEPLOY_RUN_REF}' bash -s" <<'ENDSSH'
+            "export CONFIG_SERVICES='${CONFIG_SERVICES}' LOG_PROBE_MARKER='${LOG_PROBE_MARKER}' DEPLOY_RUN_REF='${DEPLOY_RUN_REF}' APPLY_MARKER='${APPLY_MARKER}' MOUNT_CHECKS='${MOUNT_CHECKS}'; ${REMOTE_BASH}" <<'ENDSSH' | tee "$apply_log"
           # === remote-apply begin ===
           set -euo pipefail
           cd /opt/bnbong
           COMPOSE="sudo docker compose -f docker-compose.monitoring.yml"
+
+          # 이 배포가 컨테이너를 건드리기 시작한 시각이다. 아래에서 restart가 실제로
+          # 일어났는지를 각 컨테이너의 StartedAt과 이 값으로 판정한다. 같은 호스트의
+          # 시계로 양쪽을 재므로 러너와의 시차는 관계가 없다.
+          deploy_epoch="$(date -u +%s)"
 
           # 전환 상태를 남기는 디렉터리다. /opt/bnbong/monitoring/ 밖에 두어야
           # rsync --delete의 대상이 되지 않는다. 복구 단계와 마지막 정리 단계가
@@ -449,7 +553,7 @@ jobs:
           echo "  구 Promtail 상태: exists=${promtail_exists} was_running=${promtail_was_running}"
 
           # 설정 파일의 문법 오류는 컨테이너를 올리기 전에 잡는다.
-          $COMPOSE config --quiet
+          $COMPOSE config --quiet </dev/null
 
           # 이미지를 먼저 받는다.
           #
@@ -483,8 +587,15 @@ jobs:
           # exec 자체가 실패하는 경우(컨테이너가 멈춰 있거나 없는 경우)도 같은
           # 처리로 묶는다. 어느 쪽이든 다시 만드는 것이 옳은 대응이고, 다시 만든
           # 뒤에도 문제가 남으면 아래 검증이 잡는다.
+          #
+          # `docker compose exec -T`가 아니라 `docker exec`를 컨테이너 이름으로
+          # 직접 부른다. 2026-09-27 배포를 성공으로 끝내 버린 결함이 이 자리에서
+          # 나왔다. `-T`는 의사 터미널만 붙이지 않을 뿐이고 `docker compose exec`는
+          # `-i`가 기본이므로 표준 입력이 컨테이너로 연결된다. 스크립트를 파일로
+          # 실행하도록 바꾼 지금은 표준 입력이 이미 /dev/null이지만, 그 한 겹에만
+          # 의지하지 않도록 `docker exec`로 바꾸고 `</dev/null`도 함께 붙인다.
           CA_IN_CONTAINER=/etc/blackbox_exporter/cloudflare-origin-ca.pem
-          if $COMPOSE exec -T blackbox-exporter test -f "$CA_IN_CONTAINER" 2>/dev/null; then
+          if sudo docker exec vm2-blackbox-exporter test -f "$CA_IN_CONTAINER" </dev/null 2>/dev/null; then
             echo "  OK: blackbox exporter 안의 오리진 CA가 일반 파일이다."
           else
             echo "::warning::blackbox exporter 안의 ${CA_IN_CONTAINER}이 일반 파일이 아니다. 컨테이너를 다시 만들어 mount를 새로 건다."
@@ -517,6 +628,120 @@ jobs:
           else
             echo "  alertmanager가 실행 중이 아니므로 건너뛴다."
           fi
+
+          # 판정 1. restart가 실제로 일어났는가
+          #
+          # 2026-09-27 배포에서는 위의 restart 줄이 아예 실행되지 않았는데도 배포가
+          # 성공으로 끝났다. 명령을 적어 두는 것만으로는 그 명령이 돌았다는 보증이
+          # 되지 않으므로, 결과를 눈으로 확인할 수 있는 값으로 되묻는다.
+          #
+          # 컨테이너의 StartedAt이 이 배포가 시작한 시각보다 앞서면 그 컨테이너는
+          # 이번 배포에서 한 번도 다시 시작되지 않았다는 뜻이다. restart는 컨테이너를
+          # 다시 만들지 않으면서 StartedAt만 갱신하므로 이 값이 정확한 신호가 된다.
+          #
+          # 컨테이너 이름을 적지 않고 `compose ps -q`로 id를 받는다. 서비스 이름과
+          # 컨테이너 이름의 대응이 compose 파일에서 바뀌어도 이 판정이 따라온다.
+          # `ps -q`는 실행 중인 컨테이너만 돌려주므로, 값이 비어 있다는 것은 설정을
+          # 들고 있어야 할 서비스가 지금 떠 있지 않다는 뜻이고 그것도 실패다.
+          echo "  restart가 실제로 일어났는지 확인한다 (기준 시각 epoch ${deploy_epoch})."
+          restart_failed=0
+          for svc in $CONFIG_SERVICES; do
+            cid="$($COMPOSE ps -q "$svc" </dev/null 2>/dev/null || true)"
+            if [ -z "$cid" ]; then
+              echo "::error::${svc} 서비스의 실행 중인 컨테이너를 찾지 못해 재시작 여부를 판정할 수 없다."
+              restart_failed=1
+              continue
+            fi
+            started="$(sudo docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
+            if [ -z "$started" ]; then
+              echo "::error::${svc}의 StartedAt을 읽지 못해 재시작 여부를 판정할 수 없다."
+              restart_failed=1
+              continue
+            fi
+            # StartedAt은 나노초까지 붙은 RFC3339 형식이다. date가 소수점 이하를
+            # 받지 못하는 판까지 고려해서 초 단위로 내림한다. 내림한 시각은 실제
+            # 기동 시각보다 앞서므로 이 비교를 느슨한 쪽으로만 움직인다.
+            started_epoch="$(date -u -d "$(printf '%s' "$started" | sed -E 's/\.[0-9]+Z?$/Z/')" +%s 2>/dev/null || echo '')"
+            if [ -z "$started_epoch" ]; then
+              echo "::error::${svc}의 StartedAt(${started})을 epoch로 바꾸지 못해 재시작 여부를 판정할 수 없다."
+              restart_failed=1
+              continue
+            fi
+            if [ "$started_epoch" -lt "$deploy_epoch" ]; then
+              echo "::error::${svc}가 이번 배포에서 다시 시작되지 않았다. StartedAt=${started}이 배포 시작 시각보다 앞선다. 설정을 들고 있는 서비스가 옛 설정을 그대로 읽고 있는 상태다."
+              restart_failed=1
+              continue
+            fi
+            echo "  OK: ${svc} 재시작 확인 (StartedAt ${started})"
+          done
+          if [ "$restart_failed" -ne 0 ]; then
+            exit 1
+          fi
+
+          # 판정 2. 컨테이너가 보는 설정 파일이 호스트의 파일과 같은 내용인가
+          #
+          # 판정 1은 "다시 시작했는가"까지만 답한다. 단일 파일 bind mount는 컨테이너를
+          # 만들 때의 inode에 묶이므로, restart가 mount를 다시 잡아 주지 못하는 경로가
+          # 남아 있으면 다시 시작한 컨테이너도 옛 내용을 읽을 수 있다. 그래서 내용을
+          # 직접 맞비교한다. 앞의 "Verify scrape targets and rules" 단계가 Prometheus
+          # 하나에 대해 job 이름 집합으로 하던 확인을, 모든 단일 파일 mount에 대해
+          # 내용 해시로 일반화한 것이다.
+          #
+          # MOUNT_CHECKS는 러너가 compose에서 뽑아 넘긴 목록이다. 형식과 근거는 이
+          # step의 러너 쪽 주석에 있다.
+          echo "  컨테이너 안의 설정 파일이 호스트의 파일과 같은지 확인한다."
+          sha_failed=0
+          sha_checked=0
+          for entry in $MOUNT_CHECKS; do
+            svc="${entry%%:*}"
+            rest="${entry#*:}"
+            host_rel="${rest%%:*}"
+            in_path="${rest#*:}"
+            host_path="/opt/bnbong/${host_rel}"
+
+            cid="$($COMPOSE ps -q "$svc" </dev/null 2>/dev/null || true)"
+            if [ -z "$cid" ]; then
+              # alerting profile로 꺼 둔 alertmanager가 평소에 이 경로로 들어온다.
+              # 떠 있지 않은 컨테이너는 옛 설정을 읽을 수도 없으므로 실패가 아니다.
+              echo "  건너뜀: ${svc}가 실행 중이 아니다 (${in_path})"
+              continue
+            fi
+
+            # 파이프라인의 실패를 set -e에 맡기면 아래의 사유 출력에 이르지 못한
+            # 채로 스크립트가 끝난다. 값이 비었는지를 직접 보고 판정한다.
+            host_sum="$(sudo sha256sum "$host_path" 2>/dev/null | cut -d' ' -f1 || true)"
+            if [ -z "$host_sum" ]; then
+              echo "::error::호스트의 ${host_path}를 읽지 못해 설정 반영을 판정할 수 없다. rsync가 이 파일을 보냈는지 확인한다."
+              sha_failed=1
+              continue
+            fi
+
+            # 컨테이너 안에 sha256sum이 없으면 판정 자체가 성립하지 않는다. 그 상태를
+            # 통과로 두면 이 검사가 조용히 무너지므로 분명하게 실패시킨다. 지금 쓰는
+            # 이미지는 모두 busybox나 alpine이나 ubuntu 기반이라 sha256sum을 들고 있다.
+            in_sum="$(sudo docker exec "$cid" sha256sum "$in_path" </dev/null 2>/dev/null | cut -d' ' -f1 || true)"
+            if [ -z "$in_sum" ]; then
+              echo "::error::${svc} 컨테이너 안에서 ${in_path}의 해시를 구하지 못해 설정 반영을 판정할 수 없다. 그 경로가 파일이 아니거나 이미지에 sha256sum이 없는 상태다."
+              sha_failed=1
+              continue
+            fi
+
+            if [ "$host_sum" != "$in_sum" ]; then
+              echo "::error::${svc}가 옛 설정 파일을 보고 있다. ${in_path}의 해시가 호스트의 ${host_path}와 다르다 (컨테이너 ${in_sum}, 호스트 ${host_sum}). 단일 파일 bind mount가 옛 inode를 가리키는 상태이므로 컨테이너를 다시 만들어야 한다."
+              sha_failed=1
+              continue
+            fi
+            echo "  OK: ${svc} ${in_path}"
+            sha_checked=$((sha_checked + 1))
+          done
+          if [ "$sha_checked" -eq 0 ]; then
+            echo "::error::설정 반영을 확인한 파일이 하나도 없다. 판정이 아무것도 보지 않은 셈이므로 배포를 실패로 끝낸다."
+            sha_failed=1
+          fi
+          if [ "$sha_failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "  OK: 단일 파일 mount ${sha_checked}개가 호스트의 내용과 같다."
 
           # 새 수집기가 뜬 뒤에 구 수집기를 멈춘다.
           #
@@ -731,8 +956,26 @@ jobs:
           echo "  OK: Grafana provisioning (오류 로그 없음)"
 
           check_log_pipeline "$LOG_PROBE_MARKER" || exit 1
+
+          # 스크립트가 끝까지 실행되었다는 표식을 마지막 줄로 남긴다.
+          #
+          # 이 표식이 있어야 하는 이유는 2026-09-27 배포가 보여 주었다. 원격 bash가
+          # 남은 본문을 잃고 EOF로 끝내면 종료 코드가 0이므로, ssh의 종료 코드만
+          # 보는 러너는 스크립트가 중간에 끊긴 것과 끝까지 돈 것을 구분할 수 없다.
+          # 표식을 마지막 줄에 두면 "어디까지 돌았는가"가 출력에 남고, 러너가 그
+          # 표식의 유무로 판정한다. 중간 삼킴뿐 아니라 어떤 이유로든 조기에 끝나는
+          # 경우를 모두 잡는다.
+          printf 'APPLY-COMPLETE %s\n' "$APPLY_MARKER"
           # === remote-apply end ===
           ENDSSH
+
+          # 완료 표식을 확인한다. ssh가 0을 돌려주었더라도 표식이 없으면 원격
+          # 스크립트가 끝까지 실행되지 않았다는 뜻이므로 배포를 실패로 끝낸다.
+          if ! grep -qF "APPLY-COMPLETE ${APPLY_MARKER}" "$apply_log"; then
+            echo "::error::원격 apply 스크립트가 완료 표식을 남기지 않았다. ssh는 성공으로 끝났지만 스크립트가 끝까지 실행되지 않은 상태다. 표준 입력을 읽는 명령이 스크립트 본문을 가져갔거나 원격 셸이 조기에 끝난 경우이므로, 위 출력의 마지막 줄을 보고 어디에서 끊겼는지 확인한다."
+            exit 1
+          fi
+          echo "  OK: 원격 apply 스크립트가 완료 표식을 남겼다 (${APPLY_MARKER})."
 
       - name: Verify scrape targets and rules
         id: verify
@@ -753,8 +996,11 @@ jobs:
           fetch() {
             # SSH_OPTS는 여러 인자라서 분리되어야 하고(SC2086), $1은 원격이 아니라
             # 러너에서 펼쳐지는 것이 의도한 동작이다(SC2029).
+            # ssh는 표준 입력을 원격으로 흘려보내므로, 나중에 이 함수를 while read
+            # 반복 안에서 부르면 반복의 입력을 ssh가 가져간다. 같은 성질이
+            # 2026-09-27 배포의 결함을 만들었으니 호출부와 무관하게 닫아 둔다.
             # shellcheck disable=SC2086,SC2029
-            ssh $SSH_OPTS "$REMOTE" "curl -fsS --max-time 10 'http://127.0.0.1:9090$1'"
+            ssh $SSH_OPTS "$REMOTE" "curl -fsS --max-time 10 'http://127.0.0.1:9090$1'" </dev/null
           }
 
           # === verify-logic begin ===
@@ -1085,7 +1331,14 @@ jobs:
           # 포트를 게시하지 않는 서비스라서 VM2 호스트에서는 9115에 닿지 않는다.
           # 컨테이너 안에서 호출하며, 이미지가 busybox 기반이라 curl이 없고 wget을
           # 쓴다. compose의 healthcheck도 같은 이유로 wget을 쓴다.
-          BB_COMPOSE='cd /opt/bnbong && sudo docker compose -f docker-compose.monitoring.yml'
+          #
+          # `docker compose exec -T`가 아니라 `docker exec`를 컨테이너 이름으로 직접
+          # 부른다. `-T`는 의사 터미널만 붙이지 않을 뿐이고 `docker compose exec`는
+          # `-i`가 기본이라 표준 입력을 컨테이너로 연결하는데, 2026-09-27 배포를
+          # 성공으로 끝내 버린 결함이 바로 그 성질에서 나왔다. 이 단계의 ssh는
+          # heredoc을 쓰지 않아서 같은 형태로 무너지지는 않지만, 같은 위험을 가진
+          # 호출을 남겨 두지 않도록 함께 바꾸고 ssh에 `</dev/null`도 붙인다.
+          BB_EXEC='sudo docker exec vm2-blackbox-exporter'
           CA_IN_CONTAINER=/etc/blackbox_exporter/cloudflare-origin-ca.pem
 
           # 질의 인자는 prometheus.yml의 blackbox-http-origin job이 relabel로 만드는
@@ -1095,13 +1348,13 @@ jobs:
           PROBE_QUERY='module=http_2xx_origin&target=https://10.0.1.133/health&hostname=api.bnbong.com'
 
           # shellcheck disable=SC2086,SC2029
-          if ssh $SSH_OPTS "$REMOTE" "${BB_COMPOSE} exec -T blackbox-exporter test -f ${CA_IN_CONTAINER}"; then
+          if ssh $SSH_OPTS "$REMOTE" "${BB_EXEC} test -f ${CA_IN_CONTAINER}" </dev/null; then
             echo "  OK: blackbox exporter 안의 오리진 CA가 일반 파일이다."
 
             probe_body=''
             # shellcheck disable=SC2086,SC2029
             probe_body="$(ssh $SSH_OPTS "$REMOTE" \
-              "${BB_COMPOSE} exec -T blackbox-exporter wget -qO- 'http://localhost:9115/probe?${PROBE_QUERY}'" 2>&1 || true)"
+              "${BB_EXEC} wget -qO- 'http://localhost:9115/probe?${PROBE_QUERY}'" </dev/null 2>&1 || true)"
 
             if printf '%s\n' "$probe_body" | grep -qx 'probe_success 1'; then
               echo "  OK: 오리진 probe가 성공했다 (api.bnbong.com)."
@@ -1111,7 +1364,7 @@ jobs:
               # 각 단계의 소요 시간이 함께 들어 있다.
               # shellcheck disable=SC2086,SC2029
               ssh $SSH_OPTS "$REMOTE" \
-                "${BB_COMPOSE} exec -T blackbox-exporter wget -qO- 'http://localhost:9115/probe?${PROBE_QUERY}&debug=true'" 2>&1 \
+                "${BB_EXEC} wget -qO- 'http://localhost:9115/probe?${PROBE_QUERY}&debug=true'" </dev/null 2>&1 \
                 | tail -n 60 || true
               {
                 echo
@@ -1140,8 +1393,10 @@ jobs:
           VM2_HOST: ${{ secrets.VM2_HOST }}
         run: |
           set -euo pipefail
+          # 스크립트를 표준 입력이 아니라 파일로 실행한다. 근거는 이 파일 앞머리의
+          # REMOTE_BASH 주석에 있다.
           ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
-            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH'
+            "ubuntu@${VM2_HOST}" "$REMOTE_BASH" <<'ENDSSH'
           # === remote-finalize begin ===
           set -euo pipefail
           STATE_DIR=/opt/bnbong/.monitoring-deploy-state
@@ -1233,9 +1488,11 @@ jobs:
           # 어떤 상태로 남았는지와 무엇을 손으로 해야 하는지가 드러나지 않는다.
           # 그래서 종료 코드를 받아서 처리한다.
           rc=0
+          # 스크립트를 표준 입력이 아니라 파일로 실행한다. 근거는 이 파일 앞머리의
+          # REMOTE_BASH 주석에 있다.
           ssh -o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=6 \
             -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
-            "ubuntu@${VM2_HOST}" 'bash -s' <<'ENDSSH' || rc=$?
+            "ubuntu@${VM2_HOST}" "$REMOTE_BASH" <<'ENDSSH' || rc=$?
           # === remote-restore begin ===
           set -euo pipefail
           cd /opt/bnbong
