@@ -364,6 +364,17 @@ groups:
         # reject_old_samples를 켜 두었으므로, 수집기를 바꾸면서 오래된 로그를
         # 다시 읽어 보내면 그 거절이 ingester_error로 여기에 나타난다.
         #
+        # 이 규칙은 그대로 두지만 뜻하는 바가 2026-09-27에 좁아졌다. 그때까지는
+        # 보존 기간을 넘긴 줄이 Loki까지 올라가서 거절당했고, 그 거절이 실제
+        # 유실과 같은 reason="ingester_error"로 섞여 들어왔다. 조용한 컨테이너의
+        # 마지막 줄을 loki.source.docker가 계속 다시 보내는 동작 때문에 이 경보가
+        # 유실 없이 계속 발화했다. 지금은 alloy/config.alloy의
+        # loki.process.retention_guard가 167h를 넘긴 줄을 보내기 전에 버리므로
+        # 그 경로가 여기까지 오지 않는다. 즉 이 경보가 울리면 보낼 수 있었어야
+        # 하는 줄을 실제로 잃었다는 뜻이며, critical로 두는 근거가 그만큼 분명해졌다.
+        # 사전에 버린 양은 loki_process_dropped_lines_total{reason=
+        # "older_than_retention"}으로 따로 세어지고 그쪽에는 경보를 걸지 않는다.
+        #
         # rate와 for를 함께 쓰지 않는다. 이전 판은 rate(...[10m]) > 0에 for: 15m을
         # 붙였는데, 그러면 한 번에 크게 버리고 멈추는 유실은 영영 발화하지 않는다.
         # rate의 10분 창이 지나가면 식이 0으로 돌아가서 for의 15분을 채울 수 없기
@@ -398,6 +409,36 @@ groups:
           summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code={{ $labels.status_code }})'
           description: '최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 아직 재시도 중이라 유실은 없지만, 재시도가 소진되면 LogShippingDropping으로 이어진다.'
           action: 'curl -s http://127.0.0.1:3100/ready 로 Loki 상태를 먼저 보고, sudo docker logs vm2-loki --tail 100 으로 거절 사유를 확인한다.'
+
+      - alert: LogProcessDroppingUnexpected
+        # Alloy의 파이프라인이 Loki로 보내기 전에 버린 줄이다. 위의 두 규칙은
+        # 전송 단계(loki.write)를 보고 이 규칙은 그 앞 단계(loki.process)를 본다.
+        #
+        # 의도한 드롭은 하나뿐이다. alloy/config.alloy의
+        # loki.process.retention_guard가 167h를 넘긴 줄을
+        # reason="older_than_retention"으로 버리며, 그 값이 늘어나는 것은 정상
+        # 동작이므로 여기에서 제외한다. 조용한 컨테이너의 마지막 줄이 5분마다 다시
+        # 들어오는 동안에는 그 reason이 계속 늘어나기 때문에, 제외하지 않으면 이
+        # 규칙이 상시 발화한다.
+        #
+        # 그 밖의 reason이 나타나는 경우는 설정이 의도와 달라졌다는 뜻이다.
+        # drop_counter_reason을 적지 않은 stage.drop이 들어오면 Alloy의 기본값인
+        # reason="drop_stage"로 세어지고, 다른 stage가 줄을 버리면 또 다른 reason이
+        # 붙는다. 어느 쪽이든 사람이 설정을 보아야 하는 상황이지만 그 자체로 유실이
+        # 확정되지는 않으므로 critical이 아니라 warning으로 둔다.
+        #
+        # for를 5m 두는 이유는 LogShippingWriteFailing과 같다. increase의 창이
+        # 10분이므로 한 번 묶여서 일어나는 드롭도 5분 뒤에는 드러나며, 그만큼
+        # 첫 통지가 늦어지는 대신 짧은 흔들림이 곧바로 통지로 이어지지 않는다.
+        expr: sum by (reason) (increase(loki_process_dropped_lines_total{job="alloy",reason!="older_than_retention"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: alloy
+        annotations:
+          summary: 'Alloy가 예상하지 않은 이유로 로그를 버리고 있다 (reason={{ $labels.reason }})'
+          description: '최근 10분 안에 loki.process 단계에서 버린 줄이 있고 그 이유가 보존 기간 초과가 아니다. 설정에 의도하지 않은 드롭이 들어왔을 수 있다.'
+          action: 'monitoring/alloy/config.alloy의 loki.process 블록에 retention_guard 말고 다른 stage.drop이 들어왔는지 확인하고, sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics | grep loki_process_dropped_lines_total 으로 reason별 값을 읽는다.'
 
   - name: basic-capacity
     interval: 30s

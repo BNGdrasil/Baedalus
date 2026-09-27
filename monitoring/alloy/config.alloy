@@ -108,7 +108,7 @@ loki.source.docker "containers" {
 	host             = "tcp://docker-socket-proxy:2375"
 	targets          = discovery.docker.containers.targets
 	relabel_rules    = discovery.relabel.docker_logs.rules
-	forward_to       = [loki.write.loki.receiver]
+	forward_to       = [loki.process.retention_guard.receiver]
 	refresh_interval = "15s"
 }
 
@@ -126,7 +126,7 @@ loki.source.file "system" {
 			host        = "vm2",
 		},
 	]
-	forward_to = [loki.write.loki.receiver]
+	forward_to = [loki.process.retention_guard.receiver]
 
 	// __path__를 glob으로 펼치고 새로 생긴 파일을 주기적으로 다시 찾는다.
 	file_match {
@@ -141,6 +141,50 @@ loki.source.file "system" {
 	// 있는데 읽지 못하면(권한 오류 등) Alloy는 로그 재수집을 피하려고 기동을
 	// 거부한다. 전환이 끝난 뒤의 정리 절차는 README에 있다.
 	legacy_positions_file = "/var/lib/promtail/positions.yaml"
+}
+
+// ---------------------------------------------------------------------------
+// 보존 기간을 넘긴 줄을 보내기 전에 버린다
+// ---------------------------------------------------------------------------
+
+// 위의 두 소스가 모두 이 파이프라인을 거친 뒤에 loki.write로 넘어간다. docker
+// 소스와 file 소스에 각각 stage를 두지 않고 하나만 두는 이유는, stage.drop이
+// 보는 값이 label이 아니라 항목의 timestamp뿐이어서 경로마다 조건을 달리 할
+// 이유가 없기 때문이다.
+//
+// 이 stage를 넣은 사정은 2026-09-27 VM2 실사에서 확인했다. loki.source.docker는
+// Docker API의 로그 조회에 since 인자를 넘기는데, 그 경계가 포함이므로 마지막
+// 줄을 다시 읽는다. 로그가 계속 나오는 컨테이너에서는 다음 줄이 곧 들어와서
+// 경계가 앞으로 밀리지만, redis-exporter, node-exporter, redis처럼 조용한
+// 컨테이너에서는 경계가 마지막 줄에 멈춰 있으므로 같은 줄이 약 5분마다 계속
+// 다시 전송된다. 그 줄의 시각이 Loki의 reject_old_samples_max_age(168h)를 넘긴
+// 2026-09-26 16:57부터 Loki가 400 timestamp too old로 거절했고,
+// loki_write_dropped_entries_total{reason="ingester_error"}가 10분마다 약 100씩
+// 늘어나 LogShippingDropping이 계속 발화했다. 그 줄들은 이미 Loki에 적재된 뒤
+// 보존 기간을 넘겨 지워진 것이므로 실제 유실은 아니었다.
+//
+// older_than을 167h로 둔 이유는 Loki의 경계보다 한 시간 앞에서 먼저 버리기
+// 위한 것이다. stage.drop은 항목의 timestamp를 "이 stage를 지나는 시각 - 167h"와
+// 비교하고, Loki는 push 요청을 받는 시각을 기준으로 168h를 판단한다. 두 시각이
+// 같지 않으므로 168h로 맞추면 Alloy가 통과시킨 줄이 재시도와 큐 대기 중에
+// 경계를 넘어가 Loki에서 거절되는 구간이 남는다. 한 시간의 여유를 두어 그
+// 구간을 없앤다. 버린 양은 loki_process_dropped_lines_total{reason=
+// "older_than_retention"}으로 세어지며, 이 지표가 늘어나는 것은 정상 동작이므로
+// 경보를 걸지 않는다. 근거는 prometheus/rules/basic.yml의 basic-logging 그룹
+// 주석에 적었다.
+//
+// file 소스에는 timestamp stage가 없어서 /var/log 줄의 timestamp는 파일을 읽은
+// 시각이 된다. 즉 이 stage가 실제로 버리는 것은 docker 소스가 다시 보내는
+// 오래된 줄뿐이고, file 소스 경로는 사실상 그냥 지나간다. 그래도 같은
+// 파이프라인에 묶어 두는 편이 낫다고 보았다. 나중에 file 소스에 timestamp
+// 파싱을 붙이면 그때부터 같은 보호가 함께 적용되기 때문이다.
+loki.process "retention_guard" {
+	stage.drop {
+		older_than          = "167h"
+		drop_counter_reason = "older_than_retention"
+	}
+
+	forward_to = [loki.write.loki.receiver]
 }
 
 // ---------------------------------------------------------------------------

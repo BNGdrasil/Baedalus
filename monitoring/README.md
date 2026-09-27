@@ -824,7 +824,7 @@ Wegis는 `targets/wegis-server.json`으로 이미 등록되어 있습니다. 실
 
 ## 알림 규칙
 
-`prometheus/rules/basic.yml`에 여덟 개의 group과 스물한 개의 alert 규칙을 두었고
+`prometheus/rules/basic.yml`에 여덟 개의 group과 스물두 개의 alert 규칙을 두었고
 `prometheus.yml`의 `rule_files`가 이 디렉터리를 읽습니다. 규칙의 단일 출처는 이 파일 하나입니다.
 규칙 수는 `promtool check rules`의 출력으로 확인할 수 있습니다.
 
@@ -856,6 +856,7 @@ Wegis는 `targets/wegis-server.json`으로 이미 등록되어 있습니다. 실
 | `NginxDown` | VM1 nginx exporter가 `stub_status`를 5분 이상 읽지 못합니다. | nginx-prometheus-exporter 1.5.3의 `nginx_up`입니다. |
 | `LogShippingDropping` | 최근 10분 안에 Alloy가 재시도를 소진하고 버린 로그 줄이 있습니다. | Alloy의 `loki_write_dropped_entries_total`입니다. |
 | `LogShippingWriteFailing` | 최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어집니다. | Alloy의 `loki_write_request_duration_seconds_count`를 `status_code`로 나눕니다. |
+| `LogProcessDroppingUnexpected` | 최근 10분 안에 Alloy의 파이프라인이 보존 기간 초과가 아닌 이유로 버린 줄이 있고 그 상태가 5분 넘게 이어집니다. | Alloy의 `loki_process_dropped_lines_total`에서 `reason="older_than_retention"`을 제외하고 봅니다. |
 
 `GatewayNotReady`와 `InternalEndpointDown`의 조건을 나눈 이유는, 하나의 장애로 두 경보가 함께
 울리는 상황을 막기 위해서입니다. `InternalEndpointDown`의 조건에서 gateway의 `/ready` 대상을
@@ -1010,6 +1011,31 @@ critical이 발생하든 같은 호스트의 무관한 warning이 전부 묻히�
 억제가 실제로 일어나는지는 `prom/alertmanager:v0.28.1`을 임시 포트로 띄우고 `amtool alert add`로
 경보를 직접 주입해서 확인했습니다. 의도한 세 쌍은 `amtool alert query --inhibited`에 suppressed로
 나타났고, 같은 호스트의 다른 마운트와 다른 호스트의 같은 마운트는 active로 남았습니다.
+
+#### 통지의 Source 링크를 SSH 터널 주소로 맞추었습니다
+
+Prometheus가 Alertmanager로 보내는 경보에는 규칙을 조회할 수 있는 `generatorURL`이 붙고, Discord
+통지에서는 그 값이 Source 링크가 됩니다. 이 주소를 지정하지 않으면 Prometheus가 `os.Hostname()`으로
+조립하는데, 컨테이너 안에서 그 값은 컨테이너 ID입니다. 실제로 확인해 보니
+`http://7dea0a0daca2:9090/graph?g0.expr=...` 형태가 되었고, 이 주소는 어디에서도 열리지 않습니다.
+
+그래서 compose의 prometheus command에 `--web.external-url=http://127.0.0.1:9090`을 추가했습니다.
+Prometheus는 외부에 게시하지 않고 위의 "접근 방법"에 적어 둔 SSH 터널로만 보므로, 터널을 연 상태에서
+그대로 열리는 주소가 `127.0.0.1:9090`입니다. 같은 임시 스택에서 이 옵션을 붙여 띄운 결과
+`generatorURL`이 `http://127.0.0.1:9090/graph?g0.expr=...`으로 바뀌었습니다.
+
+이 값에는 경로가 없으므로 Prometheus가 제공하는 HTTP 경로는 하나도 바뀌지 않습니다.
+`--web.route-prefix`의 기본값이 `--web.external-url`의 경로 부분이고, 여기서는 그 부분이 비어 있어서
+route prefix가 `/`로 남습니다. 임시 스택에서 아래 경로가 모두 그대로 200을 돌려주는 것을
+확인했습니다. 즉 compose의 healthcheck와 배포 워크플로의 확인 요청과 blackbox job이 거치는 경로에
+영향이 없습니다.
+
+| 경로 | 쓰이는 곳 |
+|---|---|
+| `/-/healthy`, `/-/ready` | compose healthcheck입니다. |
+| `/api/v1/targets`, `/api/v1/rules`, `/api/v1/alerts` | 배포 워크플로의 target과 rule 판정입니다. |
+| `/api/v1/query` | 위의 확인 절차에 적어 둔 질의입니다. |
+| `/metrics` | Prometheus 자신을 수집하는 job입니다. |
 
 #### webhook URL을 두는 위치
 
@@ -1338,7 +1364,7 @@ VM2 장애를 감지하려면 VM2 밖에서 동작하는 독립된 probe가 있�
 |---|---|
 | `prometheus/tests/blackbox-and-containers.yml` | `OriginEndpointDown`, `GatewayNotReady`, `InternalEndpointDown`, TLS 인증서 두 규칙, 컨테이너 두 규칙입니다. Cloudflare 경유 job의 probe가 계속 실패해도 어떤 경보도 울리지 않는다는 점과, TLS 경보가 오리진 job의 인증서만 본다는 점을 함께 확인합니다. |
 | `prometheus/tests/remote-exporters.yml` | `PostgresDown`, `NginxDown`입니다. |
-| `prometheus/tests/logging.yml` | `LogShippingDropping`, `LogShippingWriteFailing`입니다. |
+| `prometheus/tests/logging.yml` | `LogShippingDropping`, `LogShippingWriteFailing`, `LogProcessDroppingUnexpected`입니다. |
 | `prometheus/tests/gateway-upstreams.yml` | `GatewayUpstreamHighServerErrorRate`와 `GatewayHighServerErrorRate`입니다. |
 
 ```bash
@@ -1355,12 +1381,15 @@ docker run --rm --entrypoint promtool \
 `TargetDown`이 함께 울리지 않는다는 점과, exporter를 설치하지 않아 시계열이 전혀 없을 때 두
 규칙이 조용하다는 점을 확인합니다. 지표가 실제로 들어오는지까지 검증하지는 않습니다.
 
-`logging.yml`은 네 가지를 더 확인합니다. 첫째, Alloy는 `reason`마다 값이 0인 시계열을 항상
+`logging.yml`은 다섯 가지를 더 확인합니다. 첫째, Alloy는 `reason`마다 값이 0인 시계열을 항상
 노출하므로 시계열이 존재한다는 사실만으로 발화하면 안 됩니다. 둘째, 정상 구간의 `status_code`는
 204이므로 `status_code!~"2.."` 조건이 그 값을 걸러야 합니다. 셋째, Alloy 컨테이너가 사라진 구간에서는
-`TargetDown` 하나만 울리고 로그 전송 규칙 두 개는 조용해야 합니다. 넷째, 값이 한 번만 크게
-늘고 그 뒤로 멈추는 구간에서도 두 규칙이 반드시 발화해야 하고, 증가가 창에서 빠져나가면 스스로
-해소되어야 합니다. 네 번째가 이전 형태에서 놓치던 상황입니다.
+`TargetDown` 하나만 울리고 로그 관련 규칙 세 개는 조용해야 합니다. 넷째, 값이 한 번만 크게
+늘고 그 뒤로 멈추는 구간에서도 규칙이 반드시 발화해야 하고, 증가가 창에서 빠져나가면 스스로
+해소되어야 합니다. 네 번째가 이전 형태에서 놓치던 상황입니다. 다섯째,
+`loki_process_dropped_lines_total{reason="older_than_retention"}`이 계속 늘어나는 구간에서는
+어떤 경보도 울리지 않고, 같은 구간에 `reason="drop_stage"`가 함께 나타나면
+`LogProcessDroppingUnexpected`가 그 `reason` 하나만 잡아야 합니다.
 
 `gateway-upstreams.yml`은 업스트림 둘 가운데 한쪽에만 5xx가 몰릴 때 그 업스트림 하나만
 발화하는지를 확인합니다. 전체 비율은 5% 기준 아래로 두어서 `GatewayHighServerErrorRate`가 함께
@@ -1406,6 +1435,80 @@ Grafana의 Explore 화면에서 다음과 같이 조회합니다.
 ```
 
 Loki의 보존 기간은 168시간이며 compactor가 그 기간을 넘긴 로그를 지웁니다.
+
+### 보존 기간을 넘긴 줄을 보내기 전에 버립니다
+
+`config.alloy`의 `loki.process.retention_guard`가 두 수집 경로의 공통 통로입니다. docker 소스와
+file 소스가 모두 이 컴포넌트를 거친 뒤에 `loki.write`로 넘어가며, 여기에 놓인 `stage.drop`이
+`older_than = "167h"`보다 오래된 줄을 Loki로 보내기 전에 버립니다. 버린 양은
+`loki_process_dropped_lines_total{reason="older_than_retention"}`으로 세어집니다.
+
+이 stage를 넣은 계기는 2026-09-27 VM2 실사에서 확인한 사건입니다. 경과는 다음과 같습니다.
+
+1. `loki.source.docker`는 Docker API로 로그를 조회할 때 어디까지 읽었는지를 `since` 인자로
+   넘기는데, 그 경계가 포함이어서 마지막 줄을 한 번 더 읽습니다. 로그가 계속 나오는 컨테이너에서는
+   다음 줄이 곧 들어와 경계가 앞으로 밀리므로 이 동작이 드러나지 않습니다.
+2. 그러나 `redis-exporter`와 `node-exporter`와 `redis`는 기동한 뒤로 새 줄을 내보내지 않는
+   조용한 컨테이너였습니다. 경계가 2026-09-19T08:45:22Z에 멈춰 있었고, Alloy가 그 한 줄을 약
+   5분마다 계속 다시 전송했습니다.
+3. 그 시각이 Loki의 `reject_old_samples_max_age`인 168시간을 넘긴 2026-09-26 16:57부터 Loki가
+   `timestamp too old`와 함께 400을 돌려주었습니다.
+4. 그 결과 `loki_write_dropped_entries_total{reason="ingester_error"}`가 10분마다 약 100씩
+   늘어나면서 `LogShippingDropping`이 끊이지 않고 발화했습니다.
+
+실제로 잃은 로그는 없었습니다. 다시 보낸 줄들은 이미 Loki에 적재된 뒤 보존 기간을 넘겨 compactor가
+지운 것이고, 남은 것은 Alloy 쪽에 멈춰 있던 읽기 위치뿐이었습니다. 즉 경보는 유실을 알린 것이
+아니라 수집기와 Loki의 보존 기준이 어긋난 상태를 알린 것이었습니다.
+
+조치는 Alloy가 그 줄을 아예 보내지 않게 만드는 것입니다. `older_than`을 Loki와 같은 168시간이 아니라
+167시간으로 둔 이유는 두 판단의 기준 시각이 다르기 때문입니다. `stage.drop`은 항목의 timestamp를
+`stage를 지나는 시각 - 167h`와 비교하고, Loki는 push 요청을 받는 시각에서 168시간을 계산합니다.
+두 시각을 같은 값으로 맞추면 Alloy가 통과시킨 줄이 배치 대기와 재시도 중에 경계를 넘어가 Loki에서
+거절되는 구간이 남습니다. 한 시간의 여유를 두어 그 구간을 없앴습니다.
+
+file 소스 경로에는 timestamp를 파싱하는 stage가 없으므로 `/var/log` 줄의 timestamp는 파일을 읽은
+시각이 됩니다. 따라서 이 stage가 실제로 버리는 것은 docker 소스가 다시 보내는 오래된 줄뿐이고,
+file 소스는 사실상 그냥 지나갑니다. 그래도 같은 통로에 묶어 두었습니다. 나중에 file 소스에
+timestamp 파싱을 붙이면 그때부터 같은 보호가 함께 적용되기 때문입니다.
+
+경보 쪽은 두 가지로 정리했습니다. `LogShippingDropping`은 조건과 severity를 그대로 두었습니다.
+사전 드롭이 들어온 뒤로는 보존 기간 초과가 `loki.write`까지 올라오지 않으므로, 이 경보가 울리면
+보낼 수 있었어야 하는 줄을 실제로 잃었다는 뜻이 됩니다. 규칙의 뜻이 좁아진 셈입니다. 반대로
+`reason="older_than_retention"`의 증가에는 경보를 걸지 않았습니다. 조용한 컨테이너가 있는 동안
+이 값은 계속 늘어나고, 그것이 의도한 동작입니다. 그 대신 다른 `reason`으로 버리는 줄이 나타나면
+잡도록 `LogProcessDroppingUnexpected`를 warning으로 하나 추가했습니다. 설정에
+`drop_counter_reason`을 적지 않은 `stage.drop`이 들어오면 Alloy가 기본값인 `reason="drop_stage"`로
+세므로, 의도하지 않은 드롭이 조용히 늘어나는 상황을 이 규칙이 드러냅니다.
+
+#### 드롭 수치를 읽을 때 주의할 점
+
+`loki_write_dropped_entries_total`은 배치 단위로 늘어납니다. Loki는 오래된 항목만 거절하고 같은
+요청에 들어 있던 정상 항목은 그대로 적재하지만, Alloy는 400 응답을 받은 배치 전체를 버린 것으로
+셉니다. 임시 스택에서 8일 전 줄 하나와 방금 만든 줄 아홉 개를 한 배치에 넣어 보냈더니, Loki에는
+정상 줄 아홉 개가 모두 남았는데도 Alloy의 값은 10만큼 늘어났습니다. 운영에서 다시 보낸 줄이
+몇 개뿐인데도 10분마다 약 100씩 늘어난 이유가 여기에 있습니다. 즉 이 지표의 값을 잃은 줄 수로
+그대로 읽으면 안 됩니다.
+
+#### 실제로 동작하는지 확인한 방법
+
+운영에 적용하기 전에 임시 project 이름과 임시 포트로 Loki 3.5.7과 Alloy `v1.19.2`를 띄워서
+확인했습니다. 저장소 파일은 고치지 않고, 8일 전 시각의 줄 열 개와 방금 만든 줄 세 개가 든 파일을
+`loki.source.file`로 읽어 timestamp를 파싱한 뒤 `retention_guard`로 넘기는 override만 따로
+두었습니다. docker 소스는 저장소 설정 그대로 docker-socket-proxy를 거치게 두었습니다.
+
+| 확인 내용 | 결과 |
+|---|---|
+| `loki_process_dropped_lines_total{reason="older_than_retention"}` | 8일 전 줄 열 개만큼 정확히 10으로 늘어났습니다. |
+| `loki_write_dropped_entries_total{reason="ingester_error"}` | 0으로 유지되었습니다. |
+| `loki_write_request_duration_seconds_count` | `status_code="204"`만 늘어났습니다. |
+| 최신 시각의 줄 | 세 개가 모두 Loki에 적재되었습니다. |
+| 8일 전 구간의 Loki 조회 | 결과가 없습니다. |
+| Loki의 오류 로그 | `timestamp too old`가 한 줄도 없습니다. |
+
+같은 줄을 `stage.drop`을 거치지 않고 곧바로 `loki.write`로 보내는 대조군도 함께 두었습니다. 그쪽은
+Loki가 `entry ... has timestamp too old`와 함께 400을 돌려주었고
+`loki_write_dropped_entries_total{reason="ingester_error"}`가 늘어났습니다. 운영에서 본 증상과 같은
+모습이며, `stage.drop`이 그 경로를 실제로 막는다는 뜻입니다.
 
 ### service label을 채우는 방식을 바꾼 이유
 
@@ -1546,10 +1649,11 @@ Error: /etc/alloy/config.alloy:6:3: unrecognized attribute name "legacy_position
 다만 두 가지를 주의해야 합니다.
 
 첫째, `loki-config.yml`은 `reject_old_samples`를 켜 두었고 기준은 168시간입니다. 컨테이너가 7일보다
-오래 돌고 있었다면 그 이전 구간의 로그는 Loki가 거절합니다. 거절된 줄은 Alloy의
-`loki_write_dropped_entries_total{reason="ingester_error"}`로 세어지고 `LogShippingDropping` 경보가
-울릴 수 있습니다. 그러나 그 로그는 Promtail이 이미 넣어 둔 것이므로 실제로 잃는 데이터는 없습니다.
-전환 직후에 이 경보가 한 번 울렸다가 잦아든다면 정상입니다.
+오래 돌고 있었다면 그 이전 구간의 로그는 Loki가 거절합니다. 이 항목은 전환 시점의 기록으로
+남겨 두지만, 2026-09-27에 `config.alloy`의 `loki.process.retention_guard`를 넣은 뒤로는 그 줄이
+Loki까지 올라가지 않습니다. Alloy가 167시간을 넘긴 줄을 먼저 버리므로 거절도, 그에 따른
+`reason="ingester_error"` 증가도 일어나지 않습니다. 사정은 아래의 "보존 기간을 넘긴 줄을 보내기
+전에 버립니다"에 적어 두었습니다.
 
 둘째, 다시 읽는 양이 한 번에 몰립니다. VM2의 Docker는 json-file 드라이버의 기본 설정을 쓰므로
 컨테이너 로그 파일에 크기 상한이 없습니다. 전환하기 전에 아래 명령으로 크기를 확인하십시오. 합이
@@ -1585,7 +1689,8 @@ Alloy가 576줄을 다시 보냈지만 Loki에 남은 줄 수는 그대로였습
 - `reason="ingester_error"`가 전환 직후에만 나타났다가 30분 안에 잦아들면 정상입니다. 7일을 넘긴
   로그를 Loki가 거절한 결과이며, 그 로그는 Promtail이 이미 넣어 두었습니다. `sudo docker logs
   vm2-loki --tail 100`에 `entry too far behind` 또는 `reject_old_samples`가 함께 보이면 이 경우가
-  맞습니다.
+  맞습니다. 이 판정은 `loki.process.retention_guard`를 넣기 전의 기준입니다. 지금은 Alloy가 그
+  줄을 먼저 버리므로 이 `reason`이 나타나면 전환과 무관한 문제로 보아야 합니다.
 - `reason="rate_limited"` 또는 `reason="stream_limited"`가 나타나면 수집 속도 제한에 걸린 것입니다.
   다시 읽는 양이 한꺼번에 몰려서 생긴 일이라면 몇 분 안에 잦아듭니다. 그러지 않고 계속 늘어난다면
   `loki/loki-config.yml`의 `ingestion_rate_mb`와 `ingestion_burst_size_mb`를 올려야 합니다. 이 경우의
@@ -1710,6 +1815,10 @@ sudo docker exec vm2-prometheus wget -O- http://<서비스>:<포트>/metrics
 # Loki로 보낸 줄 수와 버린 줄 수
 sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics \
   | grep -E '^loki_write_(sent|dropped)_entries_total|^loki_source_docker_target_entries_total'
+
+# 보내기 전에 버린 줄 수. reason="older_than_retention"이 늘어나는 것은 정상입니다
+sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics \
+  | grep '^loki_process_dropped_lines_total'
 
 # 응답 코드별 요청 수. 정상이면 204만 늘어납니다
 sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics \

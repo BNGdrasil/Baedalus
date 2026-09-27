@@ -58,6 +58,22 @@ services:
       - '--storage.tsdb.retention.size=3GB'
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'
+      # Alertmanager로 보내는 경보의 generatorURL을 사람이 쓸 수 있는 주소로 만든다.
+      # 이 옵션이 없으면 Prometheus가 os.Hostname()으로 주소를 조립하고, 컨테이너
+      # 안에서 그 값은 컨테이너 ID이므로 Discord 통지의 Source 링크가
+      # http://<컨테이너ID>:9090/graph?... 형태가 된다. 그 주소는 어디에서도 열리지
+      # 않는다. Prometheus는 외부에 게시하지 않고 SSH 터널로만 보므로(README의
+      # "접근 방법" 항목에 있는 ssh -L 9090:127.0.0.1:9090), 터널을 연 상태에서
+      # 그대로 열리는 127.0.0.1:9090으로 맞춘다.
+      #
+      # 이 값에는 경로가 없으므로 Prometheus가 제공하는 HTTP 경로는 하나도 바뀌지
+      # 않는다. --web.route-prefix의 기본값이 --web.external-url의 경로 부분이고,
+      # 여기서는 그 부분이 비어 있어서 route prefix가 "/"로 남는다. 즉 아래
+      # healthcheck의 /-/healthy, README와 배포 워크플로가 쓰는 /api/v1/targets와
+      # /api/v1/alerts, blackbox job이 거치는 경로가 모두 그대로다. 실제로 이
+      # 옵션을 붙여서 띄우고 /-/healthy와 /api/v1/alerts가 200을 돌려주는 것과
+      # generatorURL이 127.0.0.1:9090으로 나오는 것을 확인했다.
+      - '--web.external-url=http://127.0.0.1:9090'
     networks:
       - api-network
     restart: unless-stopped

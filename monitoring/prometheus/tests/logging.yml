@@ -5,11 +5,12 @@
 #     -v "$PWD/prometheus:/etc/prometheus:ro" prom/prometheus:v3.7.2 \
 #     test rules /etc/prometheus/tests/logging.yml
 #
-# basic-logging 그룹의 두 규칙을 확인한다. 두 규칙이 읽는 지표는
+# basic-logging 그룹의 세 규칙을 확인한다. 세 규칙이 읽는 지표는
 # grafana/alloy:v1.19.2를 실제로 띄워서 /metrics에 나오는 이름을 그대로
 # 옮긴 것이며, 아래 input_series의 label 구성도 그때 본 것과 같다.
 #   loki_write_dropped_entries_total{component_id, component_path, host, reason, tenant}
 #   loki_write_request_duration_seconds_count{component_id, component_path, host, status_code, tenant}
+#   loki_process_dropped_lines_total{component_id, component_path, reason}
 #
 # 두 규칙은 rate와 긴 for의 조합에서 increase와 짧은 for의 조합으로 바꾸었다.
 # 이전 형태는 한 번에 크게 늘어난 뒤 멈추는 유실을 영영 잡지 못했다. rate의 창이
@@ -169,6 +170,78 @@ tests:
         alertname: LogShippingDropping
         exp_alerts: []
 
+  # 보존 기간을 넘긴 줄을 loki.process.retention_guard가 계속 버리는 구간이다.
+  # 조용한 컨테이너의 마지막 줄이 약 5분마다 다시 들어오는 동안 이 값은 끊임없이
+  # 늘어나며, 그것이 의도한 동작이다. 어떤 경보도 울리지 않아야 한다. 전송 단계는
+  # 그 줄을 아예 받지 않으므로 dropped 쪽도 0으로 유지된다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="older_than_retention"}'
+        values: '0+50x60'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0x60'
+      - series: 'up{job="alloy",instance="vm2"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: LogProcessDroppingUnexpected
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: LogShippingDropping
+        exp_alerts: []
+
+  # 의도하지 않은 드롭이 들어온 구간이다. drop_counter_reason을 적지 않은
+  # stage.drop이 설정에 들어오면 Alloy가 기본값인 reason="drop_stage"로 센다.
+  # 보존 기간 초과 드롭이 동시에 일어나고 있어도 그쪽은 제외되고 drop_stage
+  # 하나만 발화해야 한다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="older_than_retention"}'
+        values: '0+50x60'
+      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="drop_stage"}'
+        values: '0+7x60'
+    alert_rule_test:
+      # for가 5분이므로 3분 시점에는 아직 발화하지 않는다.
+      - eval_time: 3m
+        alertname: LogProcessDroppingUnexpected
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: LogProcessDroppingUnexpected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: alloy
+              reason: drop_stage
+            exp_annotations:
+              summary: 'Alloy가 예상하지 않은 이유로 로그를 버리고 있다 (reason=drop_stage)'
+              description: '최근 10분 안에 loki.process 단계에서 버린 줄이 있고 그 이유가 보존 기간 초과가 아니다. 설정에 의도하지 않은 드롭이 들어왔을 수 있다.'
+              action: 'monitoring/alloy/config.alloy의 loki.process 블록에 retention_guard 말고 다른 stage.drop이 들어왔는지 확인하고, sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics | grep loki_process_dropped_lines_total 으로 reason별 값을 읽는다.'
+
+  # 예상하지 않은 드롭이 한 번 묶여서 일어나고 멈추는 구간이다. increase의 창이
+  # 10분이므로 5분의 for를 채워서 발화하고, 창이 지나가면 스스로 해소된다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="drop_stage"}'
+        values: '0 0 0 0 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LogProcessDroppingUnexpected
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LogProcessDroppingUnexpected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: alloy
+              reason: drop_stage
+            exp_annotations:
+              summary: 'Alloy가 예상하지 않은 이유로 로그를 버리고 있다 (reason=drop_stage)'
+              description: '최근 10분 안에 loki.process 단계에서 버린 줄이 있고 그 이유가 보존 기간 초과가 아니다. 설정에 의도하지 않은 드롭이 들어왔을 수 있다.'
+              action: 'monitoring/alloy/config.alloy의 loki.process 블록에 retention_guard 말고 다른 stage.drop이 들어왔는지 확인하고, sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics | grep loki_process_dropped_lines_total 으로 reason별 값을 읽는다.'
+      - eval_time: 20m
+        alertname: LogProcessDroppingUnexpected
+        exp_alerts: []
+
   # Alloy 컨테이너가 통째로 사라진 상황이다. 로그 전송 규칙은 시계열이 없어서
   # 조용하고, TargetDown 하나만 울린다. 규칙을 겹쳐 두지 않은 결과를 확인한다.
   - interval: 30s
@@ -181,6 +254,9 @@ tests:
         exp_alerts: []
       - eval_time: 10m
         alertname: LogShippingWriteFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: LogProcessDroppingUnexpected
         exp_alerts: []
       - eval_time: 10m
         alertname: TargetDown
