@@ -54,7 +54,7 @@
       "id": 2,
       "type": "stat",
       "title": "구간 로그 줄 수",
-      "description": "선택한 범위에서 수집된 전체 로그 줄 수다.",
+      "description": "선택한 범위에서 수집된 로그 줄 수다. 로그 수준 변수로 범위를 좁힐 수 있다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -72,7 +72,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({service=~\"$service\", host=~\"$host\"} |= \"$search\"[$__range]))",
+          "expr": "sum(count_over_time({service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"$level\" [$__range]))",
           "legendFormat": "줄",
           "queryType": "range",
           "refId": "A"
@@ -120,7 +120,7 @@
       "id": 3,
       "type": "stat",
       "title": "구간 오류 줄 수",
-      "description": "오류 패턴에 걸린 로그 줄 수다.",
+      "description": "Loki가 줄마다 붙이는 detected_level이 error, fatal, critical인 줄을 센다. 수준을 판별하지 못한 unknown 줄은 오류 패턴 변수의 정규식에 걸릴 때에만 함께 센다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -138,7 +138,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({service=~\"$service\", host=~\"$host\"} |= \"$search\" |~ \"$level\"[$__range]))",
+          "expr": "sum(count_over_time({service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"error|fatal|critical|unknown\" | regexp \"(?i)(?P<errkw>$errpattern)\" | detected_level=~\"error|fatal|critical\" or errkw!=\"\" [$__range]))",
           "legendFormat": "줄",
           "queryType": "range",
           "refId": "A"
@@ -190,7 +190,7 @@
       "id": 4,
       "type": "stat",
       "title": "초당 로그 유입량",
-      "description": "선택한 범위의 평균 초당 로그 줄 수다.",
+      "description": "선택한 범위의 평균 초당 로그 줄 수다. 로그 수준 변수로 범위를 좁힐 수 있다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -208,7 +208,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum(rate({service=~\"$service\", host=~\"$host\"} |= \"$search\"[$__range]))",
+          "expr": "sum(rate({service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"$level\" [$__range]))",
           "legendFormat": "줄/초",
           "queryType": "range",
           "refId": "A"
@@ -269,7 +269,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "서비스별 로그량",
-      "description": "서비스별 초당 로그 줄 수다. 급증은 오류 반복이나 디버그 로그를 뜻한다.",
+      "description": "서비스별 초당 로그 줄 수다. 급증은 오류 반복이나 디버그 로그를 뜻한다. 로그 수준 변수로 범위를 좁힐 수 있다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -287,7 +287,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum by (service) (rate({service=~\"$service\", host=~\"$host\"} |= \"$search\"[$__auto]))",
+          "expr": "sum by (service) (rate({service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"$level\" [$__auto]))",
           "legendFormat": "{{service}}",
           "queryType": "range",
           "refId": "A"
@@ -361,7 +361,7 @@
       "id": 7,
       "type": "timeseries",
       "title": "서비스별 오류 로그량",
-      "description": "오류 패턴에 걸린 줄만 센다.",
+      "description": "\"구간 오류 줄 수\"와 같은 기준으로 고른 줄만 서비스별로 센다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -379,7 +379,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum by (service) (rate({service=~\"$service\", host=~\"$host\"} |= \"$search\" |~ \"$level\"[$__auto]))",
+          "expr": "sum by (service) (rate({service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"error|fatal|critical|unknown\" | regexp \"(?i)(?P<errkw>$errpattern)\" | detected_level=~\"error|fatal|critical\" or errkw!=\"\" [$__auto]))",
           "legendFormat": "{{service}}",
           "queryType": "range",
           "refId": "A"
@@ -457,7 +457,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "스트림별 로그량",
-      "description": "stream 라벨은 stdout과 stderr를 구분한다.",
+      "description": "stream 라벨은 stdout과 stderr를 구분한다. 로그 수준 변수로 범위를 좁힐 수 있다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -475,7 +475,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum by (stream) (rate({service=~\"$service\", host=~\"$host\"} |= \"$search\"[$__auto]))",
+          "expr": "sum by (stream) (rate({service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"$level\" [$__auto]))",
           "legendFormat": "{{stream}}",
           "queryType": "range",
           "refId": "A"
@@ -661,7 +661,7 @@
       "id": 10,
       "type": "logs",
       "title": "오류 로그",
-      "description": "오류 패턴에 걸린 줄만 보여 준다.",
+      "description": "\"구간 오류 줄 수\"와 같은 기준으로 고른 줄만 보여 준다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -679,7 +679,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{service=~\"$service\", host=~\"$host\"} |= \"$search\" |~ \"$level\"",
+          "expr": "{service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"error|fatal|critical|unknown\" | regexp \"(?i)(?P<errkw>$errpattern)\" | detected_level=~\"error|fatal|critical\" or errkw!=\"\"",
           "legendFormat": "{{service}}",
           "queryType": "range",
           "refId": "A"
@@ -705,7 +705,7 @@
       "id": 11,
       "type": "logs",
       "title": "전체 로그",
-      "description": "선택한 서비스와 호스트의 모든 로그다.",
+      "description": "선택한 서비스와 호스트, 로그 수준에 해당하는 모든 로그다.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -723,7 +723,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{service=~\"$service\", host=~\"$host\"} |= \"$search\"",
+          "expr": "{service=~\"$service\", host=~\"$host\"} |= \"$search\" | detected_level=~\"$level\"",
           "legendFormat": "{{service}}",
           "queryType": "range",
           "refId": "A"
@@ -846,19 +846,72 @@
       },
       {
         "name": "level",
-        "label": "오류 패턴",
-        "description": "오류 로그를 고르는 정규식이다. 구조화 로그의 level 필드와 자유 형식 로그를 함께 잡는다.",
-        "type": "textbox",
-        "query": "(?i)(error|exception|traceback|fatal|critical)",
+        "label": "로그 수준",
+        "description": "Loki가 줄마다 붙이는 detected_level 값이다. All을 고르면 모든 수준을 본다. 오류 패널 세 개는 이 변수와 무관하게 error, fatal, critical을 기준으로 삼는다.",
+        "type": "custom",
+        "query": "error,fatal,critical,warn,info,debug,unknown",
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".+",
+        "options": [
+          {
+            "selected": false,
+            "text": "error",
+            "value": "error"
+          },
+          {
+            "selected": false,
+            "text": "fatal",
+            "value": "fatal"
+          },
+          {
+            "selected": false,
+            "text": "critical",
+            "value": "critical"
+          },
+          {
+            "selected": false,
+            "text": "warn",
+            "value": "warn"
+          },
+          {
+            "selected": false,
+            "text": "info",
+            "value": "info"
+          },
+          {
+            "selected": false,
+            "text": "debug",
+            "value": "debug"
+          },
+          {
+            "selected": false,
+            "text": "unknown",
+            "value": "unknown"
+          }
+        ],
         "current": {
-          "text": "(?i)(error|exception|traceback|fatal|critical)",
-          "value": "(?i)(error|exception|traceback|fatal|critical)"
+          "text": "All",
+          "value": "$__all"
+        },
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "errpattern",
+        "label": "오류 패턴",
+        "description": "detected_level이 unknown인 줄을 오류로 볼지 가리는 정규식이다. 오류 패널의 보조 조건으로만 쓰이며 대소문자를 구분하지 않는다.",
+        "type": "textbox",
+        "query": "error|exception|traceback|fatal|critical",
+        "current": {
+          "text": "error|exception|traceback|fatal|critical",
+          "value": "error|exception|traceback|fatal|critical"
         },
         "options": [
           {
             "selected": true,
-            "text": "(?i)(error|exception|traceback|fatal|critical)",
-            "value": "(?i)(error|exception|traceback|fatal|critical)"
+            "text": "error|exception|traceback|fatal|critical",
+            "value": "error|exception|traceback|fatal|critical"
           }
         ],
         "hide": 0,
@@ -884,6 +937,6 @@
   "timezone": "browser",
   "title": "로그 탐색",
   "uid": "bngdrasil-logs",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }

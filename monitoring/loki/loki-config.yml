@@ -43,6 +43,11 @@ limits_config:
   reject_old_samples_max_age: 168h
   ingestion_rate_mb: 10
   ingestion_burst_size_mb: 20
+  # 적재 시점에 줄마다 detected_level 구조화 메타데이터를 붙인다. logs.json의 오류
+  # 패널이 이 값으로 오류를 가리므로 기본값(true)에 기대지 않고 파일에 명시한다.
+  # 값을 끄면 detected_level이 사라져서 오류 패널이 빈 채로 나온다. 인식 방식과
+  # 근거는 monitoring/README.md의 "오류 판정을 detected_level로 바꾸었습니다"에 있다.
+  discover_log_levels: true
 
 compactor:
   working_directory: /loki/compactor

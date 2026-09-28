@@ -723,6 +723,144 @@ Loki는 그 제한을 채운 시점에 아직 남아 있는 조각을 스스로 
 `timepicker.refresh_intervals`에서 `10s`와 `30s`를 지우면 이 경로까지 막히지만, 다른 일곱 개
 대시보드와 선택기 구성이 달라지므로 이번에는 바꾸지 않았습니다.
 
+### 오류 판정을 detected_level로 바꾸었습니다
+
+`logs.json`의 오류 패널 세 개("구간 오류 줄 수", "서비스별 오류 로그량", "오류 로그")는
+`|~ "(?i)(error|exception|traceback|fatal|critical)"`이라는 줄 단위 정규식으로 오류를 가렸습니다.
+이 방식은 줄의 내용만 보기 때문에, 오류가 아닌데도 그 낱말을 품고 있는 줄까지 함께 셉니다. 가장
+큰 오탐은 Loki 자신이 남기는 질의 로그였습니다. Loki는 실행한 질의문을
+`level=info ... query="..."` 형태로 기록하는데, 대시보드가 보낸 질의문 안에 위 정규식 문자열이
+그대로 들어 있으므로 그 info 줄이 자기 자신의 오류 조건에 걸립니다. Grafana와 Alloy가 남기는
+info 줄도 같은 이유로 걸렸습니다. 2026년 9월 28일에 VM2에서 1시간 구간을 실측한 결과, 정규식에
+걸린 407줄(`loki` 360줄, `grafana` 34줄, `alloy` 13줄)이 모두 오류가 아닌 info 줄이었고, 실제로
+오류 수준인 줄은 40개였습니다.
+
+Loki 3.5.7은 적재 시점에 줄마다 `detected_level` 구조화 메타데이터를 붙입니다. 이 값은 줄의
+본문이 아니라 줄이 스스로 밝힌 수준에서 나오므로, 질의문을 본문에 담고 있는 info 줄이 오류로
+집계되는 경로가 사라집니다. 그래서 오류 판정의 중심을
+`| detected_level=~"error|fatal|critical"`로 옮겼습니다.
+
+#### Loki가 detected_level을 정하는 규칙
+
+`grafana/loki:3.5.7` 컨테이너를 저장소의 `loki/loki-config.yml`로 띄우고 줄을 직접 push해서
+확인했습니다. Loki는 먼저 logfmt와 JSON에서 `limits_config.log_level_fields`에 적힌 필드
+이름(`level`, `LEVEL`, `Level`, `Severity`, `severity`, `SEVERITY`, `lvl`, `LVL`, `Lvl`,
+`severity_text`, `Severity_Text`, `SEVERITY_TEXT`)을 찾고, 찾지 못하면 줄 본문에서 수준을
+뜻하는 낱말을 찾습니다. 그래도 정하지 못하면 `unknown`을 붙입니다. 수준을 붙이지 않고 넘어가는
+경우는 없었으므로, 모든 줄에 `detected_level`이 존재합니다.
+
+| push한 줄 | 붙은 `detected_level` |
+|---|---|
+| `level=error caller=token.go:88 msg="failed to mint access token"` | `error` |
+| `level=info ... query="... (?i)(error\|exception\|traceback\|fatal\|critical) ..." status=200` | `info` |
+| `level=warn caller=tail.go:9 msg="file rotated"` | `warn` |
+| `level=fatal caller=main.go:1 msg="cannot bind port"` | `fatal` |
+| `severity=Error msg="nope"` | `error` |
+| `{"level":"critical","msg":"disk full"}` | `critical` |
+| `ERROR: connection refused` | `error` |
+| `something error occurred while flushing` | `error` |
+| `panic: runtime error index out of range` | `error` |
+| `[WARNING] disk almost full` | `warn` |
+| `informational notice` | `info` |
+| `Traceback (most recent call last):` | `unknown` |
+| `an exception was raised` | `unknown` |
+| `2026-09-28 12:00:00 CRITICAL shutting down` | `unknown` |
+| `fatal shutdown now` | `unknown` |
+| `plain line with no hints at all` | `unknown` |
+
+수준 필드가 없는 줄에서 Loki가 알아보는 낱말은 `error`와 `err`, `warn`과 `warning`, `info`,
+`debug`뿐입니다. `fatal`과 `critical`, `exception`, `traceback`은 수준 필드 바깥에 있으면
+알아보지 못하고 `unknown`으로 남습니다. 파이썬 traceback처럼 수준을 밝히지 않는 줄이 여기에
+해당하므로, `detected_level`만으로 판정하면 그런 줄을 놓칩니다.
+
+#### unknown인 줄을 다루는 방법
+
+그래서 오류 패널은 두 가지 조건을 함께 씁니다. `detected_level`이 `error`, `fatal`, `critical`인
+줄은 본문과 무관하게 오류로 세고, `detected_level`이 `unknown`인 줄에 한해서만 예전의 정규식을
+보조로 적용합니다. 세 패널이 모두 아래 한 가지 질의 형태를 씁니다.
+
+```
+{service=~"$service", host=~"$host"} |= "$search"
+  | detected_level=~"error|fatal|critical|unknown"
+  | regexp "(?i)(?P<errkw>$errpattern)"
+  | detected_level=~"error|fatal|critical" or errkw!=""
+```
+
+LogQL에는 파이프라인 단계를 OR로 묶는 문법이 없지만 label filter는 `or`와 괄호를 지원하므로,
+정규식을 `regexp` 파서로 label `errkw`에 옮겨 놓으면 두 조건을 label filter 하나로 합칠 수
+있습니다. 그래서 패널마다 질의를 두 개 두고 결과를 더하는 방법을 쓰지 않았고, stat과 timeseries,
+logs 패널이 모두 같은 한 줄짜리 질의를 씁니다. 첫 줄의 `detected_level=~"error|fatal|critical|unknown"`은
+정확도가 아니라 비용을 위해 둔 단계입니다. 오탐의 대부분을 차지하던 info 줄을 `regexp` 파서에
+닿기 전에 걸러 내며, 이 단계를 거친 뒤에 남는 값은 `error`, `fatal`, `critical`, `unknown` 넷뿐이므로
+마지막 label filter의 의미는 달라지지 않습니다.
+
+같은 Loki 컨테이너에 여덟 줄을 push해서 예전 정규식과 새 기준을 나란히 던진 결과는 다음과
+같습니다. `O`는 오류로 집계되었다는 뜻입니다.
+
+| push한 줄 | `detected_level` | 예전 정규식 | 수준만 볼 때 | 수준과 unknown 보조 |
+|---|---|---|---|---|
+| `level=error ... msg="failed to mint access token"` | `error` | O | O | O |
+| `level=info ... query="... (error\|exception\|...)"` | `info` | O | | |
+| `Traceback (most recent call last):` | `unknown` | O | | O |
+| `  File "/app/main.py", line 42, in handler` | `unknown` | | | |
+| `level=info ... msg="HTTP Server Listen"` | `info` | | | |
+| `{"level":"critical","msg":"disk full"}` | `critical` | O | O | O |
+| `level=warn ... msg="file rotated"` | `warn` | | | |
+| `level=fatal ... msg="cannot bind port"` | `fatal` | O | O | O |
+
+예전 정규식은 다섯 줄을 셌고 그중 Loki 질의 로그 한 줄이 오탐이었습니다. 새 기준은 네 줄을
+셌으며 오탐이 없고 traceback 줄을 그대로 잡습니다. `detected_level`만 보고 `unknown`을 버렸다면
+세 줄에 그치고 traceback 줄을 놓쳤을 것입니다.
+
+한계도 적어 둡니다. 보조 정규식은 줄 단위로 판정하므로, traceback의 둘째 줄부터처럼 낱말이 없는
+잇따르는 줄은 오류로 세지 않습니다. 위 표의 `File "/app/main.py"` 줄이 그 예이며, "오류 로그"
+패널에서는 traceback의 첫 줄만 보입니다. 해당 서비스와 시각을 확인한 뒤에 "전체 로그" 패널에서
+앞뒤 줄을 이어 읽는 방식으로 보완하십시오. 또한 `unknown`인 줄 가운데 본문에 `error`가 들어
+있으나 오류가 아닌 줄이 있다면 예전과 같은 오탐이 남습니다. 다만 2026년 9월 28일 기준으로 VM2의
+지난 1시간 동안 `unknown`이면서 이 정규식에 걸린 줄은 0개였으므로, 현재 수집 대상에서는 이
+경로로 들어오는 오탐이 없습니다.
+
+#### 로그 수준 변수
+
+예전의 `level` 변수는 오류 정규식을 담은 textbox였습니다. 오류 판정이 정규식에서 벗어났으므로
+이 변수를 `detected_level` 값을 고르는 선택 목록으로 바꾸었습니다. 선택지는 `error`, `fatal`,
+`critical`, `warn`, `info`, `debug`, `unknown`이고 기본값은 `All`입니다. `All`의 `allValue`는
+다른 Loki 변수와 같은 이유로 `.+`이며, 모든 줄에 `detected_level`이 붙으므로 `All`을 고른 화면은
+예전과 똑같은 줄을 셉니다.
+
+이 변수는 오류 패널이 아니라 "구간 로그 줄 수", "초당 로그 유입량", "서비스별 로그량",
+"스트림별 로그량", "전체 로그" 다섯 패널에 들어갑니다. 오류 패널은 화면에서 무엇을 고르든
+`error`, `fatal`, `critical`을 기준으로 삼아야 하므로 이 변수를 쓰지 않습니다. 여러 값을 동시에
+고르는 multi 선택은 쓰지 않았습니다. Grafana가 multi 변수를 질의문에 넣을 때 적용하는 서식
+규칙을 화면 없이 확인할 방법이 없는 반면, 단일 선택은 치환 결과가 값 자체이거나 `allValue`이므로
+README의 다른 항목처럼 치환한 질의를 Loki에 직접 던져서 검증할 수 있기 때문입니다.
+
+정규식 자체는 `errpattern` 변수로 남겨 두었습니다. 기본값은
+`error|exception|traceback|fatal|critical`이고, `detected_level`이 `unknown`인 줄에만 적용됩니다.
+질의문은 이 값을 `(?i)(?P<errkw>$errpattern)`에 끼워 넣으므로 변수에는 대안 목록만 적습니다.
+값을 비우면 `unknown`인 줄이 모두 오류로 잡히므로 비우지 마십시오.
+
+#### Loki 설정에 명시한 항목
+
+`detected_level`은 `limits_config.discover_log_levels`가 켜져 있을 때에만 붙습니다. Loki 3.5.7의
+기본값은 `true`이며, 저장소의 설정을 그대로 쓴 컨테이너의 `/config`에서도 `true`로 나왔습니다.
+다만 오류 패널이 이 값에 전적으로 의존하게 되었으므로 기본값에 기대지 않고
+`loki/loki-config.yml`의 `limits_config`에 `discover_log_levels: true`를 주석과 함께
+적어 두었습니다. 이 항목을 끄면 오류 패널 세 개가 빈 화면으로 나옵니다. 설정을 고친 뒤에
+`docker compose -f monitoring/docker-compose.monitoring.yml config --quiet`가 아무 출력도 내지
+않는 것과, 그 설정으로 Loki가 다시 기동해서 `/ready`가 200을 돌려주는 것을 확인했습니다.
+
+#### 운영에 반영하는 방법
+
+이번 변경은 대시보드 JSON과 Loki 설정 파일을 고친 것이므로, 파일을 VM2로 옮기는 배포
+워크플로를 실행해야 화면에 반영됩니다. JSON만 고쳤더라도 rsync가 돌지 않으면 운영 Grafana가
+읽는 `/var/lib/grafana/dashboards` 아래 파일이 예전 내용 그대로 남습니다. 대시보드 JSON은
+Grafana가 주기적으로 다시 읽으므로 파일이 도착하면 재시작 없이 반영되지만, Loki 설정은 위의
+"설정 변경을 반영하는 방법"에 따라 Loki 컨테이너를 다시 시작해야 반영됩니다. 이미 적재된 줄에
+붙은 `detected_level`은 적재 시점에 정해진 값이므로 바뀌지 않으며, 설정을 명시한 뒤에도 예전
+줄의 판정 결과는 그대로입니다.
+
+
 ### 데이터 원본 uid
 
 대시보드 JSON과 Bantheon 어드민의 Explore 링크는 데이터 원본을 이름이 아니라 uid로 가리킵니다.
