@@ -626,6 +626,103 @@ uid는 JSON 파일 안의 `uid` 항목에 고정해 두었습니다. 이 값을 
 새 항목으로 인식해서 이전 uid로 만들어 둔 즐겨찾기와 외부 링크가 모두 끊어지므로, 파일 이름은
 바꾸더라도 uid는 그대로 두십시오.
 
+### 템플릿 변수의 All 값
+
+대시보드 위쪽의 템플릿 변수에서 `All`을 고르면, Grafana는 질의문의 변수 자리에 JSON의
+`allValue`에 적어 둔 문자열을 대신 넣습니다. 이 값은 질의를 받는 데이터 원본에 따라 다르게
+정해야 합니다.
+
+Loki는 모든 matcher가 빈 문자열과도 일치할 수 있는 stream selector를 거부하고 HTTP 400을
+돌려줍니다. `grafana/loki:3.5.7` 컨테이너의 `/loki/api/v1/query_range`에 `{service=~".*"}`를 직접
+던져서 받은 응답은 다음과 같습니다.
+
+```
+parse error : queries require at least one regexp or equality matcher that does not have an
+empty-compatible value. For instance, app=~".*" does not meet this requirement, but app=~".+" will
+```
+
+그래서 Loki 질의에 들어가는 변수는 `allValue`를 `.+`로 둡니다. Prometheus는 `.*`를 그대로
+받아들이므로 Prometheus 질의에만 쓰이는 변수는 `.*`로 두어도 됩니다. 다만 한 변수가 두 데이터
+원본의 질의에 모두 들어간다면 `.+`로 통일합니다. Prometheus 질의에서 `.*`를 `.+`로 바꾸면 해당
+label이 없거나 값이 빈 series가 결과에서 빠지지만, 변수의 선택지를 만드는 `label_values()`가 그런
+series를 애초에 내놓지 않기 때문에 화면에서 고를 수 있는 값의 범위는 달라지지 않습니다.
+
+2026년 9월 28일에 여덟 개 대시보드의 템플릿 변수를 모두 점검한 결과는 다음과 같습니다.
+
+| 대시보드 | 변수 | 변수가 들어가는 질의의 데이터 원본 | `allValue` |
+|---|---|---|---|
+| `overview.json` | `service` | Prometheus | `.*` |
+| `gateway.json` | `service` | Prometheus와 Loki | `.+` |
+| `gateway.json` | `method` | Prometheus | `.*` |
+| `auth-server.json` | `handler` | Prometheus | `.*` |
+| `hosts.json` | `instance`, `mountpoint` | Prometheus | `.*` |
+| `containers.json` | `name` | Prometheus | `.*` |
+| `backup.json` | `component` | Prometheus | `.*` |
+| `probes.json` | `job`, `target` | Prometheus | `.*` |
+| `logs.json` | `service`, `host` | Loki | `.+` |
+
+이 가운데 `gateway.json`의 `service` 변수만 `.*`에서 `.+`로 고쳤습니다. 이 변수는 Prometheus
+질의 열두 개에 들어가는 동시에 "선택한 서비스의 로그" 패널의 Loki 질의인
+`{service=~"$service"} |= "$search"`에도 들어갑니다. 변수의 기본값이 `All`이기 때문에 대시보드를
+열기만 해도 그 패널은 400을 받고 비어 있었습니다. 고친 뒤에 여덟 개 대시보드의 Loki 패널 질의
+열 개를 각 변수의 `All` 값으로 치환해서 Loki에 직접 던졌고, 열 개 모두 200을 받았습니다.
+
+`gateway.json`의 `method`는 Prometheus 질의에만 쓰이므로 `.*`를 그대로 두었습니다. 나중에 이
+변수를 Loki 패널의 질의에 쓰게 된다면 그때 `.+`로 바꾸어야 합니다.
+
+### 로그 대시보드의 오류 줄 수가 스스로 늘어나는 현상
+
+`logs.json`의 "구간 오류 줄 수" 패널이, 화면을 열어 둔 채 가만히 지켜보기만 해도 값이 계속
+올라가는 현상을 2026년 9월 28일에 확인했습니다. 늘어난 줄의 정체는 Loki 자신이 남긴 오류
+로그였습니다. Alloy가 Loki 컨테이너의 로그도 수집해서 `service="loki"`로 넣기 때문에, 로그
+대시보드가 세는 대상 안에 Loki의 오류 로그가 그대로 들어갑니다.
+
+원인은 대시보드가 보낸 질의가 도중에 취소되는 데 있습니다. 새 refresh 주기가 시작되면 Grafana는
+아직 응답을 받지 못한 이전 주기의 질의를 끊습니다. 그러면 Loki의 querier가 아래와 같은 오류를
+남기며, 네 문구 모두 `pkg/querier/worker/scheduler_processor.go`가 남기는 것입니다.
+
+```
+level=error caller=scheduler_processor.go:111 component=querier msg="error processing requests from scheduler" err="rpc error: code = Canceled desc = context canceled"
+level=error caller=scheduler_processor.go:175 component=querier msg="error notifying scheduler about finished query" err=EOF
+level=error caller=scheduler_processor.go:254 component=querier msg="error notifying frontend about finished query" err="rpc error: code = Canceled desc = context canceled"
+level=error caller=scheduler_processor.go:298 component=querier msg="error health checking" err="rpc error: code = Canceled desc = context canceled"
+```
+
+저장소의 `loki/loki-config.yml`을 그대로 쓰는 `grafana/loki:3.5.7`과, 저장소의 프로비저닝을 그대로
+쓰는 `grafana/grafana:12.2.1`을 띄우고, 여덟 개 서비스의 로그 약 800만 줄을 6시간 구간에 넣은 뒤에
+로그 대시보드를 headless 브라우저로 열어 두어 재현했습니다. 인과 관계는 따로 확인했습니다. 같은
+질의 스무 개를 끝까지 완료시켰을 때에는 오류 줄이 하나도 늘지 않았고, 같은 질의 스무 개를 도중에
+끊었을 때에는 오류 줄이 서른 개 늘었습니다.
+
+조치로는 `logs.json`의 `refresh`를 `30s`에서 `1m`으로 바꾸는 방법을 골랐습니다. 대시보드를 10분씩
+열어 두고 두 번씩 측정한 결과는 다음과 같습니다.
+
+| `refresh` | 10분 동안 브라우저가 보낸 질의 요청 | 늘어난 Loki error 줄 | 시간당 환산 |
+|---|---|---|---|
+| `30s` (1차) | 165 | 59 | 350.5 |
+| `30s` (2차) | 160 | 47 | 279.2 |
+| `1m` (1차) | 83 | 20 | 118.6 |
+| `1m` (2차) | 83 | 36 | 213.9 |
+
+두 번의 평균은 `30s`에서 시간당 314.9줄이고 `1m`에서 시간당 166.2줄이므로, 오류 줄이 약 47퍼센트
+줄었습니다. 질의 요청 수가 절반으로 줄어든 비율과 거의 같으므로, 오류 줄 수는 refresh 주기 수에
+비례합니다.
+
+버린 후보는 세 가지입니다. 첫째, 패널 질의를 가볍게 만드는 방법을 쓰지 않았습니다. "구간 오류 줄
+수"는 선택한 구간 전체의 오류 줄을 세는 패널이므로, 범위나 정규식을 줄이면 패널이 답하는 질문
+자체가 달라집니다. 둘째, Loki 설정으로 막는 방법은 존재하지 않습니다. `loki -help`의 로그 관련
+항목을 모두 확인했지만 취소 로그를 끄는 항목은 없었고, 위의 네 문구는 조건 없이 error 수준으로
+기록되므로 `log_level`을 올려도 막히지 않습니다. 셋째, 오류 수 패널의 질의에서 `service="loki"`를
+빼는 방법은 Loki의 진짜 오류까지 함께 가리므로 쓰지 않았습니다.
+
+남는 점도 두 가지 적어 둡니다. 첫째, `1m`으로 늘려도 오류 줄이 0이 되지는 않습니다. "오류 로그"와
+"전체 로그" 패널은 줄 수 제한을 따로 적지 않아서 Loki 데이터 원본의 기본값인 1000줄이 걸리는데,
+Loki는 그 제한을 채운 시점에 아직 남아 있는 조각을 스스로 끊습니다. 그래서 정상으로 끝난 질의도
+가끔 같은 문구를 남기며, 실제로 완료된 질의 열 개당 두 줄이 늘었습니다. 둘째,
+화면의 선택기에서 간격을 다시 `30s`로 바꿀 수 있으며, 그렇게 하면 같은 현상이 돌아옵니다.
+`timepicker.refresh_intervals`에서 `10s`와 `30s`를 지우면 이 경로까지 막히지만, 다른 일곱 개
+대시보드와 선택기 구성이 달라지므로 이번에는 바꾸지 않았습니다.
+
 ### 데이터 원본 uid
 
 대시보드 JSON과 Bantheon 어드민의 Explore 링크는 데이터 원본을 이름이 아니라 uid로 가리킵니다.
