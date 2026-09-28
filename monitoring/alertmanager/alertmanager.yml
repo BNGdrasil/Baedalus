@@ -109,22 +109,45 @@ inhibit_rules:
       - alertname = "DiskSpaceLow"
     equal: ['instance', 'mountpoint']
 
-  # 로그 전송 실패의 두 단계를 묶는다.
-  # LogShippingWriteFailing은 Loki가 2xx가 아닌 응답을 돌려주어 Alloy가 아직
-  # 재시도 중인 구간이고, LogShippingDropping은 재시도를 소진해 로그를 버리기
-  # 시작한 구간이다. 뒤 단계가 울리고 있으면 앞 단계는 같은 장애의 경과일 뿐이다.
+  # 로그 수집 경로의 앞 단계를 뒤 단계가 억제한다.
   #
-  # equal을 service로만 두는 근거
-  #   두 규칙식이 각각 sum by (reason)과 sum by (status_code)로 묶여 있어
-  #   instance와 job은 결과에서 사라졌고, 남는 label도 서로 다르다. 양쪽에 같은
-  #   값으로 남는 것은 규칙이 직접 붙이는 service="alloy"뿐이다.
-  #   basic.yml에서 service="alloy"를 붙이는 규칙은 이 두 개뿐이므로, 이 범위가
-  #   다른 경보까지 삼키지는 않는다.
+  # basic.yml의 basic-logging 그룹을 2026-09-28에 다시 짜면서 이 자리의 규칙도
+  # 바꾸었다. 이전에는 LogShippingDropping 하나만 source였고 equal이 service였다.
+  # 지금은 source가 둘이고 equal이 pipeline이다. 두 가지가 달라졌기 때문이다.
+  #
+  #   1. 경보가 Alloy 쪽과 Loki 쪽으로 갈렸다. LokiRejectingEntries는 Loki의
+  #      줄 단위 거절 지표를 보므로 service="loki"이고, LogShippingDropping과
+  #      LogShippingWriteFailing은 Alloy 지표를 보므로 service="alloy"다.
+  #      equal에 service를 그대로 두면 Loki 쪽 경보는 어떤 Alloy 쪽 경보와도
+  #      같아지지 않아 억제가 영영 일어나지 않는다.
+  #   2. 그래서 basic-logging의 다섯 규칙에 pipeline="logs"를 붙였다. 규칙이
+  #      직접 붙이는 label이라 집계식에 상관없이 양쪽에 같은 값으로 남는다.
+  #      이 label을 붙이는 규칙은 그 다섯 개뿐이므로 다른 경보를 삼키지 않는다.
+  #
+  # LogShippingWriteFailing은 Loki가 2xx도 400도 아닌 응답을 돌려주거나 연결
+  # 자체가 안 되는 구간을 warning으로 알린다. 아래 두 critical이 울리는 동안에는
+  # 같은 장애를 낮은 심각도로 한 번 더 말하는 것뿐이므로 통지하지 않는다.
+  # 429가 그 겹침이 생기는 자리다. 수용 한도를 넘기면 Loki가 429를 돌려주면서
+  # 줄을 거절하고, Alloy도 결국 버리기 시작한다.
   - source_matchers:
       - alertname = "LogShippingDropping"
     target_matchers:
       - alertname = "LogShippingWriteFailing"
-    equal: ['service']
+    equal: ['pipeline']
+
+  - source_matchers:
+      - alertname = "LokiRejectingEntries"
+    target_matchers:
+      - alertname = "LogShippingWriteFailing"
+    equal: ['pipeline']
+
+  # LokiRejectingEntries와 LogShippingDropping은 서로 억제하지 않는다.
+  # 수용 한도를 넘기면 둘이 함께 울리지만, 두 경보가 말하는 값이 다르기 때문이다.
+  # 앞은 Loki가 거절한 줄 수이고 뒤는 Alloy가 포기한 배치 수다. 얼마나 잃었는지
+  # 판단하려면 둘 다 필요하므로 한쪽을 묻지 않는다.
+  #
+  # LokiRejectingStaleEntries도 억제 대상에 넣지 않는다. 그 경보는 순서와 나이
+  # 때문에 거절된 줄만 보며 다른 경보와 원인이 겹치지 않는다.
 
   # 백업 오프사이트 전송 실패와 그 결과로 쌓이는 미전송 백업을 묶는다.
   # 전송에 성공하지 못한 백업은 보존 정책이 지우지 않으므로 쌓인다.

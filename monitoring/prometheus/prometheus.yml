@@ -119,10 +119,35 @@ scrape_configs:
   # Promtail에는 지표를 긁는 job이 없어서 로그 전송이 막혀도 드러나지 않았다.
   # Alloy는 12345번 포트에 /metrics를 노출하지만 compose가 그 포트를 게시하지
   # 않으므로, api-network 안의 Prometheus만 이 주소에 닿는다.
-  # basic-logging 규칙 두 개가 여기에서 오는 loki_write_* 지표를 본다.
+  # basic-logging 규칙 세 개가 여기에서 오는 loki_write_*와 loki_process_* 지표를
+  # 본다. process_start_time_seconds도 이 job에서 온다. LokiRejectingStaleEntries가
+  # 재시작 직후를 억제할 때 그 값을 읽는다.
   - job_name: 'alloy'
     static_configs:
       - targets: ['alloy:12345']
+        labels:
+          instance: 'vm2'
+
+  # Loki 자신의 지표. 로그 저장소가 받아들인 양과 거절한 양을 여기에서 읽는다.
+  #
+  # 이 job을 추가한 이유
+  #   Alloy의 loki_write_dropped_entries_total은 배치 단위로 늘어난다. Loki가 한
+  #   요청 안의 오래된 줄만 거절하고 나머지를 정상으로 적재해도 Alloy는 그 요청을
+  #   통째로 버린 것으로 센다. 2026-09-28 VM2에서 실제 400 응답 8건에 그 카운터가
+  #   23,840 늘어난 것이 그 때문이며, 그 값만으로는 얼마나 잃었는지 알 수 없다.
+  #   Loki의 loki_discarded_samples_total{reason}은 거절한 항목을 줄 단위로 세고
+  #   이유까지 나누므로, 재시작 직후의 재전송 몰림과 진짜 거절을 구분할 수 있다.
+  #   basic-logging의 LokiRejectingEntries와 LokiRejectingStaleEntries가 이 지표를 본다.
+  #
+  # compose는 Loki의 3100번 포트를 loopback에만 게시한다. 이 job은 그 게시와
+  # 무관하게 api-network 안의 컨테이너 이름으로 붙으므로 외부 노출이 늘어나지 않는다.
+  # auth_enabled가 false이므로 /metrics에 인증이 필요 없다.
+  #
+  # 이 job이 생기면서 TargetDown이 Loki 자체의 중단도 잡게 된다. 로그 수집 규칙은
+  # Alloy가 살아 있는 구간만 보므로, 그 겹침은 중복이 아니라 빈 곳을 메우는 쪽이다.
+  - job_name: 'loki'
+    static_configs:
+      - targets: ['loki:3100']
         labels:
           instance: 'vm2'
 

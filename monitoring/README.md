@@ -920,7 +920,8 @@ VM1과 VM3의 node-exporter 컨테이너는 2026-09-18 기준으로 exited 상�
 
 | job | 대상 | 수집하는 내용 |
 |---|---|---|
-| `alloy` | `alloy:12345` | 로그 수집기 자신의 지표입니다. Loki로 보낸 줄 수, 실패한 요청 수, 버린 줄 수를 포함합니다. |
+| `alloy` | `alloy:12345` | 로그 수집기 자신의 지표입니다. Loki로 보낸 줄 수, 실패한 요청 수, 버린 배치 수를 포함합니다. |
+| `loki` | `loki:3100` | 로그 저장소 자신의 지표입니다. Loki가 거절한 줄 수를 이유별로 세는 `loki_discarded_samples_total`이 여기에서 옵니다. 아래의 "로그 거절을 Alloy와 Loki 양쪽에서 봅니다"에 추가한 이유를 적어 두었습니다. |
 | `cadvisor` | `cadvisor:8080` | 컨테이너 단위의 CPU, 메모리, 디스크 입출력, 네트워크 사용량입니다. |
 | `blackbox-http-origin` | VM1 사설 주소 `10.0.1.133`에 공개 도메인 다섯 곳의 이름으로 접속합니다 | HTTP probe의 성공 여부와 오리진 TLS 인증서의 만료 시각입니다. 경보가 보는 것은 이 job입니다. |
 | `blackbox-http-external` | 공개 도메인 다섯 곳 | Cloudflare를 거친 결과입니다. 대시보드 표시용이며 어떤 경보도 이 job을 보지 않습니다. |
@@ -1029,7 +1030,7 @@ Wegis는 `targets/wegis-server.json`으로 이미 등록되어 있습니다. 실
 
 ## 알림 규칙
 
-`prometheus/rules/basic.yml`에 여덟 개의 group과 스물두 개의 alert 규칙을 두었고
+`prometheus/rules/basic.yml`에 여덟 개의 group과 스물네 개의 alert 규칙을 두었고
 `prometheus.yml`의 `rule_files`가 이 디렉터리를 읽습니다. 규칙의 단일 출처는 이 파일 하나입니다.
 규칙 수는 `promtool check rules`의 출력으로 확인할 수 있습니다.
 
@@ -1059,8 +1060,10 @@ Wegis는 `targets/wegis-server.json`으로 이미 등록되어 있습니다. 실
 | `ContainerMemoryNearLimit` | 컨테이너의 메모리 사용량이 지정한 한도의 90%를 넘었습니다. | cAdvisor의 `container_memory_working_set_bytes`와 `container_spec_memory_limit_bytes`입니다. |
 | `PostgresDown` | VM3 postgres_exporter가 데이터베이스에 5분 이상 접속하지 못합니다. | postgres_exporter 0.20.1의 `pg_up`입니다. |
 | `NginxDown` | VM1 nginx exporter가 `stub_status`를 5분 이상 읽지 못합니다. | nginx-prometheus-exporter 1.5.3의 `nginx_up`입니다. |
-| `LogShippingDropping` | 최근 10분 안에 Alloy가 재시도를 소진하고 버린 로그 줄이 있습니다. | Alloy의 `loki_write_dropped_entries_total`입니다. |
-| `LogShippingWriteFailing` | 최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어집니다. | Alloy의 `loki_write_request_duration_seconds_count`를 `status_code`로 나눕니다. |
+| `LogShippingDropping` | 최근 10분 안에 Alloy가 `ingester_error`가 아닌 이유로 버린 로그가 있습니다. | Alloy의 `loki_write_dropped_entries_total`에서 `reason="ingester_error"`를 제외하고 봅니다. |
+| `LokiRejectingEntries` | 최근 10분 안에 Loki가 순서와 나이 이외의 이유로 로그 줄을 거절했습니다. | Loki의 `loki_discarded_samples_total`에서 `too_far_behind`와 `greater_than_max_sample_age`를 제외하고 봅니다. |
+| `LokiRejectingStaleEntries` | 순서와 나이 때문에 생기는 거절이 Alloy 재시작 15분 뒤부터 다시 30분 넘게 이어집니다. | 같은 지표에서 그 두 이유만 봅니다. Alloy의 `process_start_time_seconds`로 재시작 직후를 억제합니다. |
+| `LogShippingWriteFailing` | 최근 10분 안에 2xx도 400도 아닌 응답이 있었고 그 상태가 5분 넘게 이어집니다. | Alloy의 `loki_write_request_duration_seconds_count`를 `status_code`로 나눕니다. |
 | `LogProcessDroppingUnexpected` | 최근 10분 안에 Alloy의 파이프라인이 보존 기간 초과가 아닌 이유로 버린 줄이 있고 그 상태가 5분 넘게 이어집니다. | Alloy의 `loki_process_dropped_lines_total`에서 `reason="older_than_retention"`을 제외하고 봅니다. |
 
 `GatewayNotReady`와 `InternalEndpointDown`의 조건을 나눈 이유는, 하나의 장애로 두 경보가 함께
@@ -1109,39 +1112,80 @@ exporter가 따로 필요하며, 그 작업은 이번 범위에 넣지 않았습
 규칙의 조건에서 걸러지기 때문입니다. 이 규칙이 실제로 동작하게 하려면 compose에 `mem_limit`을
 지정해야 하며, 그 작업은 이번 범위에 넣지 않았습니다.
 
-로그 전송 규칙 두 개는 Alloy가 살아 있는 상태에서 Loki 쪽 밀어넣기만 실패하는 구간을 봅니다. 그
-구간에서는 `up{job="alloy"}`가 계속 1이므로 `TargetDown`으로는 잡히지 않습니다. 반대로 Alloy
-컨테이너가 통째로 사라지는 경우는 규칙을 따로 두지 않았습니다. `prometheus.yml`에 `alloy` job을
-추가했으므로 `TargetDown`이 이미 그 상태를 잡고, 규칙을 겹쳐 두면 하나의 장애로 두 경보가 함께
-울리기 때문입니다.
+로그 수집 규칙 다섯 개는 Alloy가 살아 있는 상태에서 로그가 Loki까지 도달하지 못하는 구간을
+봅니다. 그 구간에서는 `up{job="alloy"}`가 계속 1이므로 `TargetDown`으로는 잡히지 않습니다.
+반대로 Alloy나 Loki의 컨테이너가 통째로 사라지는 경우는 규칙을 따로 두지 않았습니다.
+`prometheus.yml`에 `alloy` job과 `loki` job이 모두 있으므로 `TargetDown`이 그 상태를 이미 잡고,
+규칙을 겹쳐 두면 하나의 장애로 두 경보가 함께 울리기 때문입니다.
 
-두 규칙이 읽는 지표 이름은 `grafana/alloy:v1.19.2`를 실제로 띄워서 `/metrics`에 나오는 것만
-사용했습니다. Promtail이 내보내던 `promtail_*` 지표와는 이름이 전혀 다르므로, 옛 이름을 그대로
-옮겨 적으면 조건이 조용히 빈 결과를 냅니다.
+다섯 규칙이 읽는 지표 이름과 label은 `grafana/alloy:v1.19.2`와 `grafana/loki:3.5.7`을 실제로
+띄워서 `/metrics`에 나오는 것만 사용했습니다. Promtail이 내보내던 `promtail_*` 지표와는 이름이
+전혀 다르므로, 옛 이름을 그대로 옮겨 적으면 조건이 조용히 빈 결과를 냅니다. Loki가 거절 이유에
+사용하는 `reason` 값도 문서에서 옮겨 적지 않고 각 상황을 직접 만들어서 확인했습니다. 확인한
+값과 그 방법은 아래의 "로그 거절을 Alloy와 Loki 양쪽에서 봅니다"에 정리해 두었습니다.
 
-`LogShippingDropping`을 critical로 둔 이유는 그 지표가 늘어나는 동안의 로그가 영구히 사라지기
-때문입니다. `reason` label을 통지에 남기는 이유는 첫 대응이 갈리기 때문입니다. `rate_limited`와
-`stream_limited`는 Loki의 `limits_config`를 올려야 하고, `ingester_error`는 Loki가 요청 자체를
-거절한 경우입니다. `LogShippingWriteFailing`은 그 앞 단계로, 재시도가 아직 남아 있어 유실이 없는
-구간을 warning으로 알립니다.
+#### 2026-09-28에 이 다섯 규칙을 다시 짠 이유
 
-두 규칙은 `rate`와 긴 `for`의 조합에서 `increase`와 짧은 `for`의 조합으로 바꾸었습니다. 이전
-판은 `rate(...[10m]) > 0`에 `for: 15m`을 붙였는데, 그 형태는 **한 번에 크게 버리고 멈추는
-유실을 영영 잡지 못합니다.** `rate`의 10분 창이 지나가면 식이 0으로 돌아가므로 `for`의 15분을
-채울 수 없기 때문입니다. 유실은 한 번이라도 놓치면 안 되므로 `LogShippingDropping`에서는 `for`를
-아예 없앴고, 첫 증가가 10분 창에 들어오는 즉시 발화합니다. 증가가 창에서 빠져나가면 스스로
-해소됩니다.
+이전 판의 `LogShippingDropping`은 배포를 할 때마다 약 10분 동안 critical로 울렸습니다. 배포는
+Alloy 컨테이너를 다시 만들고, 다시 뜬 Alloy는 각 컨테이너의 저장된 읽기 위치부터 로그를 다시
+읽습니다. 그 과정에서 이미 Loki에 적재되어 있는 줄이 한 번 더 올라가고, Loki는 정렬 창을 넘긴
+줄을 400으로 거절합니다. 그런데 Alloy는 400을 받은 요청에 실려 있던 줄을 전부 버린 것으로 세기
+때문에, 실제 400 응답이 여덟 번뿐이었던 2026-09-28의 구간에서도
+`loki_write_dropped_entries_total{reason="ingester_error"}`가 23,840만큼 늘어났습니다. 잃은
+로그는 한 줄도 없었는데도 경보는 유실을 알리는 모습으로 울렸습니다.
 
-`LogShippingWriteFailing`에는 같은 결함이 있었지만 이쪽은 아직 유실이 없는 앞 단계이므로
-`for`를 완전히 없애지 않고 5분으로 두었습니다. `increase`의 창이 10분이라서 한 번의 실패
-묶음도 5분 뒤에는 반드시 드러나며, 그만큼 첫 통지가 늦어지는 대신 짧은 흔들림이 곧바로 통지로
-이어지지는 않습니다. 두 상황 모두 `prometheus/tests/logging.yml`의 "한 번 늘어난 뒤 멈춤"
-시험으로 고정해 두었습니다.
+배포마다 되풀이되는 critical은 그 경보 하나만 믿지 못하게 만들지 않습니다. 울리는 경보가 하나라도
+방치되면 같은 채널로 오는 나머지 경보까지 함께 무시됩니다. 그래서 규칙을 세 갈래로 나누어,
+재시작 때문에 생기는 거절과 실제로 로그를 잃는 상황을 서로 다른 경보로 분리했습니다.
 
-이 변경은 아래 "전환 시점의 중복과 유실" 항목에 적어 둔 설명과 맞습니다. 수집기를 바꾼 직후에
-7일이 지난 로그가 거절되면서 `reason="ingester_error"`로 한 번 세어질 수 있는데, 이전 형태는
-그 한 번을 잡지 못했고 지금은 잡습니다. 그 경보가 전환 직후에 한 번 울렸다가 10분 안에
-잦아든다면 정상입니다.
+| 규칙 | 보는 지표 | 뜻하는 상황 | severity |
+|---|---|---|---|
+| `LogShippingDropping` | Alloy의 드롭 카운터에서 `ingester_error`를 제외한 나머지 | Alloy가 응답 본문이나 자기 큐 상태를 보고 스스로 버렸습니다. 확실한 유실입니다. | critical |
+| `LokiRejectingEntries` | Loki의 줄 단위 거절에서 순서와 나이 이유를 제외한 나머지 | Loki가 지금 들어오는 로그를 받지 못하고 있습니다. | critical |
+| `LokiRejectingStaleEntries` | Loki의 줄 단위 거절 가운데 순서와 나이 이유만 | 재시작 직후의 한 번짜리 몰림이 아니라, 같은 거절이 계속 이어지고 있습니다. | warning |
+
+`LogShippingDropping`에서 `reason="ingester_error"`를 제외한 이유는 그 값이 두 가지를 섞어
+담기 때문입니다. Alloy의 `loki.write`는 재시도할 수 없는 4xx를 받았을 때와 재시도를 모두
+소진했을 때 모두 이 `reason`으로 셉니다. 앞쪽은 위에서 설명한 재전송 잡음이고 뒤쪽은 진짜
+유실인데, 지표만 보아서는 둘을 구분할 수 없습니다. 남은 `reason`인 `rate_limited`,
+`stream_limited`, `line_too_long`, `queue_is_full`은 Alloy가 응답 본문이나 큐 상태를 근거로
+붙이는 값이므로 값이 늘었다면 보낼 수 있었어야 하는 줄을 실제로 잃었다는 뜻이 분명합니다.
+
+제외에는 대가가 하나 따릅니다. Loki가 5xx를 계속 돌려주어 Alloy가 재시도를 소진하는 경우도
+`ingester_error`로 세어지므로 이 규칙이 그 구간을 잡지 못합니다. 그 구간은
+`LogShippingWriteFailing`이 `status_code`를 직접 보아서 잡습니다. 이 역할 분담은
+`prometheus/tests/logging.yml`의 "Loki가 5xx를 돌려주는 구간" 시험으로 고정해 두었습니다.
+
+`LokiRejectingStaleEntries`를 재시작 직후에 조용하게 만드는 장치는 두 겹입니다. 첫째, 조건에
+`unless on () (time() - max(process_start_time_seconds{job="alloy"}) < 900)`을 붙여서 Alloy가
+다시 뜬 뒤 900초 동안은 규칙 자체를 비활성으로 둡니다. 둘째, `for`를 30분으로 두었습니다.
+재시작 몰림은 몇 분 안에 끝나고 `increase`의 10분 창을 벗어나므로, 900초가 지난 시점에는 조건이
+이미 빈 결과로 돌아가 있습니다. 따라서 이 경보가 울리려면 재시작 15분 뒤부터 다시 30분 동안
+거절이 끊기지 않아야 하고, 가장 이른 발화 시점은 재시작 45분 뒤입니다.
+
+`LogShippingWriteFailing`에서는 `status_code`가 400인 요청을 제외했습니다. Loki 3.5.7을 실제로
+띄워서 확인한 결과, Loki가 400을 돌려주는 경우는 `too_far_behind`와
+`greater_than_max_sample_age`와 `line_too_long` 세 가지뿐입니다. 앞의 두 가지는 재시작 직후에
+늘 생기는 잡음이고, `line_too_long`은 `LokiRejectingEntries`가 줄 단위로 정확하게 잡습니다.
+4xx 전체를 제외하지는 않았습니다. 429는 수용 한도를 넘겼다는 뜻이고, 401과 403과 404는 전송
+주소나 인증 설정이 어긋났다는 뜻이어서 다른 어떤 규칙도 그 구간을 보지 않기 때문입니다. 연결
+자체가 되지 않는 요청은 Alloy가 `status_code="-1"`로 기록하며, 이 값도 부정 조건에 그대로
+걸립니다.
+
+세 규칙 모두 `rate`와 긴 `for`의 조합 대신 `increase`를 씁니다. `rate(...[10m]) > 0`에
+`for: 15m`을 붙이면 **한 번에 크게 버리고 멈추는 유실을 영영 잡지 못합니다.** `rate`의 10분 창이
+지나가면 식이 0으로 돌아가서 `for`의 15분을 채울 수 없기 때문입니다. 유실은 한 번이라도 놓치면
+안 되므로 `LogShippingDropping`과 `LokiRejectingEntries`에서는 `for`를 아예 두지 않았고, 첫
+증가가 10분 창에 들어오는 즉시 발화합니다. 증가가 창에서 빠져나가면 스스로 해소됩니다.
+`LogShippingWriteFailing`은 아직 유실이 없는 앞 단계이므로 `for`를 5분으로 두어, 짧은 흔들림이
+곧바로 통지로 이어지지는 않게 했습니다.
+
+`Alertmanager`의 억제 규칙도 함께 고쳤습니다. 이전에는 `LogShippingDropping`이
+`LogShippingWriteFailing`을 억제했고 `equal`이 `service`였습니다. 지금은 `LokiRejectingEntries`가
+같은 대상을 억제하는 규칙이 하나 더 있고, `equal`은 `pipeline`입니다. Loki 쪽 경보는
+`service="loki"`이고 Alloy 쪽 경보는 `service="alloy"`여서 `service`로는 두 경보가 절대 같아지지
+않기 때문입니다. `basic-logging`의 다섯 규칙에 `pipeline="logs"`를 붙여서 억제의 기준으로
+사용합니다. 규칙이 직접 붙이는 label이므로 집계식과 무관하게 양쪽에 같은 값으로 남습니다.
 
 Gateway와 Auth Server의 규칙을 나눈 이유는 두 앱이 같은 이름의 지표를 서로 다른 label로 내보내기
 때문입니다. Bifrost는 상태 코드를 `status_class="5xx"`로 묶어서 내보내고, Bidar는
@@ -1569,7 +1613,7 @@ VM2 장애를 감지하려면 VM2 밖에서 동작하는 독립된 probe가 있�
 |---|---|
 | `prometheus/tests/blackbox-and-containers.yml` | `OriginEndpointDown`, `GatewayNotReady`, `InternalEndpointDown`, TLS 인증서 두 규칙, 컨테이너 두 규칙입니다. Cloudflare 경유 job의 probe가 계속 실패해도 어떤 경보도 울리지 않는다는 점과, TLS 경보가 오리진 job의 인증서만 본다는 점을 함께 확인합니다. |
 | `prometheus/tests/remote-exporters.yml` | `PostgresDown`, `NginxDown`입니다. |
-| `prometheus/tests/logging.yml` | `LogShippingDropping`, `LogShippingWriteFailing`, `LogProcessDroppingUnexpected`입니다. |
+| `prometheus/tests/logging.yml` | `LogShippingDropping`, `LokiRejectingEntries`, `LokiRejectingStaleEntries`, `LogShippingWriteFailing`, `LogProcessDroppingUnexpected`입니다. |
 | `prometheus/tests/gateway-upstreams.yml` | `GatewayUpstreamHighServerErrorRate`와 `GatewayHighServerErrorRate`입니다. |
 
 ```bash
@@ -1586,15 +1630,31 @@ docker run --rm --entrypoint promtool \
 `TargetDown`이 함께 울리지 않는다는 점과, exporter를 설치하지 않아 시계열이 전혀 없을 때 두
 규칙이 조용하다는 점을 확인합니다. 지표가 실제로 들어오는지까지 검증하지는 않습니다.
 
-`logging.yml`은 다섯 가지를 더 확인합니다. 첫째, Alloy는 `reason`마다 값이 0인 시계열을 항상
-노출하므로 시계열이 존재한다는 사실만으로 발화하면 안 됩니다. 둘째, 정상 구간의 `status_code`는
-204이므로 `status_code!~"2.."` 조건이 그 값을 걸러야 합니다. 셋째, Alloy 컨테이너가 사라진 구간에서는
-`TargetDown` 하나만 울리고 로그 관련 규칙 세 개는 조용해야 합니다. 넷째, 값이 한 번만 크게
-늘고 그 뒤로 멈추는 구간에서도 규칙이 반드시 발화해야 하고, 증가가 창에서 빠져나가면 스스로
-해소되어야 합니다. 네 번째가 이전 형태에서 놓치던 상황입니다. 다섯째,
-`loki_process_dropped_lines_total{reason="older_than_retention"}`이 계속 늘어나는 구간에서는
-어떤 경보도 울리지 않고, 같은 구간에 `reason="drop_stage"`가 함께 나타나면
-`LogProcessDroppingUnexpected`가 그 `reason` 하나만 잡아야 합니다.
+`logging.yml`은 시험 열한 개로 다음을 확인합니다. 가장 중요한 것은 앞의 두 가지입니다.
+
+1. 배포 직후에 `too_far_behind` 거절이 한꺼번에 몰려도 다섯 규칙이 모두 조용합니다. 임시
+   스택에서 실제로 재현했을 때 한 번의 재시작에 약 1,900줄이 이 이유로 거절되었고, 그 값을
+   그대로 시험의 입력으로 사용했습니다.
+2. 같은 거절이 재시작 뒤에도 끊이지 않으면 `LokiRejectingStaleEntries`가 발화합니다. 32분
+   시점에서 아직 조용하다는 확인이 재시작 억제 조건이 실제로 동작한다는 증거입니다. 그 조건이
+   없으면 `for`의 30분을 그 시점에 이미 채워서 발화하기 때문입니다.
+3. `rate_limited`가 들어오면 `LokiRejectingEntries`가 곧바로 critical로 발화하고, 같은 구간에서
+   `LokiRejectingStaleEntries`는 조용합니다.
+4. Alloy의 드롭 카운터에서 `ingester_error`만 23,840까지 늘어나는 구간에서
+   `LogShippingDropping`이 조용합니다. 같은 구간에 400 응답만 늘어나므로
+   `LogShippingWriteFailing`도 조용합니다. 이전 판에서 경보가 울리던 상황이 이 구간입니다.
+5. Loki가 5xx를 돌려주면 `LogShippingWriteFailing`이 5분 뒤에 발화하고, 그 구간의
+   `LogShippingDropping`은 조용합니다. 두 규칙의 역할 분담을 고정하는 시험입니다.
+6. Alloy는 `reason`마다 값이 0인 시계열을 항상 노출하고 Loki도 한 번 나타난 거절 시계열을 계속
+   내보내므로, 시계열이 존재한다는 사실만으로 발화하면 안 됩니다.
+7. `loki_process_dropped_lines_total{reason="older_than_retention"}`이 계속 늘어나는 구간에서는
+   어떤 경보도 울리지 않고, 같은 구간에 `reason="drop_stage"`가 함께 나타나면
+   `LogProcessDroppingUnexpected`가 그 `reason` 하나만 잡습니다.
+8. Alloy 컨테이너가 사라진 구간과 Loki 컨테이너가 사라진 구간에서 각각 `TargetDown`이 울리고
+   나머지 로그 규칙은 조용합니다. Loki가 사라진 구간에서는 Alloy가 연결에 실패하므로
+   `status_code="-1"`로 `LogShippingWriteFailing`이 함께 울립니다.
+9. 값이 한 번만 크게 늘고 그 뒤로 멈추는 구간에서도 규칙이 반드시 발화하고, 증가가 창에서
+   빠져나가면 스스로 해소됩니다. `rate`와 긴 `for`의 조합이 놓치던 상황이 바로 이것입니다.
 
 `gateway-upstreams.yml`은 업스트림 둘 가운데 한쪽에만 5xx가 몰릴 때 그 업스트림 하나만
 발화하는지를 확인합니다. 전체 비율은 5% 기준 아래로 두어서 `GatewayHighServerErrorRate`가 함께
@@ -1640,6 +1700,93 @@ Grafana의 Explore 화면에서 다음과 같이 조회합니다.
 ```
 
 Loki의 보존 기간은 168시간이며 compactor가 그 기간을 넘긴 로그를 지웁니다.
+
+### 로그 거절을 Alloy와 Loki 양쪽에서 봅니다
+
+로그가 Loki에 적재되지 못하는 상황은 두 곳에서 관찰할 수 있고, 두 곳이 세는 단위가 다릅니다. 이
+차이를 모르면 지표의 값을 잘못 읽게 되므로 먼저 정리합니다.
+
+| 관찰 위치 | 지표 | 세는 단위 |
+|---|---|---|
+| Alloy (`job="alloy"`) | `loki_write_dropped_entries_total{reason}` | **배치 단위**입니다. Loki가 한 요청 안의 오래된 줄만 거절하고 나머지를 정상으로 적재해도, Alloy는 그 요청에 실려 있던 줄을 전부 버린 것으로 셉니다. |
+| Alloy (`job="alloy"`) | `loki_write_request_duration_seconds_count{status_code}` | 요청 단위입니다. 정상 구간에서는 `status_code="204"`만 늘어납니다. 연결 자체가 되지 않으면 `status_code="-1"`이 됩니다. |
+| Loki (`job="loki"`) | `loki_discarded_samples_total{reason}` | **줄 단위**입니다. distributor와 ingester가 거절한 항목을 하나씩 셉니다. 같은 이유로 버린 바이트 수는 `loki_discarded_bytes_total`이 셉니다. |
+
+배치 단위와 줄 단위의 차이는 실제 숫자로 드러났습니다. 2026-09-28 VM2에서 Loki가 400을 돌려준
+횟수는 여덟 번이었는데, 같은 구간에서 Alloy의 `loki_write_dropped_entries_total`은 23,840만큼
+늘어났습니다. 그러므로 Alloy가 보고하는 값을 잃어버린 줄의 개수로 읽으면 안 되고, 실제로 얼마나 잃었는지는
+Loki 쪽 지표로 확인해야 합니다. `prometheus.yml`에 `loki` job을 추가한 이유가 여기에 있습니다.
+
+#### Loki가 사용하는 거절 이유
+
+`grafana/loki:3.5.7`을 임시 project로 띄우고 각 상황을 직접 만들어서 확인한 값입니다. 문서에서
+옮겨 적지 않았습니다. `loki_discarded_samples_total`의 label은 `policy`, `reason`,
+`retention_hours`, `tenant` 네 개뿐이고 stream 이름이 들어가지 않으므로 카디널리티가 낮습니다.
+
+| `reason` | 만든 상황 | Loki의 응답 | 유실 여부 |
+|---|---|---|---|
+| `too_far_behind` | 정렬 창(`max_chunk_age`의 절반, 운영 설정에서 30분)보다 뒤처진 줄을 보냈습니다. | 400 | 아닙니다. 재전송 때문에 생깁니다. |
+| `greater_than_max_sample_age` | `reject_old_samples_max_age`인 168시간을 넘긴 줄을 보냈습니다. | 400 | 아닙니다. 보존 기간이 지나 이미 삭제된 줄입니다. |
+| `line_too_long` | `max_line_size`를 넘는 길이의 줄을 보냈습니다. | 400 | 유실입니다. |
+| `rate_limited` | `ingestion_rate_mb`를 낮추고 한 번에 200줄을 보냈습니다. | 429 | 유실로 이어집니다. |
+| `per_stream_rate_limit` | `per_stream_rate_limit`만 낮추고 한 스트림에 200줄을 보냈습니다. | 429 | 유실로 이어집니다. |
+| `stream_limit` | `max_streams_per_user`를 2로 낮추고 여섯 개의 스트림을 만들었습니다. | 429 | 유실입니다. |
+
+응답 코드가 이유를 두 갈래로 나눕니다. Loki가 400을 돌려주는 경우는 "이 항목을 받아들일 수
+없다"는 뜻이고, 429를 돌려주는 경우는 "지금은 더 받을 수 없다"는 뜻입니다.
+`LogShippingWriteFailing`이 400만 제외하고 429는 그대로 보는 근거가 이 구분입니다.
+
+#### Alloy가 사용하는 드롭 이유
+
+`grafana/alloy:v1.19.2`가 `loki_write_dropped_entries_total`에 사용하는 `reason`은
+`ingester_error`, `rate_limited`, `stream_limited`, `line_too_long`, `queue_is_full` 다섯
+가지이며, 다섯 개 모두 값이 0인 시계열로 항상 노출됩니다. 이 가운데 `ingester_error`는 재시도할
+수 없는 4xx를 받은 경우와 재시도를 모두 소진한 경우를 함께 담으므로, 그 값만으로는 재전송
+잡음인지 실제 유실인지 구분할 수 없습니다. 경보가 이 `reason`을 제외하는 이유는 위의 "알림
+규칙" 항목에 적어 두었습니다.
+
+#### 임시 스택으로 확인한 결과
+
+저장소의 compose를 축소한 임시 project(`loki`, `alloy`, `docker-socket-proxy`, `prometheus`,
+더미 컨테이너 두 개)를 띄우고 두 가지를 확인했습니다. 정렬 창을 좁혀서 시험 시간을 줄이려고
+`max_chunk_age`만 2분으로 낮추었고, 나머지 설정은 저장소의 것을 그대로 사용했습니다.
+
+| 만든 상황 | Loki가 센 값 | 규칙의 상태 |
+|---|---|---|
+| Alloy를 다시 만들어 읽기 위치를 잃게 하고, 이미 적재된 줄을 다시 보내게 했습니다. | `too_far_behind`가 1,885줄 늘어났습니다. | 다섯 규칙이 모두 `inactive`로 남았습니다. |
+| `ingestion_rate_mb`를 0.001로 낮추어 실제 거절을 만들었습니다. | `rate_limited`가 늘어났습니다. | `LokiRejectingEntries`가 약 40초 만에 `firing`이 되었고, `LogShippingWriteFailing`은 `status_code="429"`로 5분 뒤에 `firing`이 되었습니다. |
+
+첫 번째 구간에서 Alloy의 `loki_write_dropped_entries_total{reason="ingester_error"}`는 1,674까지
+늘어났지만 `LogShippingDropping`은 한 번도 울리지 않았습니다. 이전 판에서 배포마다 경보가
+울리던 상황이 정확히 이 구간입니다.
+
+#### 다음 배포에서 예상되는 동작
+
+배포는 Alloy 컨테이너를 다시 만들기 때문에 재전송이 반드시 일어납니다. 그때 나타나는 모습은
+다음과 같습니다.
+
+- Grafana의 `bngdrasil-logs` 대시보드에 있는 "Loki가 거절한 로그 줄 (reason별)" 패널에서
+  `too_far_behind` 계열이 잠시 크게 늘었다가 몇 분 안에 0으로 돌아갑니다. 이것이 정상입니다.
+- Alloy의 `loki_write_dropped_entries_total{reason="ingester_error"}`가 수천에서 수만 단위로
+  늘어납니다. 이 값 역시 정상이며, 배치 단위로 세기 때문에 크게 보입니다.
+- 통지는 한 건도 가지 않아야 합니다. `LogShippingDropping`은 `ingester_error`를 보지 않고,
+  `LokiRejectingEntries`는 순서와 나이 이유를 보지 않으며, `LokiRejectingStaleEntries`는 재시작
+  뒤 900초 동안 비활성이고 그 뒤에도 30분을 더 채워야 하기 때문입니다.
+- 배포 45분이 지나도록 `too_far_behind`가 계속 늘어난다면 그때 `LokiRejectingStaleEntries`가
+  warning으로 울립니다. 그 경우에는 Alloy가 같은 구간을 반복해서 다시 읽고 있거나 시각이
+  어긋난 상태이므로, 경보의 `action`에 적어 둔 순서대로 확인합니다.
+
+배포 직후에 확인하고 싶다면 아래 두 가지를 봅니다.
+
+```bash
+# Loki가 이유별로 거절한 줄 수
+sudo docker exec vm2-prometheus wget -q -O- http://loki:3100/metrics \
+  | grep -E '^loki_discarded_(samples|bytes)_total'
+
+# 로그 관련 경보가 하나도 활성이 아니어야 합니다
+curl -s http://127.0.0.1:9090/api/v1/alerts \
+  | jq '.data.alerts[] | select(.labels.pipeline=="logs")'
+```
 
 ### 보존 기간을 넘긴 줄을 보내기 전에 버립니다
 
@@ -2030,6 +2177,18 @@ sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics \
   | grep '^loki_write_request_duration_seconds_count'
 
 sudo docker logs vm2-alloy --tail 100
+```
+
+Alloy가 보냈는데도 로그가 보이지 않을 때에는 Loki가 그 줄을 거절했는지 확인합니다. Alloy의
+드롭 카운터는 배치 단위여서 잃은 줄 수를 알려 주지 못하므로, 줄 수는 Loki 쪽에서 읽어야 합니다.
+
+```bash
+# 이유별 거절 줄 수. too_far_behind와 greater_than_max_sample_age는 재전송 때문에
+# 생기는 값이며 유실이 아닙니다. 나머지 이유가 늘어나면 실제로 받지 못하고 있습니다
+sudo docker exec vm2-prometheus wget -q -O- http://loki:3100/metrics \
+  | grep -E '^loki_discarded_(samples|bytes)_total'
+
+sudo docker logs vm2-loki --tail 100
 ```
 
 Alloy가 컨테이너 목록을 가져오지 못할 때에는 프록시를 함께 확인합니다. 아래 요청이 컨테이너 목록

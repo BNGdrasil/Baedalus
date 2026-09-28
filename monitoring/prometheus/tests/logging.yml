@@ -5,17 +5,26 @@
 #     -v "$PWD/prometheus:/etc/prometheus:ro" prom/prometheus:v3.7.2 \
 #     test rules /etc/prometheus/tests/logging.yml
 #
-# basic-logging 그룹의 세 규칙을 확인한다. 세 규칙이 읽는 지표는
-# grafana/alloy:v1.19.2를 실제로 띄워서 /metrics에 나오는 이름을 그대로
-# 옮긴 것이며, 아래 input_series의 label 구성도 그때 본 것과 같다.
+# basic-logging 그룹의 다섯 규칙을 확인한다. 규칙이 읽는 지표는 두 곳에서 온다.
+#
+# Alloy(job="alloy"). grafana/alloy:v1.19.2를 실제로 띄워서 /metrics에 나오는
+# 이름과 label을 그대로 옮겼다.
 #   loki_write_dropped_entries_total{component_id, component_path, host, reason, tenant}
+#     reason 값은 ingester_error, rate_limited, stream_limited, line_too_long,
+#     queue_is_full 다섯 가지이며 모두 값이 0인 시계열로 항상 노출된다.
 #   loki_write_request_duration_seconds_count{component_id, component_path, host, status_code, tenant}
 #   loki_process_dropped_lines_total{component_id, component_path, reason}
+#   process_start_time_seconds        Go 런타임 기본 수집기가 내보낸다.
 #
-# 두 규칙은 rate와 긴 for의 조합에서 increase와 짧은 for의 조합으로 바꾸었다.
-# 이전 형태는 한 번에 크게 늘어난 뒤 멈추는 유실을 영영 잡지 못했다. rate의 창이
-# 지나가면 식이 0으로 돌아가서 for의 15분을 채울 수 없기 때문이다. 아래의
-# "한 번 늘어난 뒤 멈춤" 시험이 그 상황을 고정한다.
+# Loki(job="loki"). grafana/loki:3.5.7을 실제로 띄워서 각 거절 상황을 만들어
+# 확인했다. label은 네 개뿐이고 stream 이름이 들어가지 않으므로 카디널리티가 낮다.
+#   loki_discarded_samples_total{policy, reason, retention_hours, tenant}
+#   loki_discarded_bytes_total{policy, reason, retention_hours, tenant}
+#
+# 이 시험이 고정하려는 것은 2026-09-28에 규칙을 다시 짠 이유 그 자체다. 배포로
+# Alloy를 재시작할 때마다 이미 적재된 줄이 다시 올라가 거절되고, 그 거절이
+# critical 경보로 약 10분 동안 울렸다. 아래 첫 두 시험이 "재시작 직후의 몰림은
+# 조용하고, 같은 거절이 오래 이어질 때에만 울린다"를 고정한다.
 #
 # rule_files 경로는 컨테이너 안의 절대 경로이며, 위 실행 방법의 mount 위치와 같다.
 
@@ -25,143 +34,284 @@ rule_files:
 evaluation_interval: 30s
 
 tests:
-  # Loki가 요청을 거절해서 Alloy가 재시도를 소진하고 로그를 버리는 상황이다.
-  # Alloy 프로세스는 살아 있으므로 up은 계속 1이고 TargetDown은 울리지 않는다.
-  # 30초마다 다섯 줄씩 버리는 값을 넣는다. for가 없으므로 첫 증가가 창에 들어오는
-  # 즉시 발화한다.
+  # ---------------------------------------------------------------------------
+  # 1. 배포 직후의 too_far_behind 몰림. 어떤 경보도 울리지 않아야 한다.
+  # ---------------------------------------------------------------------------
+  # Alloy가 t=0에 다시 떴고, 저장된 위치부터 다시 읽으면서 이미 적재된 줄을 한꺼번에
+  # 다시 보냈다. Loki는 정렬 창(max_chunk_age의 절반, 운영 설정에서 30분)을 넘긴
+  # 줄을 too_far_behind로 거절한다. 임시 스택에서 실제로 재현했을 때 한 번의
+  # 재시작에 약 1,900줄이 이 이유로 거절되었다.
+  #
+  # 이 줄들은 Alloy가 끊김 없이 돌았다면 이미 Loki에 있다. 유실이 아니므로 통지가
+  # 가면 안 된다. 몰림은 2분 안에 끝나고 그 뒤로는 카운터가 멈춘다.
   - interval: 30s
     input_series:
-      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
-        values: '0+5x60'
+      - series: 'loki_discarded_samples_total{job="loki",instance="vm2",policy="",reason="too_far_behind",retention_hours="168",tenant="fake"}'
+        values: '0 0 400 900 1900 1900x115'
+      - series: 'process_start_time_seconds{job="alloy",instance="vm2"}'
+        values: '0x120'
       - series: 'up{job="alloy",instance="vm2"}'
-        values: '1x60'
+        values: '1x120'
+      - series: 'up{job="loki",instance="vm2"}'
+        values: '1x120'
     alert_rule_test:
-      - eval_time: 2m
+      # 몰림이 한창일 때. 재시작 억제 창(900초) 안이다.
+      - eval_time: 3m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LokiRejectingEntries
+        exp_alerts: []
+      - eval_time: 3m
         alertname: LogShippingDropping
-        exp_alerts:
-          - exp_labels:
-              severity: critical
-              service: alloy
-              reason: ingester_error
-            exp_annotations:
-              summary: 'Alloy가 Loki로 보내지 못한 로그를 버리고 있다 (reason=ingester_error)'
-              description: '최근 10분 안에 재시도를 모두 소진한 뒤 버린 로그 줄이 있다. 이 구간의 로그는 Loki에 남지 않는다.'
-              action: 'sudo docker logs vm2-alloy --tail 100 으로 오류를 읽고, reason이 rate_limited나 stream_limited이면 monitoring/loki/loki-config.yml의 limits_config를, ingester_error이면 Loki 쪽 로그를 확인한다.'
-      - eval_time: 26m
-        alertname: LogShippingDropping
-        exp_alerts:
-          - exp_labels:
-              severity: critical
-              service: alloy
-              reason: ingester_error
-            exp_annotations:
-              summary: 'Alloy가 Loki로 보내지 못한 로그를 버리고 있다 (reason=ingester_error)'
-              description: '최근 10분 안에 재시도를 모두 소진한 뒤 버린 로그 줄이 있다. 이 구간의 로그는 Loki에 남지 않는다.'
-              action: 'sudo docker logs vm2-alloy --tail 100 으로 오류를 읽고, reason이 rate_limited나 stream_limited이면 monitoring/loki/loki-config.yml의 limits_config를, ingester_error이면 Loki 쪽 로그를 확인한다.'
-      # 같은 구간에서 TargetDown은 울리지 않는다. 두 규칙이 보는 대상이 다르다.
-      - eval_time: 26m
-        alertname: TargetDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+      # 억제 창이 끝난 직후. 증가는 이미 10분 창 밖으로 빠져나갔다.
+      - eval_time: 16m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+      # 한참 뒤에도 조용하다.
+      - eval_time: 55m
+        alertname: LokiRejectingStaleEntries
         exp_alerts: []
 
-  # 한 번에 대량으로 버리고 멈추는 상황이다. 2분 시점에 한 번 뛰고 그 뒤로는
-  # 값이 그대로다. 이전 판의 rate + for: 15m 조합은 이 상황에서 한 번도 발화하지
-  # 않았다. 아래 두 확인이 그 회귀를 막는다.
+  # ---------------------------------------------------------------------------
+  # 2. 같은 이유의 거절이 재시작 뒤에도 끊이지 않는 구간. 경보가 울려야 한다.
+  # ---------------------------------------------------------------------------
+  # Alloy가 같은 구간을 반복해서 다시 읽고 있거나 시계가 어긋난 상태다. 유실은
+  # 아니지만 전송 대역과 Loki의 처리 시간을 계속 버리고 있으므로 사람이 보아야 한다.
+  #
+  # 발화 시점이 두 겹으로 늦춰진다. 재시작 억제 창이 15분이고 그 뒤에 for가 30분이므로
+  # 가장 이른 발화는 재시작 45분 뒤다. 32분 시점에서 조용하다는 확인이 억제 창이
+  # 실제로 동작한다는 증거다. 억제가 없으면 그 시점에 이미 30분을 채워 발화한다.
   - interval: 30s
     input_series:
-      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="rate_limited",tenant=""}'
-        values: '0 0 0 0 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400 400'
+      - series: 'loki_discarded_samples_total{job="loki",instance="vm2",policy="",reason="too_far_behind",retention_hours="168",tenant="fake"}'
+        values: '0+10x140'
+      - series: 'process_start_time_seconds{job="alloy",instance="vm2"}'
+        values: '0x140'
+      - series: 'up{job="alloy",instance="vm2"}'
+        values: '1x140'
     alert_rule_test:
-      # 유실이 한 번뿐이어도 잡아야 한다.
+      - eval_time: 10m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+      # 억제 창이 없었다면 여기에서 이미 울린다.
+      - eval_time: 32m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+      - eval_time: 44m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: loki
+              pipeline: logs
+              reason: too_far_behind
+            exp_annotations:
+              summary: 'Loki가 순서와 나이 때문에 로그 줄을 30분 넘게 계속 거절하고 있다 (reason=too_far_behind)'
+              description: '최근 10분 안에 200개가 거절되었고, 그 상태가 Alloy 재시작 15분 뒤부터 다시 30분 넘게 이어진다. 배포 직후의 한 번짜리 재전송 몰림은 이 조건에 걸리지 않는다. 거절된 줄 자체는 이미 Loki에 있으므로 유실이 아니지만, 계속 늘어난다는 것은 Alloy가 같은 구간을 반복해서 다시 읽고 있거나 시각이 어긋났다는 뜻이다.'
+              action: '1) sudo docker logs vm2-alloy --tail 200 | grep -i "too far behind\|too old" 으로 어느 컨테이너의 줄인지 확인한다. 2) sudo docker inspect vm2-alloy | grep -m1 StartedAt 으로 마지막 기동 시각을 보고 재시작이 반복되지 않았는지 확인한다. 반복 재시작이면 그쪽이 원인이다. 3) VM2와 Loki의 시계를 timedatectl 로 확인한다. 4) reason이 greater_than_max_sample_age이면 monitoring/alloy/config.alloy의 loki.process.retention_guard가 167h로 살아 있는지 확인한다. 이 stage가 제 몫을 하면 그 reason은 Loki까지 오지 않는다. 5) reason이 too_far_behind이면 monitoring/loki/loki-config.yml의 ingester.max_chunk_age를 늘려 정렬 창을 넓히는 것이 마지막 수단이다. 창을 넓히면 메모리 사용이 함께 늘어난다.'
+      # 같은 구간에서 진짜 거절 쪽 규칙은 조용하다. 두 규칙이 reason으로 갈린다.
+      - eval_time: 50m
+        alertname: LokiRejectingEntries
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 3. 수용 한도를 넘겨 Loki가 새 로그를 거절하는 구간. 즉시 critical이어야 한다.
+  # ---------------------------------------------------------------------------
+  # 임시 스택에서 ingestion_rate_mb를 0.001로 낮추고 실제로 만든 상황이다.
+  # Loki가 429를 돌려주면서 줄 단위로 거절하고, Alloy는 아직 재시도 중이라
+  # 제 드롭 카운터는 움직이지 않는다. 재시작 직후여도(억제 창 안이어도) 이 규칙은
+  # 억제되지 않는다. 억제는 순서와 나이 쪽 규칙에만 걸려 있다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_discarded_samples_total{job="loki",instance="vm2",policy="",reason="rate_limited",retention_hours="168",tenant="fake"}'
+        values: '0+40x60'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",status_code="429",tenant=""}'
+        values: '0+2x60'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="rate_limited",tenant=""}'
+        values: '0x60'
+      - series: 'process_start_time_seconds{job="alloy",instance="vm2"}'
+        values: '0x60'
+    alert_rule_test:
+      # for가 없으므로 첫 증가가 10분 창에 들어오는 즉시 울린다.
+      - eval_time: 2m
+        alertname: LokiRejectingEntries
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: loki
+              pipeline: logs
+              reason: rate_limited
+            exp_annotations:
+              summary: 'Loki가 새 로그 줄을 거절하고 있다 (reason=rate_limited)'
+              description: '최근 10분 안에 Loki가 줄 단위로 160개를 거절했다. 재시작 직후의 재전송에서 생기는 순서와 나이 거부는 제외한 값이므로, 지금 들어오는 로그가 실제로 적재되지 못하고 있다.'
+              action: '1) sudo docker exec vm2-prometheus wget -q -O- http://loki:3100/metrics | grep -E "loki_discarded_(samples|bytes)_total" 으로 reason별 줄 수와 바이트 수를 읽는다. 2) rate_limited나 per_stream_rate_limit이면 monitoring/loki/loki-config.yml의 ingestion_rate_mb, ingestion_burst_size_mb, per_stream_rate_limit을 올린다. 유입이 갑자기 늘어난 것이라면 어느 컨테이너가 쏟아내는지 Grafana의 bngdrasil-logs 대시보드에서 먼저 찾는다. 3) stream_limit이면 label 조합이 폭발한 것이다. monitoring/alloy/config.alloy의 discovery.relabel.docker_logs가 만드는 label을 확인한다. 4) line_too_long이면 해당 컨테이너의 로그 형식을 고친다.'
+      # 순서와 나이 쪽 규칙은 같은 구간에서 조용하다.
+      - eval_time: 20m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+      # Alloy는 아직 재시도 중이므로 제 드롭 카운터가 늘지 않았다.
+      - eval_time: 20m
+        alertname: LogShippingDropping
+        exp_alerts: []
+      # 429는 2xx도 400도 아니므로 전송 실패 경보가 함께 울린다. Alertmanager의
+      # 억제 규칙이 LokiRejectingEntries를 source로 이 통지를 막는다.
+      - eval_time: 20m
+        alertname: LogShippingWriteFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: alloy
+              pipeline: logs
+              status_code: '429'
+            exp_annotations:
+              summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code=429)'
+              description: '최근 10분 안에 2xx도 400도 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 400은 정렬과 나이 때문에 개별 줄이 거절되는 정상 구간이라 제외했으므로, 이 경보는 요청 자체가 처리되지 못한다는 뜻이다. 아직 재시도 중이라면 유실은 없지만 재시도가 소진되면 로그를 잃는다.'
+              action: '1) status_code가 5xx이면 Loki 쪽 장애다. curl -s http://127.0.0.1:3100/ready 를 보고 sudo docker logs vm2-loki --tail 100 으로 원인을 읽는다. 이 경우 Alloy의 드롭은 reason=ingester_error로 세어지므로 LogShippingDropping은 울리지 않는다. 유실 여부는 Loki가 정상으로 돌아온 뒤 조회로 확인한다. 2) 429이면 수용 한도 문제이며 LokiRejectingEntries의 절차를 따른다. 3) 401, 403, 404이면 monitoring/alloy/config.alloy의 loki.write endpoint 주소를 확인한다. 4) 2xx도 4xx도 5xx도 아닌 값이면 연결 자체가 안 되는 것이다. sudo docker exec vm2-alloy bash -c "exec 3<>/dev/tcp/loki/3100" 로 api-network 연결을 확인한다.'
+
+  # ---------------------------------------------------------------------------
+  # 4. Alloy 쪽 카운터에서 ingester_error만 늘어나는 구간. 조용해야 한다.
+  # ---------------------------------------------------------------------------
+  # 2026-09-27~28 VM2에서 실제로 본 모습이다. 400 응답 8건에 이 카운터가 23,840
+  # 늘었다. 값이 배치 단위이기 때문이며, 그 배치 안의 정상 줄은 Loki에 적재되었다.
+  # 재시작마다 되풀이되는 이 증가에 critical을 붙이면 경보 전체의 신뢰도가 깎인다.
+  #
+  # 같은 구간에서 Loki 쪽은 too_far_behind로만 늘어난다. 두 지표가 같은 사건을
+  # 서로 다른 단위로 세고 있다는 점을 함께 고정한다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0 0 11920 23840 23840x116'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="rate_limited",tenant=""}'
+        values: '0x120'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="stream_limited",tenant=""}'
+        values: '0x120'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="line_too_long",tenant=""}'
+        values: '0x120'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="queue_is_full",tenant=""}'
+        values: '0x120'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",status_code="400",tenant=""}'
+        values: '0 0 4 8 8x116'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",status_code="204",tenant=""}'
+        values: '0+20x120'
+      - series: 'loki_discarded_samples_total{job="loki",instance="vm2",policy="",reason="too_far_behind",retention_hours="168",tenant="fake"}'
+        values: '0 0 800 1600 1600x116'
+      - series: 'process_start_time_seconds{job="alloy",instance="vm2"}'
+        values: '0x120'
+      - series: 'up{job="alloy",instance="vm2"}'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: LogShippingDropping
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: LokiRejectingEntries
+        exp_alerts: []
+      # 400만 늘어나는 구간에서 전송 실패 경보도 조용하다. 이전 판은 여기에서 울렸다.
+      - eval_time: 8m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: LogShippingWriteFailing
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 5. Alloy가 스스로 버리는 구간. 이쪽은 즉시 critical이어야 한다.
+  # ---------------------------------------------------------------------------
+  # reason이 ingester_error가 아니면 Alloy가 응답 본문이나 제 큐 상태를 보고 붙인
+  # 값이며 실제 유실이다. 한 번에 크게 버리고 멈추는 모양을 함께 고정한다. rate와
+  # 긴 for의 조합이었던 옛 형태는 이 상황을 영영 잡지 못했다.
+  - interval: 30s
+    input_series:
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="rate_limited",tenant=""}'
+        values: '0 0 0 0 400 400x56'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0x60'
+    alert_rule_test:
       - eval_time: 4m
         alertname: LogShippingDropping
         exp_alerts:
           - exp_labels:
               severity: critical
               service: alloy
+              pipeline: logs
               reason: rate_limited
             exp_annotations:
-              summary: 'Alloy가 Loki로 보내지 못한 로그를 버리고 있다 (reason=rate_limited)'
-              description: '최근 10분 안에 재시도를 모두 소진한 뒤 버린 로그 줄이 있다. 이 구간의 로그는 Loki에 남지 않는다.'
-              action: 'sudo docker logs vm2-alloy --tail 100 으로 오류를 읽고, reason이 rate_limited나 stream_limited이면 monitoring/loki/loki-config.yml의 limits_config를, ingester_error이면 Loki 쪽 로그를 확인한다.'
-      # 증가가 10분 창에서 빠져나가면 스스로 해소된다. 계속 울리지 않는다.
+              summary: 'Alloy가 Loki로 보내지 못한 로그를 버렸다 (reason=rate_limited)'
+              description: '최근 10분 안에 Alloy가 스스로 버린 로그 줄이 있다. 이 reason은 재전송 때문에 생기는 순서와 나이 거부를 이미 제외했으므로, 이 구간의 로그는 실제로 사라졌다. 값은 배치 단위이므로 잃은 줄 수와 같지 않다. 정확한 줄 수는 Loki 쪽 지표로 읽는다.'
+              action: '1) reason이 rate_limited나 stream_limited이면 Loki의 수용 한도 문제다. sudo docker exec vm2-prometheus wget -q -O- http://loki:3100/metrics | grep loki_discarded_samples_total 으로 줄 단위 거절 수를 확인한 뒤 monitoring/loki/loki-config.yml의 limits_config를 올린다. 2) line_too_long이면 특정 컨테이너가 한 줄에 너무 긴 로그를 찍고 있다. 그 컨테이너를 찾아 로그 형식을 고친다. 3) queue_is_full이면 Loki가 느리거나 멈춘 것이다. curl -s http://127.0.0.1:3100/ready 와 sudo docker logs vm2-loki --tail 100 을 본다. 4) 어느 경우든 sudo docker logs vm2-alloy --tail 100 으로 Alloy가 받은 응답 본문을 함께 읽는다.'
+      # 증가가 10분 창에서 빠져나가면 스스로 해소된다.
       - eval_time: 20m
         alertname: LogShippingDropping
         exp_alerts: []
 
-  # 정상 구간이다. Alloy는 reason마다 값이 0인 시계열을 항상 노출하므로, 시계열이
-  # 있다는 사실만으로 발화하면 안 된다. 값이 늘지 않으면 increase가 0이어야 한다.
+  # ---------------------------------------------------------------------------
+  # 6. Loki가 5xx를 돌려주는 구간. 전송 실패 경보가 울려야 한다.
+  # ---------------------------------------------------------------------------
+  # 이 구간에서 Alloy가 재시도를 소진하면 그 드롭은 reason=ingester_error로
+  # 세어지므로 LogShippingDropping이 잡지 않는다. 그 빈자리를 이 규칙이 메운다.
+  # 두 확인을 함께 두어 그 역할 분담을 고정한다.
   - interval: 30s
     input_series:
-      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="rate_limited",tenant=""}'
-        values: '0x60'
-      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
-        values: '0x60'
-    alert_rule_test:
-      - eval_time: 26m
-        alertname: LogShippingDropping
-        exp_alerts: []
-
-  # 버리기 전 단계다. Loki가 500을 돌려주는 동안 Alloy는 재시도하므로 아직
-  # 유실이 없고, dropped 쪽은 0으로 유지된다. 경고 하나만 울려야 한다.
-  - interval: 30s
-    input_series:
-      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="500",tenant=""}'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",status_code="500",tenant=""}'
         values: '0+2x60'
-      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="204",tenant=""}'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",status_code="204",tenant=""}'
         values: '0x60'
-      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
-        values: '0x60'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0+100x60'
+      - series: 'up{job="alloy",instance="vm2"}'
+        values: '1x60'
     alert_rule_test:
-      # for가 5분이므로 3분 시점에는 아직 발화하지 않는다.
+      # for가 5분이므로 3분 시점에는 아직 울리지 않는다.
       - eval_time: 3m
         alertname: LogShippingWriteFailing
         exp_alerts: []
-      - eval_time: 26m
+      - eval_time: 20m
         alertname: LogShippingWriteFailing
         exp_alerts:
           - exp_labels:
               severity: warning
               service: alloy
+              pipeline: logs
               status_code: '500'
             exp_annotations:
               summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code=500)'
-              description: '최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 아직 재시도 중이라 유실은 없지만, 재시도가 소진되면 LogShippingDropping으로 이어진다.'
-              action: 'curl -s http://127.0.0.1:3100/ready 로 Loki 상태를 먼저 보고, sudo docker logs vm2-loki --tail 100 으로 거절 사유를 확인한다.'
-      - eval_time: 26m
-        alertname: LogShippingDropping
-        exp_alerts: []
-
-  # 밀어넣기 실패도 한 번 묶여서 일어나고 멈출 수 있다. 2분 시점에 한 번 뛰고
-  # 그대로 멈추는 구간이다. 이전 판의 rate + for: 15m 조합은 이 상황도 놓쳤다.
-  - interval: 30s
-    input_series:
-      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="503",tenant=""}'
-        values: '0 0 0 0 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30'
-    alert_rule_test:
-      - eval_time: 3m
-        alertname: LogShippingWriteFailing
-        exp_alerts: []
-      - eval_time: 9m
-        alertname: LogShippingWriteFailing
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: alloy
-              status_code: '503'
-            exp_annotations:
-              summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code=503)'
-              description: '최근 10분 안에 2xx가 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 아직 재시도 중이라 유실은 없지만, 재시도가 소진되면 LogShippingDropping으로 이어진다.'
-              action: 'curl -s http://127.0.0.1:3100/ready 로 Loki 상태를 먼저 보고, sudo docker logs vm2-loki --tail 100 으로 거절 사유를 확인한다.'
+              description: '최근 10분 안에 2xx도 400도 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 400은 정렬과 나이 때문에 개별 줄이 거절되는 정상 구간이라 제외했으므로, 이 경보는 요청 자체가 처리되지 못한다는 뜻이다. 아직 재시도 중이라면 유실은 없지만 재시도가 소진되면 로그를 잃는다.'
+              action: '1) status_code가 5xx이면 Loki 쪽 장애다. curl -s http://127.0.0.1:3100/ready 를 보고 sudo docker logs vm2-loki --tail 100 으로 원인을 읽는다. 이 경우 Alloy의 드롭은 reason=ingester_error로 세어지므로 LogShippingDropping은 울리지 않는다. 유실 여부는 Loki가 정상으로 돌아온 뒤 조회로 확인한다. 2) 429이면 수용 한도 문제이며 LokiRejectingEntries의 절차를 따른다. 3) 401, 403, 404이면 monitoring/alloy/config.alloy의 loki.write endpoint 주소를 확인한다. 4) 2xx도 4xx도 5xx도 아닌 값이면 연결 자체가 안 되는 것이다. sudo docker exec vm2-alloy bash -c "exec 3<>/dev/tcp/loki/3100" 로 api-network 연결을 확인한다.'
+      # 재시도 소진이 ingester_error로 세어지므로 이쪽은 조용하다. 의도한 빈자리다.
       - eval_time: 20m
-        alertname: LogShippingWriteFailing
+        alertname: LogShippingDropping
         exp_alerts: []
 
-  # 정상 전송만 이어지는 구간이다. 204 응답 수만 늘어나므로 두 규칙 모두
-  # 조용해야 한다. status_code!~"2.." 조건이 204를 제대로 거르는지 확인한다.
+  # ---------------------------------------------------------------------------
+  # 7. 정상 구간. 204만 늘어나고 드롭 시계열은 0으로 노출된다.
+  # ---------------------------------------------------------------------------
+  # Alloy는 reason마다 값이 0인 시계열을 항상 내보내고, Loki도 한 번 나타난
+  # discard 시계열을 계속 내보낸다. 시계열이 있다는 사실만으로 발화하면 안 된다.
   - interval: 30s
     input_series:
-      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",status_code="204",tenant=""}'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",status_code="204",tenant=""}'
         values: '0+20x60'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="rate_limited",tenant=""}'
+        values: '0x60'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="ingester_error",tenant=""}'
+        values: '0x60'
+      - series: 'loki_discarded_samples_total{job="loki",instance="vm2",policy="",reason="too_far_behind",retention_hours="168",tenant="fake"}'
+        values: '5000x60'
+      - series: 'loki_discarded_samples_total{job="loki",instance="vm2",policy="",reason="rate_limited",retention_hours="168",tenant="fake"}'
+        values: '120x60'
+      - series: 'process_start_time_seconds{job="alloy",instance="vm2"}'
+        values: '0x60'
     alert_rule_test:
       - eval_time: 26m
         alertname: LogShippingWriteFailing
@@ -169,16 +319,24 @@ tests:
       - eval_time: 26m
         alertname: LogShippingDropping
         exp_alerts: []
+      - eval_time: 26m
+        alertname: LokiRejectingEntries
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
 
-  # 보존 기간을 넘긴 줄을 loki.process.retention_guard가 계속 버리는 구간이다.
+  # ---------------------------------------------------------------------------
+  # 8. 보존 기간을 넘긴 줄을 retention_guard가 계속 버리는 구간. 조용해야 한다.
+  # ---------------------------------------------------------------------------
   # 조용한 컨테이너의 마지막 줄이 약 5분마다 다시 들어오는 동안 이 값은 끊임없이
-  # 늘어나며, 그것이 의도한 동작이다. 어떤 경보도 울리지 않아야 한다. 전송 단계는
-  # 그 줄을 아예 받지 않으므로 dropped 쪽도 0으로 유지된다.
+  # 늘어나며, 그것이 의도한 동작이다. 전송 단계는 그 줄을 아예 받지 않으므로
+  # Loki 쪽 지표도 움직이지 않는다.
   - interval: 30s
     input_series:
-      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="older_than_retention"}'
+      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",component_path="/",reason="older_than_retention"}'
         values: '0+50x60'
-      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",host="loki:3100",reason="ingester_error",tenant=""}'
+      - series: 'loki_write_dropped_entries_total{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",reason="ingester_error",tenant=""}'
         values: '0x60'
       - series: 'up{job="alloy",instance="vm2"}'
         values: '1x60'
@@ -190,18 +348,19 @@ tests:
         alertname: LogShippingDropping
         exp_alerts: []
 
-  # 의도하지 않은 드롭이 들어온 구간이다. drop_counter_reason을 적지 않은
-  # stage.drop이 설정에 들어오면 Alloy가 기본값인 reason="drop_stage"로 센다.
-  # 보존 기간 초과 드롭이 동시에 일어나고 있어도 그쪽은 제외되고 drop_stage
-  # 하나만 발화해야 한다.
+  # ---------------------------------------------------------------------------
+  # 9. 의도하지 않은 드롭이 들어온 구간.
+  # ---------------------------------------------------------------------------
+  # drop_counter_reason을 적지 않은 stage.drop이 설정에 들어오면 Alloy가 기본값인
+  # reason="drop_stage"로 센다. 보존 기간 초과 드롭이 동시에 일어나고 있어도
+  # 그쪽은 제외되고 drop_stage 하나만 발화해야 한다.
   - interval: 30s
     input_series:
-      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="older_than_retention"}'
+      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",component_path="/",reason="older_than_retention"}'
         values: '0+50x60'
-      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="drop_stage"}'
+      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",component_path="/",reason="drop_stage"}'
         values: '0+7x60'
     alert_rule_test:
-      # for가 5분이므로 3분 시점에는 아직 발화하지 않는다.
       - eval_time: 3m
         alertname: LogProcessDroppingUnexpected
         exp_alerts: []
@@ -211,43 +370,26 @@ tests:
           - exp_labels:
               severity: warning
               service: alloy
+              pipeline: logs
               reason: drop_stage
             exp_annotations:
               summary: 'Alloy가 예상하지 않은 이유로 로그를 버리고 있다 (reason=drop_stage)'
               description: '최근 10분 안에 loki.process 단계에서 버린 줄이 있고 그 이유가 보존 기간 초과가 아니다. 설정에 의도하지 않은 드롭이 들어왔을 수 있다.'
               action: 'monitoring/alloy/config.alloy의 loki.process 블록에 retention_guard 말고 다른 stage.drop이 들어왔는지 확인하고, sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics | grep loki_process_dropped_lines_total 으로 reason별 값을 읽는다.'
 
-  # 예상하지 않은 드롭이 한 번 묶여서 일어나고 멈추는 구간이다. increase의 창이
-  # 10분이므로 5분의 for를 채워서 발화하고, 창이 지나가면 스스로 해소된다.
-  - interval: 30s
-    input_series:
-      - series: 'loki_process_dropped_lines_total{job="alloy",instance="vm2",component_id="loki.process.retention_guard",reason="drop_stage"}'
-        values: '0 0 0 0 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120 120'
-    alert_rule_test:
-      - eval_time: 3m
-        alertname: LogProcessDroppingUnexpected
-        exp_alerts: []
-      - eval_time: 9m
-        alertname: LogProcessDroppingUnexpected
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: alloy
-              reason: drop_stage
-            exp_annotations:
-              summary: 'Alloy가 예상하지 않은 이유로 로그를 버리고 있다 (reason=drop_stage)'
-              description: '최근 10분 안에 loki.process 단계에서 버린 줄이 있고 그 이유가 보존 기간 초과가 아니다. 설정에 의도하지 않은 드롭이 들어왔을 수 있다.'
-              action: 'monitoring/alloy/config.alloy의 loki.process 블록에 retention_guard 말고 다른 stage.drop이 들어왔는지 확인하고, sudo docker exec vm2-prometheus wget -q -O- http://alloy:12345/metrics | grep loki_process_dropped_lines_total 으로 reason별 값을 읽는다.'
-      - eval_time: 20m
-        alertname: LogProcessDroppingUnexpected
-        exp_alerts: []
-
-  # Alloy 컨테이너가 통째로 사라진 상황이다. 로그 전송 규칙은 시계열이 없어서
-  # 조용하고, TargetDown 하나만 울린다. 규칙을 겹쳐 두지 않은 결과를 확인한다.
+  # ---------------------------------------------------------------------------
+  # 10. Alloy 컨테이너가 통째로 사라진 구간.
+  # ---------------------------------------------------------------------------
+  # 로그 관련 규칙은 시계열이 없어서 조용하고 TargetDown 하나만 울린다.
+  # LokiRejectingStaleEntries의 unless 절이 참조하는 process_start_time_seconds도
+  # 함께 사라지지만, 그 절의 오른쪽이 비면 왼쪽이 그대로 남는다는 것이 unless의
+  # 동작이다. 왼쪽도 비어 있으므로 결과는 역시 비어 있다.
   - interval: 30s
     input_series:
       - series: 'up{job="alloy",instance="vm2"}'
         values: '0x30'
+      - series: 'up{job="loki",instance="vm2"}'
+        values: '1x30'
     alert_rule_test:
       - eval_time: 10m
         alertname: LogShippingDropping
@@ -257,6 +399,12 @@ tests:
         exp_alerts: []
       - eval_time: 10m
         alertname: LogProcessDroppingUnexpected
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: LokiRejectingEntries
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: LokiRejectingStaleEntries
         exp_alerts: []
       - eval_time: 10m
         alertname: TargetDown
@@ -268,3 +416,49 @@ tests:
             exp_annotations:
               summary: 'alloy target이 5분 이상 응답하지 않는다'
               description: 'vm2의 alloy scrape가 실패하고 있다. 컨테이너 상태와 네트워크를 확인한다.'
+
+  # ---------------------------------------------------------------------------
+  # 11. Loki 컨테이너가 사라진 구간.
+  # ---------------------------------------------------------------------------
+  # prometheus.yml에 loki job을 추가하면서 생긴 구간이다. Loki 쪽 discard 지표가
+  # 함께 사라지므로 두 Loki 규칙은 조용하고, TargetDown이 Loki를 잡는다.
+  # Alloy는 살아서 연결에 실패하므로 status_code="-1"로 기록되고
+  # LogShippingWriteFailing이 그 구간을 알린다. 이 값은 grafana/alloy:v1.19.2를
+  # 띄운 채 Loki를 다시 시작해서 실제로 확인했다.
+  - interval: 30s
+    input_series:
+      - series: 'up{job="loki",instance="vm2"}'
+        values: '0x30'
+      - series: 'up{job="alloy",instance="vm2"}'
+        values: '1x30'
+      - series: 'loki_write_request_duration_seconds_count{job="alloy",instance="vm2",component_id="loki.write.loki",component_path="/",host="loki:3100",status_code="-1",tenant=""}'
+        values: '0+2x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LokiRejectingEntries
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: LokiRejectingStaleEntries
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: loki
+              instance: vm2
+            exp_annotations:
+              summary: 'loki target이 5분 이상 응답하지 않는다'
+              description: 'vm2의 loki scrape가 실패하고 있다. 컨테이너 상태와 네트워크를 확인한다.'
+      - eval_time: 10m
+        alertname: LogShippingWriteFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: alloy
+              pipeline: logs
+              status_code: '-1'
+            exp_annotations:
+              summary: 'Alloy의 Loki 밀어넣기가 실패하고 있다 (status_code=-1)'
+              description: '최근 10분 안에 2xx도 400도 아닌 응답이 있었고 그 상태가 5분 넘게 이어진다. 400은 정렬과 나이 때문에 개별 줄이 거절되는 정상 구간이라 제외했으므로, 이 경보는 요청 자체가 처리되지 못한다는 뜻이다. 아직 재시도 중이라면 유실은 없지만 재시도가 소진되면 로그를 잃는다.'
+              action: '1) status_code가 5xx이면 Loki 쪽 장애다. curl -s http://127.0.0.1:3100/ready 를 보고 sudo docker logs vm2-loki --tail 100 으로 원인을 읽는다. 이 경우 Alloy의 드롭은 reason=ingester_error로 세어지므로 LogShippingDropping은 울리지 않는다. 유실 여부는 Loki가 정상으로 돌아온 뒤 조회로 확인한다. 2) 429이면 수용 한도 문제이며 LokiRejectingEntries의 절차를 따른다. 3) 401, 403, 404이면 monitoring/alloy/config.alloy의 loki.write endpoint 주소를 확인한다. 4) 2xx도 4xx도 5xx도 아닌 값이면 연결 자체가 안 되는 것이다. sudo docker exec vm2-alloy bash -c "exec 3<>/dev/tcp/loki/3100" 로 api-network 연결을 확인한다.'
